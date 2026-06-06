@@ -1,304 +1,215 @@
 import requests
 import time
-import json
 import hmac
 import hashlib
+import os
 from datetime import datetime
 import logging
 
-# Configuration - FRESH CREDENTIALS
-BINGX_API_KEY = "pUrJ77AlMufGU7h9KEm2PH5aYpWQa5F0xWb2KWx2sT6iWJRZd5ghh6pHdzpU7qlpUjlRfnoA15yzb8qekw"
-BINGX_SECRET_KEY = "EP0Qe6lUHyFdbePheLA aNEkOM7KkigqQNuibfmEExdyAHeP8QrBANLhskt209Q2l9E2vBwy9QZ0kdOHUw"
-BINGX_UID = "32922666"
+# ===== Configuration =====
+# Read from environment variables, fallback to hardcoded values
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "sJY8Cc1aFyCPGQqlUjJjtiTOo8AqUCKwdSKX8aKHewqJ61C7GcHkCRYj05oiFYegiQBQVEEfcsln8feQbaQ")
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "NmQxcRMV1jW2UESqsudA4JtZrOVRl7UM7Zj48mVQqvfAc46Gl2Ou1kvFw3ScA9Hy7ReiMEb5BGBXBiEcL92w")
 
-TELEGRAM_BOT_TOKEN = "8969633475:AAFW0PMIM2jDxuerx9c6xaow36R2Ir9Jhns"
-TELEGRAM_CHAT_ID = "1035800369"
+TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "8969633475:AAFW0PMIM2jDxuerx9c6xaow36R2Ir9Jhns")
+TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "1035800369")
 
 BASE_URL = "https://open-api.bingx.com"
 TIMEFRAME = "15m"
 EMA_LENGTH = 20
+SCAN_INTERVAL = 900  # 15 minutes
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# ===== Logging =====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Storage for tracking sent alerts
 sent_alerts = {}
 
 def send_telegram_alert(message):
-    """Send alert to Telegram"""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            logger.info(f"✅ Telegram alert sent")
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200:
+            logger.info("Telegram alert sent")
         else:
-            logger.error(f"❌ Failed to send telegram: {response.text}")
+            logger.error(f"Telegram failed: {r.text}")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-def generate_signature(timestamp, method, request_path, body_str=""):
-    """Generate BingX API signature"""
-    message = timestamp + method + request_path + body_str
-    signature = hmac.new(
-        BINGX_SECRET_KEY.encode(),
-        message.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    return signature
-
-def make_request(method, endpoint, params=None):
-    """Make authenticated request to BingX API"""
-    try:
-        timestamp = str(int(time.time() * 1000))
-        request_path = endpoint
-        if params and method == "GET":
-            query_str = "&".join([f"{k}={v}" for k, v in params.items()])
-            request_path = f"{endpoint}?{query_str}"
-        
-        signature = generate_signature(timestamp, method, request_path)
-        
-        headers = {
-            "X-BingX-API-KEY": BINGX_API_KEY,
-            "X-BingX-TIMESTAMP": timestamp,
-            "X-BingX-SIGN": signature,
-            "Content-Type": "application/json"
-        }
-        
-        url = BASE_URL + request_path
-        
-        if method == "GET":
-            response = requests.get(url, headers=headers, timeout=10)
-        else:
-            response = requests.post(url, json=params, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            logger.error(f"API Error: {response.status_code} - {response.text}")
-            return None
-    except Exception as e:
-        logger.error(f"Request error: {e}")
-        return None
-
 def get_klines(symbol, limit=100):
-    """Get kline data from BingX"""
-    endpoint = "/openApi/swap/v2/quote/klines"
-    params = {
-        "symbol": symbol,
-        "interval": TIMEFRAME,
-        "limit": limit
-    }
-    return make_request("GET", endpoint, params)
-
-def calculate_ema(data, length):
-    """Calculate EMA"""
-    if len(data) < length:
-        return None
-    
-    prices = [float(candle[4]) for candle in data]
-    ema = prices[0]
-    multiplier = 2 / (length + 1)
-    
-    for price in prices[1:]:
-        ema = price * multiplier + ema * (1 - multiplier)
-    
-    return ema
-
-def check_sell_signal(candles):
-    """Check SELL signal"""
-    if len(candles) < 3:
-        return False, None
-    
-    c1_open = float(candles[-1][1])
-    c1_high = float(candles[-1][2])
-    c1_close = float(candles[-1][4])
-    
-    is_red = c1_close < c1_open
-    
-    ema = calculate_ema(candles, EMA_LENGTH)
-    if ema is None:
-        return False, None
-    
-    red_touch = is_red and c1_high > ema and c1_close < ema
-    
-    if not red_touch:
-        return False, None
-    
-    c2_open = float(candles[-2][1])
-    c2_close = float(candles[-2][4])
-    c2_green = c2_close > c2_open
-    c2_below_ema = c2_close < ema
-    
-    c3_open = float(candles[-3][1])
-    c3_close = float(candles[-3][4])
-    c3_green = c3_close > c3_open
-    c3_below_ema = c3_close < ema
-    
-    has_green_below = (c2_green and c2_below_ema) or (c3_green and c3_below_ema)
-    
-    if has_green_below:
-        entry_low = min(float(candles[-2][3]), float(candles[-3][3]))
-        return True, {
-            "type": "SELL",
-            "entry_low": entry_low,
-            "ema": ema,
-            "price": c1_close
-        }
-    
-    return False, None
-
-def check_buy_signal(candles):
-    """Check BUY signal"""
-    if len(candles) < 3:
-        return False, None
-    
-    c1_open = float(candles[-1][1])
-    c1_low = float(candles[-1][3])
-    c1_close = float(candles[-1][4])
-    
-    is_green = c1_close > c1_open
-    
-    ema = calculate_ema(candles, EMA_LENGTH)
-    if ema is None:
-        return False, None
-    
-    green_touch = is_green and c1_low < ema and c1_close > ema
-    
-    if not green_touch:
-        return False, None
-    
-    c2_open = float(candles[-2][1])
-    c2_close = float(candles[-2][4])
-    c2_red = c2_close < c2_open
-    c2_above_ema = c2_close > ema
-    
-    c3_open = float(candles[-3][1])
-    c3_close = float(candles[-3][4])
-    c3_red = c3_close < c3_open
-    c3_above_ema = c3_close > ema
-    
-    has_red_above = (c2_red and c2_above_ema) or (c3_red and c3_above_ema)
-    
-    if has_red_above:
-        entry_high = max(float(candles[-2][2]), float(candles[-3][2]))
-        return True, {
-            "type": "BUY",
-            "entry_high": entry_high,
-            "ema": ema,
-            "price": c1_close
-        }
-    
-    return False, None
-
-def scan_symbol(symbol):
-    """Scan a single symbol for signals"""
+    """Get 15m candles for a FUTURES symbol (public endpoint, no signature needed)."""
     try:
-        data = get_klines(symbol, limit=100)
-        
-        if not data or "data" not in data:
-            return None
-        
-        candles = data["data"]
-        if len(candles) < 3:
-            return None
-        
-        sell_signal, sell_info = check_sell_signal(candles)
-        if sell_signal:
-            return {
-                "symbol": symbol,
-                "signal": "SELL",
-                "info": sell_info
-            }
-        
-        buy_signal, buy_info = check_buy_signal(candles)
-        if buy_signal:
-            return {
-                "symbol": symbol,
-                "signal": "BUY",
-                "info": buy_info
-            }
-        
+        url = f"{BASE_URL}/openApi/swap/v3/quote/klines"
+        params = {"symbol": symbol, "interval": TIMEFRAME, "limit": limit}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if data.get("code") == 0 and "data" in data:
+            return data["data"]
         return None
     except Exception as e:
-        logger.error(f"Error scanning {symbol}: {e}")
+        logger.error(f"Klines error {symbol}: {e}")
         return None
 
 def get_all_symbols():
-    """Get list of all trading pairs"""
+    """Get ALL BingX USDT-M perpetual futures symbols."""
     try:
-        endpoint = "/openApi/spot/v1/public/products"
-        data = make_request("GET", endpoint)
-        
-        if not data or "data" not in data:
+        url = f"{BASE_URL}/openApi/swap/v2/quote/contracts"
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if data.get("code") != 0 or "data" not in data:
+            logger.error(f"Contracts endpoint bad response: {data.get('code')} {data.get('msg')}")
             return []
-        
         symbols = []
-        for product in data["data"]:
-            symbol = product.get("symbol", "")
-            if "USDT" in symbol:
-                symbols.append(symbol)
-        
-        return symbols[:50]
+        for c in data["data"]:
+            sym = c.get("symbol", "")
+            status = c.get("status", 1)
+            # status 1 = online/tradable
+            if sym.endswith("-USDT") and status == 1:
+                symbols.append(sym)
+        logger.info(f"Loaded {len(symbols)} futures symbols")
+        return symbols
     except Exception as e:
-        logger.error(f"Error getting symbols: {e}")
+        logger.error(f"get_all_symbols error: {e}")
         return []
 
+def calculate_ema(candles, length):
+    """EMA on close prices. Candle dict keys: open, close, high, low."""
+    closes = [float(c["close"]) for c in candles]
+    if len(closes) < length:
+        return None
+    ema = closes[0]
+    k = 2 / (length + 1)
+    for price in closes[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+def parse_candle(c):
+    """Normalize a candle into open/high/low/close floats."""
+    return {
+        "open": float(c["open"]),
+        "high": float(c["high"]),
+        "low": float(c["low"]),
+        "close": float(c["close"]),
+    }
+
+def check_buy_signal(candles):
+    if len(candles) < 4:
+        return False, None
+    ema = calculate_ema(candles, EMA_LENGTH)
+    if ema is None:
+        return False, None
+    # Use last 3 CLOSED candles: c1 oldest -> c3 newest closed
+    c1 = parse_candle(candles[-3])
+    c2 = parse_candle(candles[-2])
+    c3 = parse_candle(candles[-1])
+
+    # Candle 1: green, touches EMA from below
+    c1_green = c1["close"] > c1["open"]
+    c1_touch = c1["low"] < ema and c1["close"] > ema
+    if not (c1_green and c1_touch):
+        return False, None
+
+    # Candle 2/3: at least one RED with close above EMA
+    c2_ok = (c2["close"] < c2["open"]) and (c2["close"] > ema)
+    c3_ok = (c3["close"] < c3["open"]) and (c3["close"] > ema)
+    if not (c2_ok or c3_ok):
+        return False, None
+
+    entry_high = max(c2["high"], c3["high"])
+    sl = min(c1["low"], c2["low"])
+    risk = entry_high - sl
+    tp = entry_high + 4 * risk
+    return True, {"type": "BUY", "entry": entry_high, "sl": sl, "tp": tp, "ema": ema, "price": c3["close"]}
+
+def check_sell_signal(candles):
+    if len(candles) < 4:
+        return False, None
+    ema = calculate_ema(candles, EMA_LENGTH)
+    if ema is None:
+        return False, None
+    c1 = parse_candle(candles[-3])
+    c2 = parse_candle(candles[-2])
+    c3 = parse_candle(candles[-1])
+
+    # Candle 1: red, touches EMA from above
+    c1_red = c1["close"] < c1["open"]
+    c1_touch = c1["high"] > ema and c1["close"] < ema
+    if not (c1_red and c1_touch):
+        return False, None
+
+    # Candle 2/3: at least one GREEN with close below EMA
+    c2_ok = (c2["close"] > c2["open"]) and (c2["close"] < ema)
+    c3_ok = (c3["close"] > c3["open"]) and (c3["close"] < ema)
+    if not (c2_ok or c3_ok):
+        return False, None
+
+    entry_low = min(c2["low"], c3["low"])
+    sl = max(c1["high"], c2["high"])
+    risk = sl - entry_low
+    tp = entry_low - 4 * risk
+    return True, {"type": "SELL", "entry": entry_low, "sl": sl, "tp": tp, "ema": ema, "price": c3["close"]}
+
+def scan_symbol(symbol):
+    candles = get_klines(symbol, limit=100)
+    if not candles or len(candles) < 4:
+        return None
+    # BingX returns newest-first sometimes; ensure oldest-first by time
+    try:
+        candles = sorted(candles, key=lambda x: int(x["time"]))
+    except Exception:
+        pass
+    buy, info = check_buy_signal(candles)
+    if buy:
+        return {"symbol": symbol, **info}
+    sell, info = check_sell_signal(candles)
+    if sell:
+        return {"symbol": symbol, **info}
+    return None
+
+def format_alert(sig):
+    emoji = "🟢 BUY" if sig["type"] == "BUY" else "🔴 SELL"
+    return f"""{emoji} SIGNAL READY
+
+Pair: {sig['symbol']}
+Price: {sig['price']:.6f}
+EMA20: {sig['ema']:.6f}
+
+Entry: {sig['entry']:.6f}
+SL: {sig['sl']:.6f}
+TP (1:4): {sig['tp']:.6f}
+
+⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"""
+
 def main_loop():
-    """Main scanning loop"""
-    logger.info("🚀 BingX EMA Scanner Bot Started")
-    send_telegram_alert("🚀 BingX EMA Scanner Bot Started\nScanning all USDT pairs every 15 minutes...")
-    
+    logger.info("BingX Futures EMA Scanner Started")
+    send_telegram_alert("🚀 BingX Futures EMA Scanner Started\nScanning all USDT-M perpetual pairs every 15 min...")
+
     while True:
         try:
-            logger.info(f"\n⏰ Scanning at {datetime.now()}")
             symbols = get_all_symbols()
-            logger.info(f"📊 Scanning {len(symbols)} symbols...")
-            
-            signals_found = []
-            
-            for symbol in symbols:
-                result = scan_symbol(symbol)
-                if result:
-                    signals_found.append(result)
-                    logger.info(f"✅ Signal found: {result}")
-                
-                time.sleep(0.1)
-            
-            for signal in signals_found:
-                symbol = signal["symbol"]
-                signal_type = signal["signal"]
-                info = signal["info"]
-                
-                alert_key = f"{symbol}_{signal_type}_{datetime.now().hour}"
-                if alert_key in sent_alerts:
-                    continue
-                
-                message = f"""
-{'🔴 SELL' if signal_type == 'SELL' else '🟢 BUY'} SIGNAL READY
+            if not symbols:
+                logger.error("No symbols loaded - check API/endpoint. Retrying in 60s.")
+                time.sleep(60)
+                continue
 
-Pair: {symbol}
-Price: {info['price']:.8f}
-EMA20: {info['ema']:.8f}
+            logger.info(f"Scanning {len(symbols)} symbols...")
+            found = 0
+            for sym in symbols:
+                sig = scan_symbol(sym)
+                if sig:
+                    key = f"{sig['symbol']}_{sig['type']}_{datetime.utcnow().strftime('%Y%m%d%H')}"
+                    if key not in sent_alerts:
+                        send_telegram_alert(format_alert(sig))
+                        sent_alerts[key] = True
+                        found += 1
+                        logger.info(f"SIGNAL: {sig['symbol']} {sig['type']}")
+                time.sleep(0.15)  # rate-limit friendly
 
-⏳ Wait for Candle 4 to enter trade
-📈 Entry: {'Low ' + str(round(info['entry_low'], 8)) if signal_type == 'SELL' else 'High ' + str(round(info['entry_high'], 8))}
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-                """
-                send_telegram_alert(message)
-                sent_alerts[alert_key] = True
-            
-            logger.info("⏳ Waiting 15 minutes for next scan...")
-            time.sleep(900)
-            
+            logger.info(f"Scan complete. {found} new signals. Waiting 15 min...")
+            time.sleep(SCAN_INTERVAL)
         except Exception as e:
-            logger.error(f"Error in main loop: {e}")
+            logger.error(f"Main loop error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":

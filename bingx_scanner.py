@@ -3,17 +3,16 @@ import time
 import json
 import hmac
 import hashlib
-import os
 from datetime import datetime
 import logging
 
-# Configuration - read from environment variables
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "pUrJ77AlMufGU7h9KEm2PH5aYpWQa5F0xWb2KWx2sT6iWJRZd5ghh6pHdzpU7qlpUjlRfnoA15yzb8qekw")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "EP0Qe6lUHyFdbePheLA aNEkOM7KkigqQNuibfmEExdyAHeP8QrBANLhskt209Q2l9E2vBwy9QZ0kdOHUw")
-BINGX_UID = os.getenv("BINGX_UID", "32922666")
+# Configuration - HARDCODED
+BINGX_API_KEY = "pUrJ77AlMufGU7h9KEm2PH5aYpWQa5F0xWb2KWx2sT6iWJRZd5ghh6pHdzpU7qlpUjlRfnoA15yzb8qekw"
+BINGX_SECRET_KEY = "EP0Qe6lUHyFdbePheLA aNEkOM7KkigqQNuibfmEExdyAHeP8QrBANLhskt209Q2l9E2vBwy9QZ0kdOHUw"
+BINGX_UID = "32922666"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "7284589720:AAG-1WOaFjGKC1tVvVn3DW5YZ7Q8xR9sT0U")
-TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "779634396")
+TELEGRAM_BOT_TOKEN = "8847704988:AAG-4ij7YpQiJLZoegrzGENsAdoaV6ny_QM"
+TELEGRAM_CHAT_ID = "1035800369"
 
 BASE_URL = "https://open-api.bingx.com"
 TIMEFRAME = "15m"
@@ -23,7 +22,7 @@ EMA_LENGTH = 20
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Storage for tracking sent alerts (to avoid duplicates)
+# Storage for tracking sent alerts
 sent_alerts = {}
 
 def send_telegram_alert(message):

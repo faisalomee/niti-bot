@@ -6,12 +6,12 @@ import hashlib
 from datetime import datetime
 import logging
 
-# Configuration - HARDCODED
+# Configuration - FRESH CREDENTIALS
 BINGX_API_KEY = "pUrJ77AlMufGU7h9KEm2PH5aYpWQa5F0xWb2KWx2sT6iWJRZd5ghh6pHdzpU7qlpUjlRfnoA15yzb8qekw"
 BINGX_SECRET_KEY = "EP0Qe6lUHyFdbePheLA aNEkOM7KkigqQNuibfmEExdyAHeP8QrBANLhskt209Q2l9E2vBwy9QZ0kdOHUw"
 BINGX_UID = "32922666"
 
-TELEGRAM_BOT_TOKEN = "8847704988:AAG-4ij7YpQiJLZoegrzGENsAdoaV6ny_QM"
+TELEGRAM_BOT_TOKEN = "8969633475:AAFW0PMIM2jDxuerx9c6xaow36R2Ir9Jhns"
 TELEGRAM_CHAT_ID = "1035800369"
 
 BASE_URL = "https://open-api.bingx.com"

@@ -270,7 +270,7 @@ def get_all_symbols():
 def main_loop():
     """Main scanning loop"""
     logger.info("🚀 BingX EMA Scanner Bot Started")
-    send_telegram_alert("🚀 <b>BingX EMA Scanner Bot Started</b>\nScanning all USDT pairs every 15 minutes...")
+    send_telegram_alert("🚀 BingX EMA Scanner Bot Started\nScanning all USDT pairs every 15 minutes...")
     
     while True:
         try:
@@ -300,13 +300,13 @@ def main_loop():
                     continue
                 
                 message = f"""
-<b>{'🔴 SELL' if signal_type == 'SELL' else '🟢 BUY'} SIGNAL READY</b>
+{'🔴 SELL' if signal_type == 'SELL' else '🟢 BUY'} SIGNAL READY
 
-<b>Pair:</b> {symbol}
-<b>Price:</b> {info['price']:.8f}
-<b>EMA20:</b> {info['ema']:.8f}
+Pair: {symbol}
+Price: {info['price']:.8f}
+EMA20: {info['ema']:.8f}
 
-⏳ <i>Wait for Candle 4 to enter trade</i>
+⏳ Wait for Candle 4 to enter trade
 📈 Entry: {'Low ' + str(round(info['entry_low'], 8)) if signal_type == 'SELL' else 'High ' + str(round(info['entry_high'], 8))}
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}

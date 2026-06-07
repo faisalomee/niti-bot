@@ -1,4 +1,4 @@
-import os, time, hmac, hashlib, requests
+import os, time, hmac, hashlib, requests, traceback
 from flask import Flask
 from threading import Thread
 
@@ -9,8 +9,8 @@ SECRET_KEY = os.environ.get("BINGX_SECRET_KEY")
 TG_TOKEN   = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
-BASE_URL = "https://open-api.bingx.com"
-CANDLE_MS = 15 * 60 * 1000  # 15 minutes in milliseconds
+BASE_URL  = "https://open-api.bingx.com"
+CANDLE_MS = 15 * 60 * 1000
 
 
 def sign(params: dict) -> str:
@@ -67,8 +67,6 @@ def is_red(c):   return close_of(c) < open_of(c)
 def is_green(c): return close_of(c) > open_of(c)
 
 
-# last_alerted: set of (symbol, direction, rejection_candle_time)
-# prevents duplicate alerts for the same setup
 last_alerted = set()
 
 
@@ -78,39 +76,24 @@ def check_symbol(symbol):
         if len(candles) < 10:
             return
 
-        # confirmed = all fully closed candles (skip last = currently open)
         confirmed = candles[:-1]
         closes    = [float(c["close"]) for c in confirmed]
         ema_vals  = calc_ema_series(closes, period=21)
 
-        # Build a time -> index map for fast C4 lookup
-        time_to_idx = {int(c["time"]): i for i, c in enumerate(confirmed)}
-
-        # ── Scan for C1/C2/C3 setups ─────────────────────────────────
-        # Look back up to 6 candles from the end.
-        # C1=i, C2=i+1, C3=i+2, C4=i+3 (must all be confirmed)
-        # We need i+3 to exist in confirmed, so stop at len-4.
-
         scan_start = max(0, len(confirmed) - 6)
-        scan_end   = len(confirmed) - 3  # need C4 = i+3 to exist
+        scan_end   = len(confirmed) - 3
 
         for i in range(scan_end, scan_start - 1, -1):
             c1 = confirmed[i]
             c2 = confirmed[i + 1]
             c3 = confirmed[i + 2]
-            c4 = confirmed[i + 3]   # strict: must be exactly i+3
+            c4 = confirmed[i + 3]
 
             ema_c1 = ema_vals[i]
             ema_c2 = ema_vals[i + 1]
             ema_c3 = ema_vals[i + 2]
 
-            # ── BUY ──────────────────────────────────────────────────
-            # C1: close BELOW EMA
-            # C2 or C3: RED candle that closes ABOVE EMA (EMA rejection up)
-            # C4: high must touch or exceed the HIGH of the rejection candle
-            # Entry = HIGH of rejection candle
-            # SL    = LOW  of rejection candle
-
+            # ── BUY ──
             if close_of(c1) < ema_c1:
                 rej = None
                 if is_red(c2) and close_of(c2) > ema_c2:
@@ -121,13 +104,10 @@ def check_symbol(symbol):
                 if rej is not None:
                     rej_time = int(rej["time"])
                     sig_id   = (symbol, "BUY", rej_time)
-
                     if sig_id not in last_alerted:
                         entry = high_of(rej)
                         sl    = low_of(rej)
                         rr    = abs(entry - sl)
-
-                        # C4 must touch entry from below
                         if high_of(c4) >= entry:
                             last_alerted.add(sig_id)
                             tp1 = round(entry + rr * 3, 4)
@@ -138,8 +118,8 @@ def check_symbol(symbol):
                                 f"⏱ Timeframe : 15m\n"
                                 f"📐 Strategy  : EMA21 Rejection + C4 Retest\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
-                                f"🎯 Entry     : {round(entry, 4)}\n"
-                                f"🛑 Stop Loss : {round(sl, 4)}\n"
+                                f"🎯 Entry     : {round(entry,4)}\n"
+                                f"🛑 Stop Loss : {round(sl,4)}\n"
                                 f"💰 TP1 (1:3) : {tp1}\n"
                                 f"💰 TP2 (1:4) : {tp2}\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -147,15 +127,9 @@ def check_symbol(symbol):
                             )
                             send_tg(msg)
                             print(f"BUY: {symbol} | Entry={round(entry,4)} SL={round(sl,4)}")
-                    break  # found most recent setup, stop scanning
+                break
 
-            # ── SELL ─────────────────────────────────────────────────
-            # C1: close ABOVE EMA
-            # C2 or C3: GREEN candle that closes BELOW EMA (EMA rejection down)
-            # C4: low must touch or go below the LOW of the rejection candle
-            # Entry = LOW  of rejection candle
-            # SL    = HIGH of rejection candle
-
+            # ── SELL ──
             if close_of(c1) > ema_c1:
                 rej = None
                 if is_green(c2) and close_of(c2) < ema_c2:
@@ -166,13 +140,10 @@ def check_symbol(symbol):
                 if rej is not None:
                     rej_time = int(rej["time"])
                     sig_id   = (symbol, "SELL", rej_time)
-
                     if sig_id not in last_alerted:
                         entry = low_of(rej)
                         sl    = high_of(rej)
                         rr    = abs(entry - sl)
-
-                        # C4 must touch entry from above
                         if low_of(c4) <= entry:
                             last_alerted.add(sig_id)
                             tp1 = round(entry - rr * 3, 4)
@@ -183,8 +154,8 @@ def check_symbol(symbol):
                                 f"⏱ Timeframe : 15m\n"
                                 f"📐 Strategy  : EMA21 Rejection + C4 Retest\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
-                                f"🎯 Entry     : {round(entry, 4)}\n"
-                                f"🛑 Stop Loss : {round(sl, 4)}\n"
+                                f"🎯 Entry     : {round(entry,4)}\n"
+                                f"🛑 Stop Loss : {round(sl,4)}\n"
                                 f"💰 TP1 (1:3) : {tp1}\n"
                                 f"💰 TP2 (1:4) : {tp2}\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -192,16 +163,17 @@ def check_symbol(symbol):
                             )
                             send_tg(msg)
                             print(f"SELL: {symbol} | Entry={round(entry,4)} SL={round(sl,4)}")
-                    break  # found most recent setup, stop scanning
+                break
 
     except Exception as e:
-        print(f"[{symbol}] error: {e}")
+        print(f"[{symbol}] error: {traceback.format_exc()}")
 
 
 def monitor_loop():
     print("Monitor started — EMA21 Rejection + C4 Strict Retest | 1:3/1:4 RR")
     while True:
         try:
+            print("Fetching symbols...")
             symbols = get_futures_symbols()
             print(f"Scanning {len(symbols)} pairs...")
             for sym in symbols:
@@ -209,7 +181,7 @@ def monitor_loop():
                 time.sleep(0.3)
             print("Scan complete. Sleeping 14 min...")
         except Exception as e:
-            print(f"Loop error: {e}")
+            print(f"Loop error: {traceback.format_exc()}")
         time.sleep(60 * 14)
 
 

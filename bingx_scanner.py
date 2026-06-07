@@ -11,6 +11,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
 BASE_URL  = "https://open-api.bingx.com"
 CANDLE_MS = 15 * 60 * 1000
+TIMEOUT   = 15  # seconds
 
 
 def sign(params: dict) -> str:
@@ -20,24 +21,37 @@ def sign(params: dict) -> str:
 
 
 def get_futures_symbols():
-    url = BASE_URL + "/openApi/swap/v2/quote/contracts"
-    r = requests.get(url, timeout=10).json()
-    return [c["symbol"] for c in r.get("data", [])
-            if c.get("status") == 1 and "USDT" in c["symbol"]]
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/contracts"
+        r = requests.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        symbols = [c["symbol"] for c in data.get("data", [])
+                   if c.get("status") == 1 and "USDT" in c["symbol"]]
+        print(f"Got {len(symbols)} symbols from BingX")
+        return symbols
+    except Exception as e:
+        print(f"get_futures_symbols error: {e}")
+        return []
 
 
 def get_candles(symbol, limit=60):
-    ts = int(time.time() * 1000)
-    params = {"symbol": symbol, "interval": "15m",
-              "limit": limit, "timestamp": ts}
-    params["signature"] = sign(params)
-    url = BASE_URL + "/openApi/swap/v3/quote/klines"
-    r = requests.get(url, params=params,
-                     headers={"X-BX-APIKEY": API_KEY},
-                     timeout=10).json()
-    candles = r.get("data", [])
-    candles.sort(key=lambda x: x["time"])
-    return candles
+    try:
+        ts = int(time.time() * 1000)
+        params = {"symbol": symbol, "interval": "15m",
+                  "limit": limit, "timestamp": ts}
+        params["signature"] = sign(params)
+        url = BASE_URL + "/openApi/swap/v3/quote/klines"
+        r = requests.get(url, params=params,
+                         headers={"X-BX-APIKEY": API_KEY},
+                         timeout=TIMEOUT)
+        r.raise_for_status()
+        candles = r.json().get("data", [])
+        candles.sort(key=lambda x: x["time"])
+        return candles
+    except Exception as e:
+        print(f"get_candles [{symbol}] error: {e}")
+        return []
 
 
 def calc_ema_series(closes, period=21):
@@ -51,12 +65,15 @@ def calc_ema_series(closes, period=21):
 
 
 def send_tg(msg):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": TG_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML"
-    }, timeout=10)
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TG_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }, timeout=TIMEOUT)
+    except Exception as e:
+        print(f"send_tg error: {e}")
 
 
 def close_of(c): return float(c["close"])
@@ -76,8 +93,7 @@ def check_symbol(symbol):
         if len(candles) < 10:
             return
 
-        # skip currently open candle
-        confirmed = candles[:-1]
+        confirmed = candles[:-1]  # skip currently open candle
         closes    = [float(c["close"]) for c in confirmed]
         ema_vals  = calc_ema_series(closes, period=21)
 
@@ -100,7 +116,7 @@ def check_symbol(symbol):
 
             # ── BUY ──
             # C1: close BELOW EMA
-            # C2 or C3: RED candle, close ABOVE EMA
+            # C2 or C3: RED candle, close ABOVE EMA (rejection up)
             # C4: high >= rejection candle high → entry
             if close_of(c1) < ema_c1:
                 rej = None
@@ -139,7 +155,7 @@ def check_symbol(symbol):
 
             # ── SELL ──
             # C1: close ABOVE EMA
-            # C2 or C3: GREEN candle, close BELOW EMA
+            # C2 or C3: GREEN candle, close BELOW EMA (rejection down)
             # C4: low <= rejection candle low → entry
             if close_of(c1) > ema_c1:
                 rej = None
@@ -186,6 +202,10 @@ def monitor_loop():
         try:
             print("Fetching symbols...")
             symbols = get_futures_symbols()
+            if not symbols:
+                print("No symbols fetched! Retrying in 2 min...")
+                time.sleep(120)
+                continue
             print(f"Scanning {len(symbols)} pairs...")
             for sym in symbols:
                 check_symbol(sym)
@@ -198,7 +218,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti EMA Bot v4 is running!", 200
+    return "Niti EMA Bot v5 is running!", 200
 
 
 if __name__ == "__main__":

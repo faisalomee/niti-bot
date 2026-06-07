@@ -76,12 +76,17 @@ def check_symbol(symbol):
         if len(candles) < 10:
             return
 
+        # skip currently open candle
         confirmed = candles[:-1]
         closes    = [float(c["close"]) for c in confirmed]
         ema_vals  = calc_ema_series(closes, period=21)
 
-        scan_start = max(0, len(confirmed) - 6)
-        scan_end   = len(confirmed) - 3
+        # need i, i+1, i+2, i+3 — so max i = len-4
+        scan_end   = len(confirmed) - 4
+        scan_start = max(0, scan_end - 5)
+
+        if scan_end < 0:
+            return
 
         for i in range(scan_end, scan_start - 1, -1):
             c1 = confirmed[i]
@@ -94,6 +99,9 @@ def check_symbol(symbol):
             ema_c3 = ema_vals[i + 2]
 
             # ── BUY ──
+            # C1: close BELOW EMA
+            # C2 or C3: RED candle, close ABOVE EMA
+            # C4: high >= rejection candle high → entry
             if close_of(c1) < ema_c1:
                 rej = None
                 if is_red(c2) and close_of(c2) > ema_c2:
@@ -130,6 +138,9 @@ def check_symbol(symbol):
                 break
 
             # ── SELL ──
+            # C1: close ABOVE EMA
+            # C2 or C3: GREEN candle, close BELOW EMA
+            # C4: low <= rejection candle low → entry
             if close_of(c1) > ema_c1:
                 rej = None
                 if is_green(c2) and close_of(c2) < ema_c2:
@@ -187,7 +198,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti EMA Bot v3 is running!", 200
+    return "Niti EMA Bot v4 is running!", 200
 
 
 if __name__ == "__main__":

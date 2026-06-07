@@ -25,7 +25,7 @@ def get_futures_symbols():
             if c.get("status") == 1 and "USDT" in c["symbol"]]
 
 
-def get_candles(symbol, limit=50):
+def get_candles(symbol, limit=60):
     ts = int(time.time() * 1000)
     params = {"symbol": symbol, "interval": "15m",
               "limit": limit, "timestamp": ts}
@@ -39,12 +39,14 @@ def get_candles(symbol, limit=50):
     return candles
 
 
-def calc_ema(closes, period=21):
+def calc_ema_series(closes, period=21):
     k = 2 / (period + 1)
     ema = closes[0]
-    for c in closes[1:]:
+    ema_vals = []
+    for c in closes:
         ema = c * k + ema * (1 - k)
-    return ema
+        ema_vals.append(ema)
+    return ema_vals
 
 
 def send_tg(msg):
@@ -56,129 +58,164 @@ def send_tg(msg):
     }, timeout=10)
 
 
-last_signal = {}  # symbol -> (direction, candle_time)
+# pending_signals: symbol -> setup dict
+# last_alerted:   (symbol, direction, setup_time) -> True
+pending_signals = {}
+last_alerted    = {}
+
+
+def close_of(c): return float(c["close"])
+def open_of(c):  return float(c["open"])
+def high_of(c):  return float(c["high"])
+def low_of(c):   return float(c["low"])
+def is_red(c):   return close_of(c) < open_of(c)
+def is_green(c): return close_of(c) > open_of(c)
 
 
 def check_symbol(symbol):
     try:
-        candles = get_candles(symbol, limit=50)
+        candles = get_candles(symbol, limit=60)
         if len(candles) < 30:
             return
 
-        # Use only confirmed (closed) candles — skip the last (current open)
-        confirmed = candles[:-1]
+        confirmed = candles[:-1]  # skip currently open candle
+        closes    = [float(c["close"]) for c in confirmed]
+        ema_vals  = calc_ema_series(closes, period=21)
 
-        closes = [float(c["close"]) for c in confirmed]
-        ema_values = []
-        k = 2 / (21 + 1)
-        ema = closes[0]
-        for c in closes:
-            ema = c * k + ema * (1 - k)
-            ema_values.append(ema)
+        # ── STEP 1: Detect C1/C2/C3 setup ────────────────────────────
+        for i in range(len(confirmed) - 3, max(len(confirmed) - 8, 1), -1):
+            c1     = confirmed[i]
+            c2     = confirmed[i + 1]
+            c3     = confirmed[i + 2]
+            ema_c1 = ema_vals[i]
+            ema_c2 = ema_vals[i + 1]
+            ema_c3 = ema_vals[i + 2]
 
-        # c1 = 3rd last confirmed, c2 = 2nd last, c3 = last confirmed
-        c1      = confirmed[-3]
-        c2      = confirmed[-2]
-        c3      = confirmed[-1]
-        ema_c1  = ema_values[-3]
-        ema_c2  = ema_values[-2]
-        ema_c3  = ema_values[-1]
+            # ── BUY setup ──
+            # C1 close below EMA
+            # C2 or C3: RED candle, close ABOVE EMA (rejection up)
+            # Entry = HIGH of rejection candle
+            # SL    = LOW  of rejection candle
+            if close_of(c1) < ema_c1:
+                rejection_candle = None
+                if is_red(c2) and close_of(c2) > ema_c2:
+                    rejection_candle = c2
+                elif is_red(c3) and close_of(c3) > ema_c3:
+                    rejection_candle = c3
 
-        def close_of(c): return float(c["close"])
-        def open_of(c):  return float(c["open"])
-        def is_red(c):   return close_of(c) < open_of(c)
-        def is_green(c): return close_of(c) > open_of(c)
+                if rejection_candle is not None:
+                    setup_time = int(rejection_candle["time"])
+                    sig_id     = (symbol, "BUY", setup_time)
+                    if sig_id not in last_alerted:
+                        pending_signals[symbol] = {
+                            "direction":         "BUY",
+                            "entry_trigger":     high_of(rejection_candle),
+                            "stop_loss":         low_of(rejection_candle),
+                            "setup_candle_time": setup_time,
+                            "alerted":           False,
+                        }
+                    break
 
-        now_ms        = int(time.time() * 1000)
-        candle_15m_ms = 15 * 60 * 1000
+            # ── SELL setup ──
+            # C1 close above EMA
+            # C2 or C3: GREEN candle, close BELOW EMA (rejection down)
+            # Entry = LOW  of rejection candle
+            # SL    = HIGH of rejection candle
+            if close_of(c1) > ema_c1:
+                rejection_candle = None
+                if is_green(c2) and close_of(c2) < ema_c2:
+                    rejection_candle = c2
+                elif is_green(c3) and close_of(c3) < ema_c3:
+                    rejection_candle = c3
 
-        # ── BUY ──────────────────────────────────────────────────────────
-        # c1 closed BELOW its EMA
-        # c2 or c3: must be RED AND close ABOVE its own EMA
-        # only one of c2/c3 fires (whichever comes first)
+                if rejection_candle is not None:
+                    setup_time = int(rejection_candle["time"])
+                    sig_id     = (symbol, "SELL", setup_time)
+                    if sig_id not in last_alerted:
+                        pending_signals[symbol] = {
+                            "direction":         "SELL",
+                            "entry_trigger":     low_of(rejection_candle),
+                            "stop_loss":         high_of(rejection_candle),
+                            "setup_candle_time": setup_time,
+                            "alerted":           False,
+                        }
+                    break
 
-        if close_of(c1) < ema_c1:  # trigger
-            # check c2 first
-            if is_red(c2) and close_of(c2) > ema_c2:
-                sig_time = int(c2["time"])
-                sig_key  = ("BUY", sig_time)
-                if (now_ms - sig_time <= candle_15m_ms * 2
-                        and last_signal.get(symbol) != sig_key):
-                    last_signal[symbol] = sig_key
-                    send_tg(
-                        f"🟢 BUY — {symbol}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📊 EMA21: {ema_c2:.4f}\n"
-                        f"🕯 Close: {close_of(c2):.4f}\n"
-                        f"⏱ 15m | EMA Reclaim\n"
-                        f"━━━━━━━━━━━━━━━\n"
+        # ── STEP 2: C4 retest check ───────────────────────────────────
+        setup = pending_signals.get(symbol)
+        if setup and not setup["alerted"]:
+            c4          = confirmed[-1]
+            direction   = setup["direction"]
+            entry       = setup["entry_trigger"]
+            sl          = setup["stop_loss"]
+            setup_time  = setup["setup_candle_time"]
+            rr          = abs(entry - sl)
+
+            # Expire after 4 candles (60 min)
+            c4_time     = int(c4["time"])
+            candle_ms   = 15 * 60 * 1000
+            age_candles = (c4_time - setup_time) // candle_ms
+            if age_candles > 4:
+                pending_signals.pop(symbol, None)
+                return
+
+            triggered = False
+            if direction == "BUY"  and high_of(c4) >= entry:
+                triggered = True
+            if direction == "SELL" and low_of(c4)  <= entry:
+                triggered = True
+
+            if triggered:
+                sig_id           = (symbol, direction, setup_time)
+                last_alerted[sig_id] = True
+                setup["alerted"]     = True
+                pending_signals.pop(symbol, None)
+
+                entry_r = round(entry, 4)
+                sl_r    = round(sl, 4)
+
+                if direction == "BUY":
+                    tp1 = round(entry + rr * 3, 4)
+                    tp2 = round(entry + rr * 4, 4)
+                    msg = (
+                        f"🟢 BUY SIGNAL — {symbol}\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⏱ Timeframe : 15m\n"
+                        f"📐 Strategy  : EMA21 Rejection + C4 Retest\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🎯 Entry     : {entry_r}\n"
+                        f"🛑 Stop Loss : {sl_r}\n"
+                        f"💰 TP1 (1:3) : {tp1}\n"
+                        f"💰 TP2 (1:4) : {tp2}\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
                         f"⚡ Niti Alert"
                     )
-                    print(f"BUY (c2): {symbol}")
-
-            # c2 did NOT fire → check c3
-            elif is_red(c3) and close_of(c3) > ema_c3:
-                sig_time = int(c3["time"])
-                sig_key  = ("BUY", sig_time)
-                if (now_ms - sig_time <= candle_15m_ms * 2
-                        and last_signal.get(symbol) != sig_key):
-                    last_signal[symbol] = sig_key
-                    send_tg(
-                        f"🟢 BUY — {symbol}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📊 EMA21: {ema_c3:.4f}\n"
-                        f"🕯 Close: {close_of(c3):.4f}\n"
-                        f"⏱ 15m | EMA Reclaim\n"
-                        f"━━━━━━━━━━━━━━━\n"
+                else:
+                    tp1 = round(entry - rr * 3, 4)
+                    tp2 = round(entry - rr * 4, 4)
+                    msg = (
+                        f"🔴 SELL SIGNAL — {symbol}\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⏱ Timeframe : 15m\n"
+                        f"📐 Strategy  : EMA21 Rejection + C4 Retest\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🎯 Entry     : {entry_r}\n"
+                        f"🛑 Stop Loss : {sl_r}\n"
+                        f"💰 TP1 (1:3) : {tp1}\n"
+                        f"💰 TP2 (1:4) : {tp2}\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
                         f"⚡ Niti Alert"
                     )
-                    print(f"BUY (c3): {symbol}")
 
-        # ── SELL ─────────────────────────────────────────────────────────
-        # c1 closed ABOVE its EMA
-        # c2 or c3: must be GREEN AND close BELOW its own EMA
-
-        if close_of(c1) > ema_c1:  # trigger
-            if is_green(c2) and close_of(c2) < ema_c2:
-                sig_time = int(c2["time"])
-                sig_key  = ("SELL", sig_time)
-                if (now_ms - sig_time <= candle_15m_ms * 2
-                        and last_signal.get(symbol) != sig_key):
-                    last_signal[symbol] = sig_key
-                    send_tg(
-                        f"🔴 SELL — {symbol}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📊 EMA21: {ema_c2:.4f}\n"
-                        f"🕯 Close: {close_of(c2):.4f}\n"
-                        f"⏱ 15m | EMA Rejection\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"⚡ Niti Alert"
-                    )
-                    print(f"SELL (c2): {symbol}")
-
-            elif is_green(c3) and close_of(c3) < ema_c3:
-                sig_time = int(c3["time"])
-                sig_key  = ("SELL", sig_time)
-                if (now_ms - sig_time <= candle_15m_ms * 2
-                        and last_signal.get(symbol) != sig_key):
-                    last_signal[symbol] = sig_key
-                    send_tg(
-                        f"🔴 SELL — {symbol}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📊 EMA21: {ema_c2:.4f}\n"
-                        f"🕯 Close: {close_of(c3):.4f}\n"
-                        f"⏱ 15m | EMA Rejection\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"⚡ Niti Alert"
-                    )
-                    print(f"SELL (c3): {symbol}")
+                send_tg(msg)
+                print(f"{direction}: {symbol} | Entry={entry_r} | SL={sl_r} | TP1={tp1} | TP2={tp2}")
 
     except Exception as e:
         print(f"[{symbol}] error: {e}")
 
 
 def monitor_loop():
-    print("Monitor started")
+    print("Monitor started — EMA21 Rejection + C4 Retest | 1:3 / 1:4 RR")
     while True:
         try:
             symbols = get_futures_symbols()
@@ -194,7 +231,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti EMA Bot is running!", 200
+    return "Niti EMA Bot v2 is running!", 200
 
 
 if __name__ == "__main__":

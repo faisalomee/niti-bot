@@ -11,8 +11,6 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
 BASE_URL = "https://open-api.bingx.com"
 
-# ── helpers ──────────────────────────────────────────────
-
 def sign(params: dict) -> str:
     qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     return hmac.new(SECRET_KEY.encode(), qs.encode(),
@@ -39,7 +37,6 @@ def get_candles(symbol, limit=30):
     r = requests.get(url, params=params,
                      headers=headers, timeout=10).json()
     candles = r.get("data", [])
-    # sort oldest first
     candles.sort(key=lambda x: x["time"])
     return candles
 
@@ -58,22 +55,25 @@ def send_tg(msg):
         "parse_mode": "HTML"
     }, timeout=10)
 
-# ── signal state per symbol ──────────────────────────────
-
-state = {}   # symbol -> {"phase": None/"below"/"above", "count": int}
+# last_signal[symbol] = candle time of last sent signal
+last_signal = {}
 
 def check_symbol(symbol):
     try:
         candles = get_candles(symbol, limit=30)
         if len(candles) < 25:
             return
-        closes = [float(c["close"]) for c in candles]
-        ema21  = calc_ema(closes[:-1], 21)   # EMA on all but last (confirmed)
 
-        # last 3 confirmed candles (index -4, -3, -2), current unconfirmed = -1
-        c1 = candles[-4]   # 3 bars ago
-        c2 = candles[-3]   # 2 bars ago (trigger candle)
-        c3 = candles[-2]   # 1 bar ago  (signal candle)
+        closes = [float(c["close"]) for c in candles]
+        ema21  = calc_ema(closes[:-1], 21)
+
+        now_ms        = int(time.time() * 1000)
+        candle_15m_ms = 15 * 60 * 1000
+
+        # c1 = 3 bars ago, c2 = 2 bars ago, c3 = 1 bar ago (all confirmed)
+        c1 = candles[-4]
+        c2 = candles[-3]
+        c3 = candles[-2]
 
         c1_close = float(c1["close"])
         c2_close = float(c2["close"])
@@ -86,60 +86,59 @@ def check_symbol(symbol):
         c2_green = not c2_red
         c3_green = not c3_red
 
-        key = symbol
-        if key not in state:
-            state[key] = {"last_signal": None}
-
-        # ── BUY condition ────────────────────────────────
-        # c1 closed BELOW ema
-        # within next 2 candles (c2 or c3): one RED candle closes ABOVE ema
+        # ── BUY ──────────────────────────────────────────
+        # c1 below EMA, then c2 or c3: RED candle closes ABOVE EMA
         buy_trigger = c1_close < ema21
         buy_c2 = buy_trigger and c2_red and c2_close > ema21
-        buy_c3 = buy_trigger and c3_red and c3_close > ema21 and not (c2_red and c2_close > ema21)
+        buy_c3 = (buy_trigger and c3_red and c3_close > ema21
+                  and not (c2_red and c2_close > ema21))
 
         if buy_c2 or buy_c3:
-            sig_candle = c2 if buy_c2 else c3
-            sig_id = sig_candle["time"]
-            if state[key]["last_signal"] != ("BUY", sig_id):
-                state[key]["last_signal"] = ("BUY", sig_id)
-                msg = (
-                    f"🟢 BUY SIGNAL — {symbol}\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"📊 EMA21: {ema21:.4f}\n"
-                    f"🕯 Close: {float(sig_candle['close']):.4f}\n"
-                    f"⏱ Timeframe: 15m\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"⚡ EMA Reclaim Signal"
-                )
-                send_tg(msg)
+            sig = c2 if buy_c2 else c3
+            sig_time = int(sig["time"])
+            # only fire if candle is recent (within last 2 candles)
+            if now_ms - sig_time <= candle_15m_ms * 2:
+                sig_key = (symbol, "BUY", sig_time)
+                if last_signal.get(symbol) != sig_key:
+                    last_signal[symbol] = sig_key
+                    send_tg(
+                        f"🟢 BUY — {symbol}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"📊 EMA21: {ema21:.4f}\n"
+                        f"🕯 Close: {float(sig['close']):.4f}\n"
+                        f"⏱ 15m | EMA Reclaim\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"⚡ Niti Alert"
+                    )
+                    print(f"BUY signal sent: {symbol}")
 
-        # ── SELL condition ───────────────────────────────
-        # c1 closed ABOVE ema
-        # within next 2 candles: one GREEN candle closes BELOW ema
+        # ── SELL ─────────────────────────────────────────
+        # c1 above EMA, then c2 or c3: GREEN candle closes BELOW EMA
         sell_trigger = c1_close > ema21
         sell_c2 = sell_trigger and c2_green and c2_close < ema21
-        sell_c3 = sell_trigger and c3_green and c3_close < ema21 and not (c2_green and c2_close < ema21)
+        sell_c3 = (sell_trigger and c3_green and c3_close < ema21
+                   and not (c2_green and c2_close < ema21))
 
         if sell_c2 or sell_c3:
-            sig_candle = c2 if sell_c2 else c3
-            sig_id = sig_candle["time"]
-            if state[key]["last_signal"] != ("SELL", sig_id):
-                state[key]["last_signal"] = ("SELL", sig_id)
-                msg = (
-                    f"🔴 SELL SIGNAL — {symbol}\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"📊 EMA21: {ema21:.4f}\n"
-                    f"🕯 Close: {float(sig_candle['close']):.4f}\n"
-                    f"⏱ Timeframe: 15m\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"⚡ EMA Rejection Signal"
-                )
-                send_tg(msg)
+            sig = c2 if sell_c2 else c3
+            sig_time = int(sig["time"])
+            if now_ms - sig_time <= candle_15m_ms * 2:
+                sig_key = (symbol, "SELL", sig_time)
+                if last_signal.get(symbol) != sig_key:
+                    last_signal[symbol] = sig_key
+                    send_tg(
+                        f"🔴 SELL — {symbol}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"📊 EMA21: {ema21:.4f}\n"
+                        f"🕯 Close: {float(sig['close']):.4f}\n"
+                        f"⏱ 15m | EMA Rejection\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"⚡ Niti Alert"
+                    )
+                    print(f"SELL signal sent: {symbol}")
 
     except Exception as e:
         print(f"[{symbol}] error: {e}")
-
-# ── main loop ────────────────────────────────────────────
 
 def monitor_loop():
     print("Monitor started")
@@ -149,10 +148,11 @@ def monitor_loop():
             print(f"Scanning {len(symbols)} pairs...")
             for sym in symbols:
                 check_symbol(sym)
-                time.sleep(0.3)   # rate limit
+                time.sleep(0.3)
+            print("Scan complete. Sleeping 14 min...")
         except Exception as e:
             print(f"Loop error: {e}")
-        time.sleep(60 * 14)   # re-scan every 14 min (15m candle)
+        time.sleep(60 * 14)
 
 @app.route("/")
 def health():

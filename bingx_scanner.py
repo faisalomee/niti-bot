@@ -1,4 +1,4 @@
-import os, time, hmac, hashlib, requests, traceback
+import os, time, hmac, hashlib, requests
 from flask import Flask
 from threading import Thread
 
@@ -9,9 +9,7 @@ SECRET_KEY = os.environ.get("BINGX_SECRET_KEY")
 TG_TOKEN   = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
-BASE_URL  = "https://open-api.bingx.com"
-CANDLE_MS = 15 * 60 * 1000
-TIMEOUT   = 15  # seconds
+BASE_URL = "https://open-api.bingx.com"
 
 
 def sign(params: dict) -> str:
@@ -21,37 +19,24 @@ def sign(params: dict) -> str:
 
 
 def get_futures_symbols():
-    try:
-        url = BASE_URL + "/openApi/swap/v2/quote/contracts"
-        r = requests.get(url, timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        symbols = [c["symbol"] for c in data.get("data", [])
-                   if c.get("status") == 1 and "USDT" in c["symbol"]]
-        print(f"Got {len(symbols)} symbols from BingX")
-        return symbols
-    except Exception as e:
-        print(f"get_futures_symbols error: {e}")
-        return []
+    url = BASE_URL + "/openApi/swap/v2/quote/contracts"
+    r = requests.get(url, timeout=10).json()
+    return [c["symbol"] for c in r.get("data", [])
+            if c.get("status") == 1 and "USDT" in c["symbol"]]
 
 
 def get_candles(symbol, limit=60):
-    try:
-        ts = int(time.time() * 1000)
-        params = {"symbol": symbol, "interval": "15m",
-                  "limit": limit, "timestamp": ts}
-        params["signature"] = sign(params)
-        url = BASE_URL + "/openApi/swap/v3/quote/klines"
-        r = requests.get(url, params=params,
-                         headers={"X-BX-APIKEY": API_KEY},
-                         timeout=TIMEOUT)
-        r.raise_for_status()
-        candles = r.json().get("data", [])
-        candles.sort(key=lambda x: x["time"])
-        return candles
-    except Exception as e:
-        print(f"get_candles [{symbol}] error: {e}")
-        return []
+    ts = int(time.time() * 1000)
+    params = {"symbol": symbol, "interval": "15m",
+              "limit": limit, "timestamp": ts}
+    params["signature"] = sign(params)
+    url = BASE_URL + "/openApi/swap/v3/quote/klines"
+    r = requests.get(url, params=params,
+                     headers={"X-BX-APIKEY": API_KEY},
+                     timeout=10).json()
+    candles = r.get("data", [])
+    candles.sort(key=lambda x: x["time"])
+    return candles
 
 
 def calc_ema_series(closes, period=21):
@@ -65,15 +50,15 @@ def calc_ema_series(closes, period=21):
 
 
 def send_tg(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": TG_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML"
-        }, timeout=TIMEOUT)
-    except Exception as e:
-        print(f"send_tg error: {e}")
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": TG_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML"
+    }, timeout=10)
+
+
+last_alerted = set()
 
 
 def close_of(c): return float(c["close"])
@@ -84,20 +69,19 @@ def is_red(c):   return close_of(c) < open_of(c)
 def is_green(c): return close_of(c) > open_of(c)
 
 
-last_alerted = set()
-
-
 def check_symbol(symbol):
     try:
         candles = get_candles(symbol, limit=60)
         if len(candles) < 10:
             return
 
-        confirmed = candles[:-1]  # skip currently open candle
+        # skip currently open candle
+        confirmed = candles[:-1]
         closes    = [float(c["close"]) for c in confirmed]
         ema_vals  = calc_ema_series(closes, period=21)
 
-        # need i, i+1, i+2, i+3 — so max i = len-4
+        # C1=i, C2=i+1, C3=i+2, C4=i+3
+        # max i = len-4 so i+3 never goes out of range
         scan_end   = len(confirmed) - 4
         scan_start = max(0, scan_end - 5)
 
@@ -115,9 +99,10 @@ def check_symbol(symbol):
             ema_c3 = ema_vals[i + 2]
 
             # ── BUY ──
-            # C1: close BELOW EMA
-            # C2 or C3: RED candle, close ABOVE EMA (rejection up)
-            # C4: high >= rejection candle high → entry
+            # C1 close below EMA
+            # C2 or C3: RED candle, close above EMA (rejection up)
+            # C4 high touches rejection candle high → entry
+            # SL = rejection candle low
             if close_of(c1) < ema_c1:
                 rej = None
                 if is_red(c2) and close_of(c2) > ema_c2:
@@ -126,8 +111,7 @@ def check_symbol(symbol):
                     rej = c3
 
                 if rej is not None:
-                    rej_time = int(rej["time"])
-                    sig_id   = (symbol, "BUY", rej_time)
+                    sig_id = (symbol, "BUY", int(rej["time"]))
                     if sig_id not in last_alerted:
                         entry = high_of(rej)
                         sl    = low_of(rej)
@@ -136,7 +120,7 @@ def check_symbol(symbol):
                             last_alerted.add(sig_id)
                             tp1 = round(entry + rr * 3, 4)
                             tp2 = round(entry + rr * 4, 4)
-                            msg = (
+                            send_tg(
                                 f"🟢 BUY SIGNAL — {symbol}\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
                                 f"⏱ Timeframe : 15m\n"
@@ -149,14 +133,14 @@ def check_symbol(symbol):
                                 f"━━━━━━━━━━━━━━━━━━\n"
                                 f"⚡ Niti Alert"
                             )
-                            send_tg(msg)
                             print(f"BUY: {symbol} | Entry={round(entry,4)} SL={round(sl,4)}")
                 break
 
             # ── SELL ──
-            # C1: close ABOVE EMA
-            # C2 or C3: GREEN candle, close BELOW EMA (rejection down)
-            # C4: low <= rejection candle low → entry
+            # C1 close above EMA
+            # C2 or C3: GREEN candle, close below EMA (rejection down)
+            # C4 low touches rejection candle low → entry
+            # SL = rejection candle high
             if close_of(c1) > ema_c1:
                 rej = None
                 if is_green(c2) and close_of(c2) < ema_c2:
@@ -165,8 +149,7 @@ def check_symbol(symbol):
                     rej = c3
 
                 if rej is not None:
-                    rej_time = int(rej["time"])
-                    sig_id   = (symbol, "SELL", rej_time)
+                    sig_id = (symbol, "SELL", int(rej["time"]))
                     if sig_id not in last_alerted:
                         entry = low_of(rej)
                         sl    = high_of(rej)
@@ -175,7 +158,7 @@ def check_symbol(symbol):
                             last_alerted.add(sig_id)
                             tp1 = round(entry - rr * 3, 4)
                             tp2 = round(entry - rr * 4, 4)
-                            msg = (
+                            send_tg(
                                 f"🔴 SELL SIGNAL — {symbol}\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
                                 f"⏱ Timeframe : 15m\n"
@@ -188,37 +171,31 @@ def check_symbol(symbol):
                                 f"━━━━━━━━━━━━━━━━━━\n"
                                 f"⚡ Niti Alert"
                             )
-                            send_tg(msg)
                             print(f"SELL: {symbol} | Entry={round(entry,4)} SL={round(sl,4)}")
                 break
 
     except Exception as e:
-        print(f"[{symbol}] error: {traceback.format_exc()}")
+        print(f"[{symbol}] error: {e}")
 
 
 def monitor_loop():
-    print("Monitor started — EMA21 Rejection + C4 Strict Retest | 1:3/1:4 RR")
+    print("Monitor started — EMA21 Rejection + C4 Retest | 1:3/1:4 RR")
     while True:
         try:
-            print("Fetching symbols...")
             symbols = get_futures_symbols()
-            if not symbols:
-                print("No symbols fetched! Retrying in 2 min...")
-                time.sleep(120)
-                continue
             print(f"Scanning {len(symbols)} pairs...")
             for sym in symbols:
                 check_symbol(sym)
                 time.sleep(0.3)
             print("Scan complete. Sleeping 14 min...")
         except Exception as e:
-            print(f"Loop error: {traceback.format_exc()}")
+            print(f"Loop error: {e}")
         time.sleep(60 * 14)
 
 
 @app.route("/")
 def health():
-    return "Niti EMA Bot v5 is running!", 200
+    return "Niti EMA Bot is running!", 200
 
 
 if __name__ == "__main__":

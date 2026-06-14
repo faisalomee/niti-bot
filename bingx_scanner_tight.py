@@ -42,6 +42,8 @@ def get_candles(symbol, limit=150):
                      headers={"X-BX-APIKEY": API_KEY},
                      timeout=10).json()
     candles = r.get("data", [])
+    if not isinstance(candles, list):
+        return []
     candles.sort(key=lambda x: x["time"])
     return candles
 

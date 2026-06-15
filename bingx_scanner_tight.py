@@ -79,21 +79,25 @@ def is_red(c):    return close_of(c) < open_of(c)
 def is_green(c):  return close_of(c) > open_of(c)
 
 
-def volume_spike_ok(confirmed, i):
+def volume_spike_ok(confirmed, i, symbol, side):
     """
     i = index of C1 (so C1..C4 = confirmed[i..i+3]).
     Returns True if ANY ONE of C1, C2, C3, C4 has volume >= 40x
     the average volume of the 100 candles immediately BEFORE C1.
+
+    Also logs the actual ratio found, so the multiplier can be
+    tuned later based on real data.
     """
     window = confirmed[i - VOLUME_LOOKBACK:i]
     avg_vol = sum(vol_of(c) for c in window) / VOLUME_LOOKBACK
     if avg_vol <= 0:
         return False
     threshold = avg_vol * VOLUME_MULTIPLIER
-    for idx in range(i, i + 4):
-        if vol_of(confirmed[idx]) >= threshold:
-            return True
-    return False
+    max_vol = max(vol_of(confirmed[idx]) for idx in range(i, i + 4))
+    ratio = max_vol / avg_vol
+    print(f"[INFO] {symbol} {side} setup | volume ratio = {ratio:.1f}x "
+          f"(need {VOLUME_MULTIPLIER}x)")
+    return max_vol >= threshold
 
 
 def check_symbol(symbol):
@@ -144,7 +148,7 @@ def check_symbol(symbol):
                         entry = high_of(rej)
                         sl    = low_of(rej)
                         rr    = abs(entry - sl)
-                        if high_of(c4) >= entry and volume_spike_ok(confirmed, i):
+                        if high_of(c4) >= entry and volume_spike_ok(confirmed, i, symbol, "BUY"):
                             last_alerted.add(sig_id)
                             tp1 = round(entry + rr * 3, 4)
                             tp2 = round(entry + rr * 4, 4)
@@ -182,7 +186,7 @@ def check_symbol(symbol):
                         entry = low_of(rej)
                         sl    = high_of(rej)
                         rr    = abs(entry - sl)
-                        if low_of(c4) <= entry and volume_spike_ok(confirmed, i):
+                        if low_of(c4) <= entry and volume_spike_ok(confirmed, i, symbol, "SELL"):
                             last_alerted.add(sig_id)
                             tp1 = round(entry - rr * 3, 4)
                             tp2 = round(entry - rr * 4, 4)

@@ -16,7 +16,7 @@ BASE_URL = "https://open-api.bingx.com"
 # -- New filter settings --
 TIMEFRAME         = "1m"
 VOLUME_LOOKBACK   = 100   # number of prior candles used for average volume
-VOLUME_MULTIPLIER = 400   # one of C1-C4 must have volume >= avg * this
+VOLUME_MULTIPLIER = 40    # one of C1-C4 must have volume >= avg * this
 
 
 def sign(params: dict) -> str:
@@ -82,7 +82,7 @@ def is_green(c):  return close_of(c) > open_of(c)
 def volume_spike_ok(confirmed, i):
     """
     i = index of C1 (so C1..C4 = confirmed[i..i+3]).
-    Returns True if ANY ONE of C1, C2, C3, C4 has volume >= 400x
+    Returns True if ANY ONE of C1, C2, C3, C4 has volume >= 40x
     the average volume of the 100 candles immediately BEFORE C1.
     """
     window = confirmed[i - VOLUME_LOOKBACK:i]
@@ -152,7 +152,7 @@ def check_symbol(symbol):
                                 f"BUY SIGNAL -- {symbol}\n"
                                 f"------------------\n"
                                 f"Timeframe : 1m\n"
-                                f"Strategy  : EMA21 Rejection + C4 Retest + 400x Volume Spike\n"
+                                f"Strategy  : EMA21 Rejection + C4 Retest + 40x Volume Spike\n"
                                 f"------------------\n"
                                 f"Entry     : {round(entry,4)}\n"
                                 f"Stop Loss : {round(sl,4)}\n"
@@ -190,7 +190,7 @@ def check_symbol(symbol):
                                 f"SELL SIGNAL -- {symbol}\n"
                                 f"------------------\n"
                                 f"Timeframe : 1m\n"
-                                f"Strategy  : EMA21 Rejection + C4 Retest + 400x Volume Spike\n"
+                                f"Strategy  : EMA21 Rejection + C4 Retest + 40x Volume Spike\n"
                                 f"------------------\n"
                                 f"Entry     : {round(entry,4)}\n"
                                 f"Stop Loss : {round(sl,4)}\n"
@@ -207,7 +207,7 @@ def check_symbol(symbol):
 
 
 def monitor_loop():
-    print("Monitor started -- 1m EMA21 Rejection + C4 Retest + 400x Volume Spike (any 1 of 4 candles)")
+    print("Monitor started -- 1m EMA21 Rejection + C4 Retest + 40x Volume Spike (any 1 of 4 candles)")
     while True:
         try:
             symbols = get_futures_symbols()

@@ -6,17 +6,21 @@ app = Flask(__name__)
 
 API_KEY    = os.environ.get("BINGX_API_KEY")
 SECRET_KEY = os.environ.get("BINGX_SECRET_KEY")
-
-# Separate Telegram bot/channel for this tighter strategy
 TG_TOKEN   = os.environ.get("TG_BOT_TOKEN_TIGHT")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID_TIGHT")
 
 BASE_URL = "https://open-api.bingx.com"
 
-# -- New filter settings --
+# -- Strategy Settings --
 TIMEFRAME         = "1m"
-VOLUME_LOOKBACK   = 100   # number of prior candles used for average volume
-VOLUME_MULTIPLIER = 40    # one of C1-C4 must have volume >= avg * this
+EMA_FAST          = 9
+EMA_SLOW          = 21
+RSI_LEN           = 14
+VOLUME_LOOKBACK   = 100
+VOLUME_MULTIPLIER = 10     # volume spike filter (x of 100-candle avg)
+RR_RATIO          = 4      # 1:4 Risk:Reward
+SL_BUFFER_PCT     = 0.15   # % buffer beyond 21 EMA for SL
+SWING_LOOKBACK    = 5      # candles to look back for swing low/high
 
 
 def sign(params: dict) -> str:
@@ -32,7 +36,7 @@ def get_futures_symbols():
             if c.get("status") == 1 and "USDT" in c["symbol"]]
 
 
-def get_candles(symbol, limit=150):
+def get_candles(symbol, limit=200):
     ts = int(time.time() * 1000)
     params = {"symbol": symbol, "interval": TIMEFRAME,
               "limit": limit, "timestamp": ts}
@@ -48,14 +52,33 @@ def get_candles(symbol, limit=150):
     return candles
 
 
-def calc_ema_series(closes, period=21):
+def ema_series(closes, period):
     k = 2 / (period + 1)
     ema = closes[0]
-    ema_vals = []
+    result = []
     for c in closes:
         ema = c * k + ema * (1 - k)
-        ema_vals.append(ema)
-    return ema_vals
+        result.append(ema)
+    return result
+
+
+def rsi_series(closes, period=14):
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    if len(gains) < period:
+        return [50.0] * len(closes)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsi_vals = [50.0] * (period + 1)
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rs = avg_gain / avg_loss if avg_loss != 0 else 100
+        rsi_vals.append(100 - 100 / (1 + rs))
+    return rsi_vals
 
 
 def send_tg(msg):
@@ -70,148 +93,123 @@ def send_tg(msg):
 last_alerted = set()
 
 
-def close_of(c):  return float(c["close"])
-def open_of(c):   return float(c["open"])
-def high_of(c):   return float(c["high"])
-def low_of(c):    return float(c["low"])
-def vol_of(c):    return float(c["volume"])
-def is_red(c):    return close_of(c) < open_of(c)
-def is_green(c):  return close_of(c) > open_of(c)
-
-
-def volume_spike_ok(confirmed, i, symbol, side):
-    """
-    i = index of C1 (so C1..C4 = confirmed[i..i+3]).
-    Returns True if ANY ONE of C1, C2, C3, C4 has volume >= 40x
-    the average volume of the 100 candles immediately BEFORE C1.
-
-    Also logs the actual ratio found, so the multiplier can be
-    tuned later based on real data.
-    """
-    window = confirmed[i - VOLUME_LOOKBACK:i]
-    avg_vol = sum(vol_of(c) for c in window) / VOLUME_LOOKBACK
-    if avg_vol <= 0:
-        return False
-    threshold = avg_vol * VOLUME_MULTIPLIER
-    max_vol = max(vol_of(confirmed[idx]) for idx in range(i, i + 4))
-    ratio = max_vol / avg_vol
-    print(f"[INFO] {symbol} {side} setup | volume ratio = {ratio:.1f}x "
-          f"(need {VOLUME_MULTIPLIER}x)")
-    return max_vol >= threshold
+def o(c):  return float(c["open"])
+def h(c):  return float(c["high"])
+def l(c):  return float(c["low"])
+def cl(c): return float(c["close"])
+def v(c):  return float(c["volume"])
 
 
 def check_symbol(symbol):
     try:
-        candles = get_candles(symbol, limit=150)
-        # need >= VOLUME_LOOKBACK candles before C1, plus C1..C4, plus the open candle
-        if len(candles) < VOLUME_LOOKBACK + 6:
+        candles = get_candles(symbol, limit=200)
+        min_len = VOLUME_LOOKBACK + RSI_LEN + 10
+        if len(candles) < min_len:
             return
 
-        # skip currently open (unconfirmed) candle
         confirmed = candles[:-1]
-        closes    = [float(c["close"]) for c in confirmed]
-        ema_vals  = calc_ema_series(closes, period=21)
+        closes = [cl(c) for c in confirmed]
+        vols   = [v(c)  for c in confirmed]
 
-        # C1=i, C2=i+1, C3=i+2, C4=i+3
-        # need i >= VOLUME_LOOKBACK so there are 100 candles before C1
-        scan_end   = len(confirmed) - 4
-        scan_start = max(VOLUME_LOOKBACK, scan_end - 5)
+        ema_fast_vals = ema_series(closes, EMA_FAST)
+        ema_slow_vals = ema_series(closes, EMA_SLOW)
+        rsi_vals      = rsi_series(closes, RSI_LEN)
 
-        if scan_end < VOLUME_LOOKBACK:
+        i = len(confirmed) - 1
+        p = i - 1
+
+        if p < VOLUME_LOOKBACK:
             return
 
-        for i in range(scan_end, scan_start - 1, -1):
-            c1 = confirmed[i]
-            c2 = confirmed[i + 1]
-            c3 = confirmed[i + 2]
-            c4 = confirmed[i + 3]
+        # EMA crossover detection
+        bull_cross = (ema_fast_vals[p] <= ema_slow_vals[p] and
+                      ema_fast_vals[i] >  ema_slow_vals[i])
+        bear_cross = (ema_fast_vals[p] >= ema_slow_vals[p] and
+                      ema_fast_vals[i] <  ema_slow_vals[i])
 
-            ema_c1 = ema_vals[i]
-            ema_c2 = ema_vals[i + 1]
-            ema_c3 = ema_vals[i + 2]
+        if not bull_cross and not bear_cross:
+            return
 
-            # -- BUY --
-            # C1 close below EMA
-            # C2 or C3: RED candle, close above EMA (rejection up)
-            # C4 high touches rejection candle high -> entry
-            # SL = rejection candle low
-            if close_of(c1) < ema_c1:
-                rej = None
-                if is_red(c2) and close_of(c2) > ema_c2:
-                    rej = c2
-                elif is_red(c3) and close_of(c3) > ema_c3:
-                    rej = c3
+        rsi_now      = rsi_vals[i]
+        avg_vol      = sum(vols[i - VOLUME_LOOKBACK:i]) / VOLUME_LOOKBACK
+        max_vol      = max(vols[p], vols[i])
+        ratio        = max_vol / avg_vol if avg_vol > 0 else 0
+        ema_slow_now = ema_slow_vals[i]
+        entry        = closes[i]
 
-                if rej is not None:
-                    sig_id = (symbol, "BUY", int(rej["time"]))
-                    if sig_id not in last_alerted:
-                        entry = high_of(rej)
-                        sl    = low_of(rej)
-                        rr    = abs(entry - sl)
-                        if high_of(c4) >= entry and volume_spike_ok(confirmed, i, symbol, "BUY"):
-                            last_alerted.add(sig_id)
-                            tp1 = round(entry + rr * 3, 4)
-                            tp2 = round(entry + rr * 4, 4)
-                            send_tg(
-                                f"BUY SIGNAL -- {symbol}\n"
-                                f"------------------\n"
-                                f"Timeframe : 1m\n"
-                                f"Strategy  : EMA21 Rejection + C4 Retest + 40x Volume Spike\n"
-                                f"------------------\n"
-                                f"Entry     : {round(entry,4)}\n"
-                                f"Stop Loss : {round(sl,4)}\n"
-                                f"TP1 (1:3) : {tp1}\n"
-                                f"TP2 (1:4) : {tp2}\n"
-                                f"------------------\n"
-                                f"Niti Tight Alert"
-                            )
-                            print(f"BUY: {symbol} | Entry={round(entry,4)} SL={round(sl,4)}")
-                break
+        swing_low  = min(l(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
+        swing_high = max(h(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
 
-            # -- SELL --
-            # C1 close above EMA
-            # C2 or C3: GREEN candle, close below EMA (rejection down)
-            # C4 low touches rejection candle low -> entry
-            # SL = rejection candle high
-            if close_of(c1) > ema_c1:
-                rej = None
-                if is_green(c2) and close_of(c2) < ema_c2:
-                    rej = c2
-                elif is_green(c3) and close_of(c3) < ema_c3:
-                    rej = c3
+        # -- LONG --
+        if bull_cross and 50 < rsi_now < 70:
+            sig_id = (symbol, "BUY", int(confirmed[i]["time"]))
+            if sig_id not in last_alerted:
+                sl   = min(swing_low, ema_slow_now * (1 - SL_BUFFER_PCT / 100))
+                risk = entry - sl
+                if risk <= 0:
+                    return
+                tp = round(entry + risk * RR_RATIO, 4)
+                sl = round(sl, 4)
 
-                if rej is not None:
-                    sig_id = (symbol, "SELL", int(rej["time"]))
-                    if sig_id not in last_alerted:
-                        entry = low_of(rej)
-                        sl    = high_of(rej)
-                        rr    = abs(entry - sl)
-                        if low_of(c4) <= entry and volume_spike_ok(confirmed, i, symbol, "SELL"):
-                            last_alerted.add(sig_id)
-                            tp1 = round(entry - rr * 3, 4)
-                            tp2 = round(entry - rr * 4, 4)
-                            send_tg(
-                                f"SELL SIGNAL -- {symbol}\n"
-                                f"------------------\n"
-                                f"Timeframe : 1m\n"
-                                f"Strategy  : EMA21 Rejection + C4 Retest + 40x Volume Spike\n"
-                                f"------------------\n"
-                                f"Entry     : {round(entry,4)}\n"
-                                f"Stop Loss : {round(sl,4)}\n"
-                                f"TP1 (1:3) : {tp1}\n"
-                                f"TP2 (1:4) : {tp2}\n"
-                                f"------------------\n"
-                                f"Niti Tight Alert"
-                            )
-                            print(f"SELL: {symbol} | Entry={round(entry,4)} SL={round(sl,4)}")
-                break
+                print(f"[INFO] {symbol} BUY crossover | RSI={rsi_now:.1f} | "
+                      f"vol_ratio={ratio:.1f}x (need {VOLUME_MULTIPLIER}x)")
+
+                if ratio >= VOLUME_MULTIPLIER:
+                    last_alerted.add(sig_id)
+                    send_tg(
+                        f"BUY SIGNAL -- {symbol}\n"
+                        f"------------------\n"
+                        f"Timeframe : 1m\n"
+                        f"Strategy  : EMA 9/21 Cross + RSI + 10x Volume\n"
+                        f"------------------\n"
+                        f"Entry     : {round(entry, 4)}\n"
+                        f"Stop Loss : {sl}\n"
+                        f"TP (1:4)  : {tp}\n"
+                        f"RSI       : {rsi_now:.1f}\n"
+                        f"Vol Ratio : {ratio:.1f}x\n"
+                        f"------------------\n"
+                        f"Niti Tight Alert"
+                    )
+                    print(f"BUY: {symbol} | Entry={round(entry,4)} SL={sl} TP={tp}")
+
+        # -- SHORT --
+        if bear_cross and 30 < rsi_now < 50:
+            sig_id = (symbol, "SELL", int(confirmed[i]["time"]))
+            if sig_id not in last_alerted:
+                sl   = max(swing_high, ema_slow_now * (1 + SL_BUFFER_PCT / 100))
+                risk = sl - entry
+                if risk <= 0:
+                    return
+                tp = round(entry - risk * RR_RATIO, 4)
+                sl = round(sl, 4)
+
+                print(f"[INFO] {symbol} SELL crossover | RSI={rsi_now:.1f} | "
+                      f"vol_ratio={ratio:.1f}x (need {VOLUME_MULTIPLIER}x)")
+
+                if ratio >= VOLUME_MULTIPLIER:
+                    last_alerted.add(sig_id)
+                    send_tg(
+                        f"SELL SIGNAL -- {symbol}\n"
+                        f"------------------\n"
+                        f"Timeframe : 1m\n"
+                        f"Strategy  : EMA 9/21 Cross + RSI + 10x Volume\n"
+                        f"------------------\n"
+                        f"Entry     : {round(entry, 4)}\n"
+                        f"Stop Loss : {sl}\n"
+                        f"TP (1:4)  : {tp}\n"
+                        f"RSI       : {rsi_now:.1f}\n"
+                        f"Vol Ratio : {ratio:.1f}x\n"
+                        f"------------------\n"
+                        f"Niti Tight Alert"
+                    )
+                    print(f"SELL: {symbol} | Entry={round(entry,4)} SL={sl} TP={tp}")
 
     except Exception as e:
         print(f"[{symbol}] error: {e}")
 
 
 def monitor_loop():
-    print("Monitor started -- 1m EMA21 Rejection + C4 Retest + 40x Volume Spike (any 1 of 4 candles)")
+    print("Monitor started -- 1m EMA 9/21 Cross + RSI 14 + 10x Volume | RR 1:4")
     while True:
         try:
             symbols = get_futures_symbols()
@@ -227,7 +225,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight Volume Bot (1m) is running!", 200
+    return "Niti Tight Bot (1m EMA 9/21 + RSI + 10x Vol) is running!", 200
 
 
 if __name__ == "__main__":

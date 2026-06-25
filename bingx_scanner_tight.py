@@ -17,10 +17,10 @@ EMA_FAST          = 9
 EMA_SLOW          = 21
 RSI_LEN           = 14
 VOLUME_LOOKBACK   = 100
-VOLUME_MULTIPLIER = 5      # volume spike filter (x of 100-candle avg)
-RR_RATIO          = 4      # 1:4 Risk:Reward
-SL_BUFFER_PCT     = 0.15   # % buffer beyond 21 EMA for SL
-SWING_LOOKBACK    = 5      # candles to look back for swing low/high
+VOLUME_MULTIPLIER = 5
+RR_RATIO          = 4
+SL_BUFFER_PCT     = 0.15
+SWING_LOOKBACK    = 5
 
 
 def sign(params: dict) -> str:
@@ -93,7 +93,6 @@ def send_tg(msg):
 last_alerted = set()
 
 
-def o(c):  return float(c["open"])
 def h(c):  return float(c["high"])
 def l(c):  return float(c["low"])
 def cl(c): return float(c["close"])
@@ -103,8 +102,7 @@ def v(c):  return float(c["volume"])
 def check_symbol(symbol):
     try:
         candles = get_candles(symbol, limit=200)
-        min_len = VOLUME_LOOKBACK + RSI_LEN + 10
-        if len(candles) < min_len:
+        if len(candles) < VOLUME_LOOKBACK + RSI_LEN + 10:
             return
 
         confirmed = candles[:-1]
@@ -117,7 +115,6 @@ def check_symbol(symbol):
 
         i = len(confirmed) - 1
         p = i - 1
-
         if p < VOLUME_LOOKBACK:
             return
 
@@ -135,9 +132,8 @@ def check_symbol(symbol):
         ratio        = max_vol / avg_vol if avg_vol > 0 else 0
         ema_slow_now = ema_slow_vals[i]
         entry        = closes[i]
-
-        swing_low  = min(l(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
-        swing_high = max(h(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
+        swing_low    = min(l(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
+        swing_high   = max(h(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
 
         # -- LONG --
         if bull_cross and 50 < rsi_now < 70:
@@ -149,10 +145,7 @@ def check_symbol(symbol):
                     return
                 tp = round(entry + risk * RR_RATIO, 4)
                 sl = round(sl, 4)
-
-                print(f"[INFO] {symbol} BUY crossover | RSI={rsi_now:.1f} | "
-                      f"vol_ratio={ratio:.1f}x (need {VOLUME_MULTIPLIER}x)")
-
+                print(f"[INFO] {symbol} BUY | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x (need {VOLUME_MULTIPLIER}x)")
                 if ratio >= VOLUME_MULTIPLIER:
                     last_alerted.add(sig_id)
                     send_tg(
@@ -181,10 +174,7 @@ def check_symbol(symbol):
                     return
                 tp = round(entry - risk * RR_RATIO, 4)
                 sl = round(sl, 4)
-
-                print(f"[INFO] {symbol} SELL crossover | RSI={rsi_now:.1f} | "
-                      f"vol_ratio={ratio:.1f}x (need {VOLUME_MULTIPLIER}x)")
-
+                print(f"[INFO] {symbol} SELL | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x (need {VOLUME_MULTIPLIER}x)")
                 if ratio >= VOLUME_MULTIPLIER:
                     last_alerted.add(sig_id)
                     send_tg(
@@ -228,5 +218,5 @@ def health():
 
 
 if __name__ == "__main__":
-    Thread(target=monitor_loop, daemon=True).start()\n    app.run(host="0.0.0.0",
-            port=int(os.environ.get("PORT", 5000)))
+    Thread(target=monitor_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

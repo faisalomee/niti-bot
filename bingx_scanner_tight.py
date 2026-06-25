@@ -12,12 +12,12 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID_TIGHT")
 BASE_URL = "https://open-api.bingx.com"
 
 # -- Strategy Settings --
-TIMEFRAME         = "1m"
+TIMEFRAME         = "15m"
 EMA_FAST          = 9
 EMA_SLOW          = 21
 RSI_LEN           = 14
 VOLUME_LOOKBACK   = 100
-VOLUME_MULTIPLIER = 5     # volume spike filter (x of 100-candle avg)
+VOLUME_MULTIPLIER = 5      # volume spike filter (x of 100-candle avg)
 RR_RATIO          = 4      # 1:4 Risk:Reward
 SL_BUFFER_PCT     = 0.15   # % buffer beyond 21 EMA for SL
 SWING_LOOKBACK    = 5      # candles to look back for swing low/high
@@ -121,7 +121,6 @@ def check_symbol(symbol):
         if p < VOLUME_LOOKBACK:
             return
 
-        # EMA crossover detection
         bull_cross = (ema_fast_vals[p] <= ema_slow_vals[p] and
                       ema_fast_vals[i] >  ema_slow_vals[i])
         bear_cross = (ema_fast_vals[p] >= ema_slow_vals[p] and
@@ -159,8 +158,8 @@ def check_symbol(symbol):
                     send_tg(
                         f"BUY SIGNAL -- {symbol}\n"
                         f"------------------\n"
-                        f"Timeframe : 1m\n"
-                        f"Strategy  : EMA 9/21 Cross + RSI + 10x Volume\n"
+                        f"Timeframe : 15m\n"
+                        f"Strategy  : EMA 9/21 Cross + RSI + 5x Volume\n"
                         f"------------------\n"
                         f"Entry     : {round(entry, 4)}\n"
                         f"Stop Loss : {sl}\n"
@@ -191,8 +190,8 @@ def check_symbol(symbol):
                     send_tg(
                         f"SELL SIGNAL -- {symbol}\n"
                         f"------------------\n"
-                        f"Timeframe : 1m\n"
-                        f"Strategy  : EMA 9/21 Cross + RSI + 10x Volume\n"
+                        f"Timeframe : 15m\n"
+                        f"Strategy  : EMA 9/21 Cross + RSI + 5x Volume\n"
                         f"------------------\n"
                         f"Entry     : {round(entry, 4)}\n"
                         f"Stop Loss : {sl}\n"
@@ -209,7 +208,7 @@ def check_symbol(symbol):
 
 
 def monitor_loop():
-    print("Monitor started -- 1m EMA 9/21 Cross + RSI 14 + 10x Volume | RR 1:4")
+    print("Monitor started -- 15m EMA 9/21 Cross + RSI 14 + 5x Volume | RR 1:4")
     while True:
         try:
             symbols = get_futures_symbols()
@@ -225,10 +224,9 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight Bot (1m EMA 9/21 + RSI + 10x Vol) is running!", 200
+    return "Niti Tight Bot (15m EMA 9/21 + RSI + 5x Vol) is running!", 200
 
 
 if __name__ == "__main__":
-    Thread(target=monitor_loop, daemon=True).start()
-    app.run(host="0.0.0.0",
+    Thread(target=monitor_loop, daemon=True).start()\n    app.run(host="0.0.0.0",
             port=int(os.environ.get("PORT", 5000)))

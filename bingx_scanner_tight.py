@@ -29,10 +29,13 @@ auto_trade_enabled = False
 symbol_precision   = {}
 
 
-def sign(params: dict) -> str:
+def build_signed_params(params: dict) -> dict:
+    params["timestamp"] = int(time.time() * 1000)
     qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(SECRET_KEY.encode(), qs.encode(),
-                    hashlib.sha256).hexdigest()
+    params["signature"] = hmac.new(
+        SECRET_KEY.encode(), qs.encode(), hashlib.sha256
+    ).hexdigest()
+    return params
 
 
 def get_futures_symbols():
@@ -48,14 +51,10 @@ def get_futures_symbols():
 
 
 def get_candles(symbol, limit=200):
-    ts = int(time.time() * 1000)
-    params = {"symbol": symbol, "interval": TIMEFRAME,
-              "limit": limit, "timestamp": ts}
-    params["signature"] = sign(params)
+    params = build_signed_params({"symbol": symbol, "interval": TIMEFRAME, "limit": limit})
     url = BASE_URL + "/openApi/swap/v3/quote/klines"
     r = requests.get(url, params=params,
-                     headers={"X-BX-APIKEY": API_KEY},
-                     timeout=10).json()
+                     headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     candles = r.get("data", [])
     if not isinstance(candles, list):
         return []
@@ -103,16 +102,9 @@ def send_tg(msg):
 
 def set_leverage(symbol):
     try:
-        ts  = int(time.time() * 1000)
         url = BASE_URL + "/openApi/swap/v2/trade/leverage"
         for side in ["LONG", "SHORT"]:
-            params = {
-                "symbol":    symbol,
-                "side":      side,
-                "leverage":  LEVERAGE,
-                "timestamp": ts
-            }
-            params["signature"] = sign(params)
+            params = build_signed_params({"symbol": symbol, "side": side, "leverage": LEVERAGE})
             r = requests.post(url, params=params,
                               headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
             print(f"[LEVERAGE] {symbol} {side}: {r}")
@@ -123,9 +115,8 @@ def set_leverage(symbol):
 def place_order(symbol, side, entry, sl, tp):
     try:
         set_leverage(symbol)
-        ts        = int(time.time() * 1000)
-        precision = symbol_precision.get(symbol, 4)
-        quantity  = round(TRADE_AMOUNT * LEVERAGE / entry, precision)
+        precision  = symbol_precision.get(symbol, 4)
+        quantity   = round(TRADE_AMOUNT * LEVERAGE / entry, precision)
         if quantity <= 0:
             print(f"[ORDER SKIP] {symbol} quantity=0")
             return None
@@ -134,35 +125,31 @@ def place_order(symbol, side, entry, sl, tp):
         close_side = "SELL"  if side == "BUY"  else "BUY"
         url        = BASE_URL + "/openApi/swap/v2/trade/order"
 
-        params = {
+        # Main order
+        params = build_signed_params({
             "symbol":       symbol,
             "side":         side,
             "positionSide": pos_side,
             "type":         "MARKET",
             "quantity":     quantity,
-            "timestamp":    ts
-        }
-        params["signature"] = sign(params)
+        })
         resp = requests.post(url, params=params,
                              headers={"X-BX-APIKEY": API_KEY}, timeout=10)
-        r    = resp.json()
+        r = resp.json()
         print(f"[ORDER RESPONSE] {symbol} {side}: {r}")
 
         order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
 
         if order_id != "N/A":
             for price, order_type in [(sl, "STOP_MARKET"), (tp, "TAKE_PROFIT_MARKET")]:
-                ts2 = int(time.time() * 1000)
-                p2  = {
+                p2 = build_signed_params({
                     "symbol":        symbol,
                     "side":          close_side,
                     "positionSide":  pos_side,
                     "type":          order_type,
                     "stopPrice":     price,
                     "closePosition": "true",
-                    "timestamp":     ts2
-                }
-                p2["signature"] = sign(p2)
+                })
                 r2 = requests.post(url, params=p2,
                                    headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
                 print(f"[SL/TP RESPONSE] {symbol} {order_type}: {r2}")
@@ -219,7 +206,6 @@ def check_symbol(symbol):
         swing_high   = max(h(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
 
         if entry < MIN_PRICE:
-            print(f"[SKIP] {symbol} price too low: {entry}")
             return
 
         if bull_cross and 50 < rsi_now < 70:
@@ -234,7 +220,6 @@ def check_symbol(symbol):
                 print(f"[INFO] {symbol} BUY | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x")
                 if ratio >= VOLUME_MULTIPLIER:
                     last_alerted.add(sig_id)
-                    trade_status = ""
                     if auto_trade_enabled:
                         order_id = place_order(symbol, "BUY", entry, sl, tp)
                         trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
@@ -269,7 +254,6 @@ def check_symbol(symbol):
                 print(f"[INFO] {symbol} SELL | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x")
                 if ratio >= VOLUME_MULTIPLIER:
                     last_alerted.add(sig_id)
-                    trade_status = ""
                     if auto_trade_enabled:
                         order_id = place_order(symbol, "SELL", entry, sl, tp)
                         trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"

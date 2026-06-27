@@ -24,6 +24,7 @@ SL_BUFFER_PCT     = 0.15
 SWING_LOOKBACK    = 5
 
 auto_trade_enabled = False
+symbol_precision   = {}
 
 
 def sign(params: dict) -> str:
@@ -35,8 +36,14 @@ def sign(params: dict) -> str:
 def get_futures_symbols():
     url = BASE_URL + "/openApi/swap/v2/quote/contracts"
     r = requests.get(url, timeout=10).json()
-    return [c["symbol"] for c in r.get("data", [])
-            if c.get("status") == 1 and "USDT" in c["symbol"]]
+    symbols = []
+    for c in r.get("data", []):
+        if c.get("status") == 1 and "USDT" in c["symbol"]:
+            sym = c["symbol"]
+            symbols.append(sym)
+            qty_precision = int(c.get("quantityPrecision", 4))
+            symbol_precision[sym] = qty_precision
+    return symbols
 
 
 def get_candles(symbol, limit=200):
@@ -118,7 +125,8 @@ def place_order(symbol, side, entry, sl, tp):
     try:
         set_leverage(symbol)
         ts = int(time.time() * 1000)
-        quantity = round(TRADE_AMOUNT * LEVERAGE / entry, 4)
+        precision = symbol_precision.get(symbol, 4)
+        quantity  = round(TRADE_AMOUNT * LEVERAGE / entry, precision)
         params = {
             "symbol": symbol,
             "side": side,
@@ -132,7 +140,7 @@ def place_order(symbol, side, entry, sl, tp):
         r = requests.post(url, params=params,
                           headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
         order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
-        print(f"[ORDER] {symbol} {side} placed | orderId={order_id} qty={quantity}")
+        print(f"[ORDER] {symbol} {side} placed | orderId={order_id} qty={quantity} precision={precision}")
 
         sl_side  = "SELL" if side == "BUY" else "BUY"
         tp_side  = sl_side
@@ -324,10 +332,10 @@ def monitor_loop():
             for sym in symbols:
                 check_symbol(sym)
                 time.sleep(0.2)
-            print("Scan complete. Sleeping 20s...")
+            print("Scan complete. Sleeping 60s...")
         except Exception as e:
             print(f"Loop error: {e}")
-        time.sleep(20)
+        time.sleep(60)
 
 
 @app.route("/")

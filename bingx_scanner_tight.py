@@ -4,12 +4,12 @@ from threading import Thread
 
 app = Flask(__name__)
 
-API_KEY       = os.environ.get("BINGX_API_KEY")
-SECRET_KEY    = os.environ.get("BINGX_SECRET_KEY")
-TG_TOKEN      = os.environ.get("TG_BOT_TOKEN_TIGHT")
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID_TIGHT")
-TRADE_AMOUNT  = float(os.environ.get("TRADE_AMOUNT", 20))
-LEVERAGE      = int(os.environ.get("LEVERAGE", 10))
+API_KEY      = os.environ.get("BINGX_API_KEY")
+SECRET_KEY   = os.environ.get("BINGX_SECRET_KEY")
+TG_TOKEN     = os.environ.get("TG_BOT_TOKEN_TIGHT")
+TG_CHAT_ID   = os.environ.get("TG_CHAT_ID_TIGHT")
+TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", 20))
+LEVERAGE     = int(os.environ.get("LEVERAGE", 10))
 
 BASE_URL = "https://open-api.bingx.com"
 
@@ -22,6 +22,8 @@ VOLUME_MULTIPLIER = 5
 RR_RATIO          = 4
 SL_BUFFER_PCT     = 0.15
 SWING_LOOKBACK    = 5
+MIN_PRICE         = 0.001
+MIN_RISK_PCT      = 0.1
 
 auto_trade_enabled = False
 symbol_precision   = {}
@@ -41,8 +43,7 @@ def get_futures_symbols():
         if c.get("status") == 1 and "USDT" in c["symbol"]:
             sym = c["symbol"]
             symbols.append(sym)
-            qty_precision = int(c.get("quantityPrecision", 4))
-            symbol_precision[sym] = qty_precision
+            symbol_precision[sym] = int(c.get("quantityPrecision", 4))
     return symbols
 
 
@@ -103,20 +104,17 @@ def send_tg(msg):
 def set_leverage(symbol):
     try:
         ts = int(time.time() * 1000)
-        params = {
-            "symbol": symbol,
-            "side": "LONG",
-            "leverage": LEVERAGE,
-            "timestamp": ts
-        }
-        params["signature"] = sign(params)
         url = BASE_URL + "/openApi/swap/v2/trade/leverage"
-        requests.post(url, params=params,
-                      headers={"X-BX-APIKEY": API_KEY}, timeout=10)
-        params["side"] = "SHORT"
-        params["signature"] = sign(params)
-        requests.post(url, params=params,
-                      headers={"X-BX-APIKEY": API_KEY}, timeout=10)
+        for side in ["LONG", "SHORT"]:
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "leverage": LEVERAGE,
+                "timestamp": ts
+            }
+            params["signature"] = sign(params)
+            requests.post(url, params=params,
+                          headers={"X-BX-APIKEY": API_KEY}, timeout=10)
     except Exception as e:
         print(f"[LEVERAGE] {symbol} error: {e}")
 
@@ -124,33 +122,37 @@ def set_leverage(symbol):
 def place_order(symbol, side, entry, sl, tp):
     try:
         set_leverage(symbol)
-        ts = int(time.time() * 1000)
+        ts        = int(time.time() * 1000)
         precision = symbol_precision.get(symbol, 4)
         quantity  = round(TRADE_AMOUNT * LEVERAGE / entry, precision)
+        if quantity <= 0:
+            print(f"[ORDER SKIP] {symbol} quantity=0")
+            return None
+
+        pos_side = "LONG" if side == "BUY" else "SHORT"
+        close_side = "SELL" if side == "BUY" else "BUY"
+
+        url = BASE_URL + "/openApi/swap/v2/trade/order"
+
         params = {
             "symbol": symbol,
             "side": side,
-            "positionSide": "LONG" if side == "BUY" else "SHORT",
+            "positionSide": pos_side,
             "type": "MARKET",
             "quantity": quantity,
             "timestamp": ts
         }
         params["signature"] = sign(params)
-        url = BASE_URL + "/openApi/swap/v2/trade/order"
         r = requests.post(url, params=params,
                           headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
         order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
-        print(f"[ORDER] {symbol} {side} placed | orderId={order_id} qty={quantity} precision={precision}")
-
-        sl_side  = "SELL" if side == "BUY" else "BUY"
-        tp_side  = sl_side
-        pos_side = "LONG" if side == "BUY" else "SHORT"
+        print(f"[ORDER] {symbol} {side} | orderId={order_id} qty={quantity}")
 
         for price, order_type in [(sl, "STOP_MARKET"), (tp, "TAKE_PROFIT_MARKET")]:
             ts2 = int(time.time() * 1000)
             p2 = {
                 "symbol": symbol,
-                "side": sl_side if order_type == "STOP_MARKET" else tp_side,
+                "side": close_side,
                 "positionSide": pos_side,
                 "type": order_type,
                 "stopPrice": price,
@@ -177,7 +179,6 @@ def v(c):  return float(c["volume"])
 
 
 def check_symbol(symbol):
-    global auto_trade_enabled
     try:
         candles = get_candles(symbol, limit=200)
         if len(candles) < VOLUME_LOOKBACK + RSI_LEN + 10:
@@ -213,15 +214,20 @@ def check_symbol(symbol):
         swing_low    = min(l(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
         swing_high   = max(h(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
 
+        if entry < MIN_PRICE:
+            print(f"[SKIP] {symbol} price too low: {entry}")
+            return
+
         if bull_cross and 50 < rsi_now < 70:
             sig_id = (symbol, "BUY", int(confirmed[i]["time"]))
             if sig_id not in last_alerted:
                 sl   = min(swing_low, ema_slow_now * (1 - SL_BUFFER_PCT / 100))
                 risk = entry - sl
-                if risk <= 0:
+                if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
+                    print(f"[SKIP] {symbol} BUY risk too small: {risk}")
                     return
-                tp = round(entry + risk * RR_RATIO, 4)
-                sl = round(sl, 4)
+                tp = round(entry + risk * RR_RATIO, 6)
+                sl = round(sl, 6)
                 print(f"[INFO] {symbol} BUY | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x")
                 if ratio >= VOLUME_MULTIPLIER:
                     last_alerted.add(sig_id)
@@ -237,7 +243,7 @@ def check_symbol(symbol):
                         f"Timeframe : 15m\n"
                         f"Strategy  : EMA 9/21 + RSI + 5x Vol\n"
                         f"——————————————\n"
-                        f"Entry     : {round(entry, 4)}\n"
+                        f"Entry     : {round(entry, 6)}\n"
                         f"Stop Loss : {sl}\n"
                         f"TP (1:4)  : {tp}\n"
                         f"RSI       : {rsi_now:.1f}\n"
@@ -253,10 +259,11 @@ def check_symbol(symbol):
             if sig_id not in last_alerted:
                 sl   = max(swing_high, ema_slow_now * (1 + SL_BUFFER_PCT / 100))
                 risk = sl - entry
-                if risk <= 0:
+                if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
+                    print(f"[SKIP] {symbol} SELL risk too small: {risk}")
                     return
-                tp = round(entry - risk * RR_RATIO, 4)
-                sl = round(sl, 4)
+                tp = round(entry - risk * RR_RATIO, 6)
+                sl = round(sl, 6)
                 print(f"[INFO] {symbol} SELL | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x")
                 if ratio >= VOLUME_MULTIPLIER:
                     last_alerted.add(sig_id)
@@ -272,7 +279,7 @@ def check_symbol(symbol):
                         f"Timeframe : 15m\n"
                         f"Strategy  : EMA 9/21 + RSI + 5x Vol\n"
                         f"——————————————\n"
-                        f"Entry     : {round(entry, 4)}\n"
+                        f"Entry     : {round(entry, 6)}\n"
                         f"Stop Loss : {sl}\n"
                         f"TP (1:4)  : {tp}\n"
                         f"RSI       : {rsi_now:.1f}\n"
@@ -299,8 +306,8 @@ def handle_telegram_commands():
             r = requests.get(url, params=params, timeout=35).json()
             for update in r.get("result", []):
                 offset = update["update_id"] + 1
-                msg = update.get("message", {})
-                text = msg.get("text", "").strip().lower()
+                msg    = update.get("message", {})
+                text   = msg.get("text", "").strip().lower()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != str(TG_CHAT_ID):
                     continue

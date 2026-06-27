@@ -103,20 +103,21 @@ def send_tg(msg):
 
 def set_leverage(symbol):
     try:
-        ts = int(time.time() * 1000)
+        ts  = int(time.time() * 1000)
         url = BASE_URL + "/openApi/swap/v2/trade/leverage"
         for side in ["LONG", "SHORT"]:
             params = {
-                "symbol": symbol,
-                "side": side,
-                "leverage": LEVERAGE,
+                "symbol":    symbol,
+                "side":      side,
+                "leverage":  LEVERAGE,
                 "timestamp": ts
             }
             params["signature"] = sign(params)
-            requests.post(url, params=params,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10)
+            r = requests.post(url, params=params,
+                              headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            print(f"[LEVERAGE] {symbol} {side}: {r}")
     except Exception as e:
-        print(f"[LEVERAGE] {symbol} error: {e}")
+        print(f"[LEVERAGE ERROR] {symbol}: {e}")
 
 
 def place_order(symbol, side, entry, sl, tp):
@@ -129,39 +130,42 @@ def place_order(symbol, side, entry, sl, tp):
             print(f"[ORDER SKIP] {symbol} quantity=0")
             return None
 
-        pos_side = "LONG" if side == "BUY" else "SHORT"
-        close_side = "SELL" if side == "BUY" else "BUY"
-
-        url = BASE_URL + "/openApi/swap/v2/trade/order"
+        pos_side   = "LONG"  if side == "BUY"  else "SHORT"
+        close_side = "SELL"  if side == "BUY"  else "BUY"
+        url        = BASE_URL + "/openApi/swap/v2/trade/order"
 
         params = {
-            "symbol": symbol,
-            "side": side,
+            "symbol":       symbol,
+            "side":         side,
             "positionSide": pos_side,
-            "type": "MARKET",
-            "quantity": quantity,
-            "timestamp": ts
+            "type":         "MARKET",
+            "quantity":     quantity,
+            "timestamp":    ts
         }
         params["signature"] = sign(params)
-        r = requests.post(url, params=params,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-        order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
-        print(f"[ORDER] {symbol} {side} | orderId={order_id} qty={quantity}")
+        resp = requests.post(url, params=params,
+                             headers={"X-BX-APIKEY": API_KEY}, timeout=10)
+        r    = resp.json()
+        print(f"[ORDER RESPONSE] {symbol} {side}: {r}")
 
-        for price, order_type in [(sl, "STOP_MARKET"), (tp, "TAKE_PROFIT_MARKET")]:
-            ts2 = int(time.time() * 1000)
-            p2 = {
-                "symbol": symbol,
-                "side": close_side,
-                "positionSide": pos_side,
-                "type": order_type,
-                "stopPrice": price,
-                "closePosition": "true",
-                "timestamp": ts2
-            }
-            p2["signature"] = sign(p2)
-            requests.post(url, params=p2,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10)
+        order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
+
+        if order_id != "N/A":
+            for price, order_type in [(sl, "STOP_MARKET"), (tp, "TAKE_PROFIT_MARKET")]:
+                ts2 = int(time.time() * 1000)
+                p2  = {
+                    "symbol":        symbol,
+                    "side":          close_side,
+                    "positionSide":  pos_side,
+                    "type":          order_type,
+                    "stopPrice":     price,
+                    "closePosition": "true",
+                    "timestamp":     ts2
+                }
+                p2["signature"] = sign(p2)
+                r2 = requests.post(url, params=p2,
+                                   headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+                print(f"[SL/TP RESPONSE] {symbol} {order_type}: {r2}")
 
         return order_id
     except Exception as e:
@@ -224,7 +228,6 @@ def check_symbol(symbol):
                 sl   = min(swing_low, ema_slow_now * (1 - SL_BUFFER_PCT / 100))
                 risk = entry - sl
                 if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
-                    print(f"[SKIP] {symbol} BUY risk too small: {risk}")
                     return
                 tp = round(entry + risk * RR_RATIO, 6)
                 sl = round(sl, 6)
@@ -234,7 +237,7 @@ def check_symbol(symbol):
                     trade_status = ""
                     if auto_trade_enabled:
                         order_id = place_order(symbol, "BUY", entry, sl, tp)
-                        trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id else "\n❌ Order failed"
+                        trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
                     else:
                         trade_status = "\n⏸ Auto-trade OFF (signal only)"
                     send_tg(
@@ -260,7 +263,6 @@ def check_symbol(symbol):
                 sl   = max(swing_high, ema_slow_now * (1 + SL_BUFFER_PCT / 100))
                 risk = sl - entry
                 if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
-                    print(f"[SKIP] {symbol} SELL risk too small: {risk}")
                     return
                 tp = round(entry - risk * RR_RATIO, 6)
                 sl = round(sl, 6)
@@ -270,7 +272,7 @@ def check_symbol(symbol):
                     trade_status = ""
                     if auto_trade_enabled:
                         order_id = place_order(symbol, "SELL", entry, sl, tp)
-                        trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id else "\n❌ Order failed"
+                        trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
                     else:
                         trade_status = "\n⏸ Auto-trade OFF (signal only)"
                     send_tg(
@@ -299,15 +301,15 @@ def handle_telegram_commands():
     offset = None
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
+            url    = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
             params = {"timeout": 30}
             if offset:
                 params["offset"] = offset
             r = requests.get(url, params=params, timeout=35).json()
             for update in r.get("result", []):
-                offset = update["update_id"] + 1
-                msg    = update.get("message", {})
-                text   = msg.get("text", "").strip().lower()
+                offset  = update["update_id"] + 1
+                msg     = update.get("message", {})
+                text    = msg.get("text", "").strip().lower()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != str(TG_CHAT_ID):
                     continue

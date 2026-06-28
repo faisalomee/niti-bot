@@ -213,7 +213,7 @@ def check_symbol(symbol):
     try:
         candles = get_candles(symbol, limit=200)
         if len(candles) < VOLUME_LOOKBACK + RSI_LEN + EMA_LEN + 10:
-            return
+            return None  # return ratio=None
 
         confirmed = candles[:-1]
         closes = [cl(c) for c in confirmed]
@@ -230,24 +230,20 @@ def check_symbol(symbol):
         p = i - 1
 
         if p < VOLUME_LOOKBACK + EMA_LEN:
-            return
+            return None
 
         entry    = closes[i]
         vwap_now = vwap_vals[i]
         ema_now  = ema_vals[i]
         rsi_now  = rsi_vals[i]
 
-        # FIX 3: avg = cross candle (p) এর আগের 100 candle, নিজে বাদ
         avg_vol = sum(vols[p - VOLUME_LOOKBACK:p]) / VOLUME_LOOKBACK
-
-        # FIX 2: volume check cross candle (p) দিয়ে
         ratio   = vols[p] / avg_vol if avg_vol > 0 else 0
         vol_ok  = ratio >= VOLUME_MULTIPLIER
 
         swing_low  = min(lows[i - SWING_LOOKBACK:i + 1])
         swing_high = max(highs[i - SWING_LOOKBACK:i + 1])
 
-        # FIX 1: last 3 candle এর মধ্যে যেকোনো সময় cross হলেই চলবে
         vwap_cross_up = any(
             closes[j] > vwap_vals[j] and closes[j - 1] <= vwap_vals[j - 1]
             for j in range(p - 1, p + 2)
@@ -260,7 +256,7 @@ def check_symbol(symbol):
         )
 
         if entry < MIN_PRICE:
-            return
+            return ratio
 
         # LONG
         if (vwap_cross_up
@@ -275,7 +271,7 @@ def check_symbol(symbol):
                 sl   = min(swing_low, vwap_now * (1 - SL_BUFFER_PCT / 100))
                 risk = entry - sl
                 if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
-                    return
+                    return ratio
                 tp1 = round(entry + risk * RR_TP1, 6)
                 tp2 = round(entry + risk * RR_TP2, 6)
                 sl  = round(sl, 6)
@@ -318,7 +314,7 @@ def check_symbol(symbol):
                 sl   = max(swing_high, vwap_now * (1 + SL_BUFFER_PCT / 100))
                 risk = sl - entry
                 if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
-                    return
+                    return ratio
                 tp1 = round(entry - risk * RR_TP1, 6)
                 tp2 = round(entry - risk * RR_TP2, 6)
                 sl  = round(sl, 6)
@@ -348,8 +344,11 @@ def check_symbol(symbol):
                     f"Niti Tight Bot 2"
                 )
 
+        return ratio
+
     except Exception as e:
         print(f"[{symbol}] error: {e}")
+        return None
 
 
 def handle_telegram_commands():
@@ -395,9 +394,17 @@ def monitor_loop():
         try:
             symbols = get_futures_symbols()
             print(f"Scanning {len(symbols)} pairs... | auto_trade={auto_trade_enabled}")
+
+            ratios = []
             for sym in symbols:
-                check_symbol(sym)
+                r = check_symbol(sym)
+                if r is not None:
+                    ratios.append(r)
                 time.sleep(0.2)
+
+            if ratios:
+                top5 = sorted(ratios, reverse=True)[:5]
+                print(f"[VOL DEBUG] Top 5 ratios this scan: {[round(x,2) for x in top5]} | threshold={VOLUME_MULTIPLIER}x")
             print("Scan complete. Sleeping 60s...")
         except Exception as e:
             print(f"Loop error: {e}")

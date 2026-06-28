@@ -1,15 +1,17 @@
 import os, time, hmac, hashlib, requests
 from flask import Flask
 from threading import Thread
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
-API_KEY      = os.environ.get("BINGX_API_KEY")
-SECRET_KEY   = os.environ.get("BINGX_SECRET_KEY")
-TG_TOKEN     = os.environ.get("TG_BOT_TOKEN_TIGHT")
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID_TIGHT")
-TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", 20))
-LEVERAGE     = int(os.environ.get("LEVERAGE", 10))
+API_KEY        = os.environ.get("BINGX_API_KEY")
+SECRET_KEY     = os.environ.get("BINGX_SECRET_KEY")
+TG_TOKEN       = os.environ.get("TG_BOT_TOKEN_TIGHT")
+TG_CHAT_ID     = os.environ.get("TG_CHAT_ID_TIGHT")
+TG_JOURNAL_ID  = os.environ.get("TG_JOURNAL_CHAT_ID")
+TRADE_AMOUNT   = float(os.environ.get("TRADE_AMOUNT", 20))
+LEVERAGE       = int(os.environ.get("LEVERAGE", 10))
 
 BASE_URL = "https://open-api.bingx.com"
 
@@ -27,6 +29,11 @@ MIN_RISK_PCT      = 0.1
 
 auto_trade_enabled = False
 symbol_precision   = {}
+
+# Journal tracking
+open_trades  = {}   # order_id -> trade info
+daily_trades = []   # closed trades for today
+last_summary_date = None
 
 
 def build_signed_params(params: dict) -> dict:
@@ -107,13 +114,19 @@ def rsi_series(closes, period=14):
     return rsi_vals
 
 
-def send_tg(msg):
+def send_tg(msg, chat_id=None):
+    cid = chat_id or TG_CHAT_ID
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     requests.post(url, json={
-        "chat_id": TG_CHAT_ID,
+        "chat_id": cid,
         "text": msg,
         "parse_mode": "HTML"
     }, timeout=10)
+
+
+def send_journal(msg):
+    if TG_JOURNAL_ID:
+        send_tg(msg, chat_id=TG_JOURNAL_ID)
 
 
 def set_leverage(symbol):
@@ -163,9 +176,8 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
                 "stopPrice":     sl,
                 "closePosition": "true",
             })
-            r_sl = requests.post(url, params=p_sl,
-                                 headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-            print(f"[SL] {symbol}: {r_sl}")
+            requests.post(url, params=p_sl,
+                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
 
             p_tp1 = build_signed_params({
                 "symbol":        symbol,
@@ -176,9 +188,8 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
                 "quantity":      half_qty,
                 "closePosition": "false",
             })
-            r_tp1 = requests.post(url, params=p_tp1,
-                                  headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-            print(f"[TP1] {symbol}: {r_tp1}")
+            requests.post(url, params=p_tp1,
+                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
 
             p_tp2 = build_signed_params({
                 "symbol":        symbol,
@@ -189,14 +200,113 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
                 "quantity":      half_qty,
                 "closePosition": "false",
             })
-            r_tp2 = requests.post(url, params=p_tp2,
-                                  headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-            print(f"[TP2] {symbol}: {r_tp2}")
+            requests.post(url, params=p_tp2,
+                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+
+            # Track open trade for journal
+            open_trades[str(order_id)] = {
+                "symbol": symbol,
+                "side":   side,
+                "entry":  entry,
+                "sl":     sl,
+                "tp1":    tp1,
+                "tp2":    tp2,
+                "qty":    total_qty,
+                "time":   datetime.now(timezone.utc).strftime("%H:%M UTC"),
+            }
 
         return order_id
     except Exception as e:
         print(f"[ORDER ERROR] {symbol}: {e}")
         return None
+
+
+def check_order_status(order_id, symbol):
+    try:
+        params = build_signed_params({"symbol": symbol, "orderId": order_id})
+        url = BASE_URL + "/openApi/swap/v2/trade/order"
+        r = requests.get(url, params=params,
+                         headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        return r.get("data", {}).get("order", {}).get("status", "")
+    except:
+        return ""
+
+
+def track_open_trades():
+    global open_trades, daily_trades
+    to_remove = []
+    for oid, trade in open_trades.items():
+        status = check_order_status(oid, trade["symbol"])
+        if status in ("FILLED", "CANCELLED", "EXPIRED"):
+            # Estimate PnL based on current price vs entry
+            try:
+                candles = get_candles(trade["symbol"], limit=2)
+                current = float(candles[-1]["close"]) if candles else trade["entry"]
+                if trade["side"] == "BUY":
+                    pnl = (current - trade["entry"]) / trade["entry"] * TRADE_AMOUNT * LEVERAGE
+                    result = "✅ TP" if current >= trade["tp1"] else ("❌ SL" if current <= trade["sl"] else "⏳ Open")
+                else:
+                    pnl = (trade["entry"] - current) / trade["entry"] * TRADE_AMOUNT * LEVERAGE
+                    result = "✅ TP" if current <= trade["tp1"] else ("❌ SL" if current >= trade["sl"] else "⏳ Open")
+
+                pnl = round(pnl, 2)
+                trade["pnl"]    = pnl
+                trade["result"] = result
+                daily_trades.append(trade)
+                to_remove.append(oid)
+
+                emoji = "🟢" if pnl > 0 else "🔴"
+                send_journal(
+                    f"{emoji} Trade Closed — {trade['symbol']}\n"
+                    f"——————————————\n"
+                    f"Side   : {trade['side']}\n"
+                    f"Entry  : {trade['entry']}\n"
+                    f"Result : {result}\n"
+                    f"PnL    : {'+' if pnl > 0 else ''}{pnl} USDT\n"
+                    f"Time   : {trade['time']}\n"
+                    f"——————————————\n"
+                    f"Niti Journal"
+                )
+            except Exception as e:
+                print(f"[TRACK ERROR] {e}")
+
+    for oid in to_remove:
+        open_trades.pop(oid, None)
+
+
+def send_daily_summary():
+    global daily_trades, last_summary_date
+    nzt = timezone(timedelta(hours=12))
+    now = datetime.now(nzt)
+    today = now.date()
+
+    if last_summary_date == today:
+        return
+    if now.hour != 23 or now.minute < 55:
+        return
+
+    last_summary_date = today
+    total_pnl  = round(sum(t.get("pnl", 0) for t in daily_trades), 2)
+    wins       = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
+    losses     = sum(1 for t in daily_trades if t.get("pnl", 0) <= 0)
+    total      = len(daily_trades)
+    win_rate   = round(wins / total * 100, 1) if total > 0 else 0
+    emoji      = "🟢" if total_pnl > 0 else "🔴"
+
+    lines = [f"📊 Daily Summary — {today.strftime('%b %d, %Y')}
+——————————————"]
+    for i, t in enumerate(daily_trades, 1):
+        p = t.get("pnl", 0)
+        lines.append(f"{i}. {t['symbol']} {t['side']} | {t.get('result','?')} | {'+' if p>0 else ''}{p} USDT")
+
+    lines.append(f"——————————————")
+    lines.append(f"Trades   : {total} ({wins}W / {losses}L)")
+    lines.append(f"Win Rate : {win_rate}%")
+    lines.append(f"{emoji} Total PnL : {'+' if total_pnl > 0 else ''}{total_pnl} USDT")
+    lines.append(f"——————————————\nNiti Journal")
+
+    send_journal("\n".join(lines))
+    daily_trades = []
 
 
 last_alerted = set()
@@ -300,6 +410,18 @@ def check_symbol(symbol):
                     f"——————————————\n"
                     f"Niti Tight Bot 2"
                 )
+                send_journal(
+                    f"📝 New Trade — {symbol}\n"
+                    f"——————————————\n"
+                    f"Side   : BUY\n"
+                    f"Entry  : {round(entry, 6)}\n"
+                    f"SL     : {sl}\n"
+                    f"TP1    : {tp1}\n"
+                    f"TP2    : {tp2}\n"
+                    f"RSI    : {rsi_now:.1f} | Vol: {ratio:.1f}x\n"
+                    f"——————————————\n"
+                    f"Niti Journal"
+                )
 
         # SHORT
         if (vwap_cross_down
@@ -342,6 +464,18 @@ def check_symbol(symbol):
                     f"{trade_status}\n"
                     f"——————————————\n"
                     f"Niti Tight Bot 2"
+                )
+                send_journal(
+                    f"📝 New Trade — {symbol}\n"
+                    f"——————————————\n"
+                    f"Side   : SELL\n"
+                    f"Entry  : {round(entry, 6)}\n"
+                    f"SL     : {sl}\n"
+                    f"TP1    : {tp1}\n"
+                    f"TP2    : {tp2}\n"
+                    f"RSI    : {rsi_now:.1f} | Vol: {ratio:.1f}x\n"
+                    f"——————————————\n"
+                    f"Niti Journal"
                 )
 
         return ratio
@@ -401,6 +535,9 @@ def monitor_loop():
                 if r is not None:
                     ratios.append(r)
                 time.sleep(0.2)
+
+            track_open_trades()
+            send_daily_summary()
 
             if ratios:
                 top5 = sorted(ratios, reverse=True)[:5]

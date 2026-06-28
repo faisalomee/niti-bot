@@ -30,9 +30,8 @@ MIN_RISK_PCT      = 0.1
 auto_trade_enabled = False
 symbol_precision   = {}
 
-# Journal tracking
-open_trades  = {}   # order_id -> trade info
-daily_trades = []   # closed trades for today
+open_trades       = {}
+daily_trades      = []
 last_summary_date = None
 
 
@@ -154,6 +153,7 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
         close_side = "SELL"  if side == "BUY"  else "BUY"
         url        = BASE_URL + "/openApi/swap/v2/trade/order"
 
+        # Main entry order
         params = build_signed_params({
             "symbol":       symbol,
             "side":         side,
@@ -168,42 +168,47 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
         order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
 
         if order_id != "N/A":
+            time.sleep(0.5)
+
+            # SL — explicit quantity, no closePosition
             p_sl = build_signed_params({
                 "symbol":        symbol,
                 "side":          close_side,
                 "positionSide":  pos_side,
                 "type":          "STOP_MARKET",
-                "stopPrice":     sl,
-                "closePosition": "true",
+                "stopPrice":     round(sl, 6),
+                "quantity":      total_qty,
             })
-            requests.post(url, params=p_sl,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            r_sl = requests.post(url, params=p_sl,
+                                 headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            print(f"[SL] {symbol}: {r_sl}")
 
+            # TP1 — half quantity
             p_tp1 = build_signed_params({
                 "symbol":        symbol,
                 "side":          close_side,
                 "positionSide":  pos_side,
                 "type":          "TAKE_PROFIT_MARKET",
-                "stopPrice":     tp1,
+                "stopPrice":     round(tp1, 6),
                 "quantity":      half_qty,
-                "closePosition": "false",
             })
-            requests.post(url, params=p_tp1,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            r_tp1 = requests.post(url, params=p_tp1,
+                                  headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            print(f"[TP1] {symbol}: {r_tp1}")
 
+            # TP2 — half quantity
             p_tp2 = build_signed_params({
                 "symbol":        symbol,
                 "side":          close_side,
                 "positionSide":  pos_side,
                 "type":          "TAKE_PROFIT_MARKET",
-                "stopPrice":     tp2,
+                "stopPrice":     round(tp2, 6),
                 "quantity":      half_qty,
-                "closePosition": "false",
             })
-            requests.post(url, params=p_tp2,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            r_tp2 = requests.post(url, params=p_tp2,
+                                  headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            print(f"[TP2] {symbol}: {r_tp2}")
 
-            # Track open trade for journal
             open_trades[str(order_id)] = {
                 "symbol": symbol,
                 "side":   side,
@@ -235,37 +240,35 @@ def check_order_status(order_id, symbol):
 def track_open_trades():
     global open_trades, daily_trades
     to_remove = []
-    for oid, trade in open_trades.items():
+    for oid, trade in list(open_trades.items()):
         status = check_order_status(oid, trade["symbol"])
         if status in ("FILLED", "CANCELLED", "EXPIRED"):
-            # Estimate PnL based on current price vs entry
             try:
                 candles = get_candles(trade["symbol"], limit=2)
                 current = float(candles[-1]["close"]) if candles else trade["entry"]
                 if trade["side"] == "BUY":
-                    pnl = (current - trade["entry"]) / trade["entry"] * TRADE_AMOUNT * LEVERAGE
-                    result = "✅ TP" if current >= trade["tp1"] else ("❌ SL" if current <= trade["sl"] else "⏳ Open")
+                    pnl    = round((current - trade["entry"]) / trade["entry"] * TRADE_AMOUNT * LEVERAGE, 2)
+                    result = "TP" if current >= trade["tp1"] else ("SL" if current <= trade["sl"] else "Open")
                 else:
-                    pnl = (trade["entry"] - current) / trade["entry"] * TRADE_AMOUNT * LEVERAGE
-                    result = "✅ TP" if current <= trade["tp1"] else ("❌ SL" if current >= trade["sl"] else "⏳ Open")
+                    pnl    = round((trade["entry"] - current) / trade["entry"] * TRADE_AMOUNT * LEVERAGE, 2)
+                    result = "TP" if current <= trade["tp1"] else ("SL" if current >= trade["sl"] else "Open")
 
-                pnl = round(pnl, 2)
                 trade["pnl"]    = pnl
                 trade["result"] = result
                 daily_trades.append(trade)
                 to_remove.append(oid)
 
-                emoji = "🟢" if pnl > 0 else "🔴"
+                sign = "+" if pnl > 0 else ""
                 send_journal(
-                    f"{emoji} Trade Closed — {trade['symbol']}\n"
-                    f"——————————————\n"
-                    f"Side   : {trade['side']}\n"
-                    f"Entry  : {trade['entry']}\n"
-                    f"Result : {result}\n"
-                    f"PnL    : {'+' if pnl > 0 else ''}{pnl} USDT\n"
-                    f"Time   : {trade['time']}\n"
-                    f"——————————————\n"
-                    f"Niti Journal"
+                    "Trade Closed - " + trade["symbol"] + "\n"
+                    "------------------------------\n"
+                    "Side   : " + trade["side"] + "\n"
+                    "Entry  : " + str(trade["entry"]) + "\n"
+                    "Result : " + result + "\n"
+                    "PnL    : " + sign + str(pnl) + " USDT\n"
+                    "Time   : " + trade["time"] + "\n"
+                    "------------------------------\n"
+                    "Niti Journal"
                 )
             except Exception as e:
                 print(f"[TRACK ERROR] {e}")
@@ -276,8 +279,8 @@ def track_open_trades():
 
 def send_daily_summary():
     global daily_trades, last_summary_date
-    nzt = timezone(timedelta(hours=12))
-    now = datetime.now(nzt)
+    nzt   = timezone(timedelta(hours=12))
+    now   = datetime.now(nzt)
     today = now.date()
 
     if last_summary_date == today:
@@ -286,24 +289,26 @@ def send_daily_summary():
         return
 
     last_summary_date = today
-    total_pnl  = round(sum(t.get("pnl", 0) for t in daily_trades), 2)
-    wins       = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
-    losses     = sum(1 for t in daily_trades if t.get("pnl", 0) <= 0)
-    total      = len(daily_trades)
-    win_rate   = round(wins / total * 100, 1) if total > 0 else 0
-    emoji      = "🟢" if total_pnl > 0 else "🔴"
+    total_pnl = round(sum(t.get("pnl", 0) for t in daily_trades), 2)
+    wins      = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
+    losses    = sum(1 for t in daily_trades if t.get("pnl", 0) <= 0)
+    total     = len(daily_trades)
+    win_rate  = round(wins / total * 100, 1) if total > 0 else 0
+    sign      = "+" if total_pnl > 0 else ""
+    date_str  = today.strftime("%b %d, %Y")
 
-    lines = [f"📊 Daily Summary — {today.strftime('%b %d, %Y')}
-——————————————"]
-    for i, t in enumerate(daily_trades, 1):
-        p = t.get("pnl", 0)
-        lines.append(f"{i}. {t['symbol']} {t['side']} | {t.get('result','?')} | {'+' if p>0 else ''}{p} USDT")
+    lines = ["Daily Summary - " + date_str, "------------------------------"]
+    for idx, t in enumerate(daily_trades, 1):
+        p  = t.get("pnl", 0)
+        ps = "+" if p > 0 else ""
+        lines.append(str(idx) + ". " + t["symbol"] + " " + t["side"] + " | " + t.get("result","?") + " | " + ps + str(p) + " USDT")
 
-    lines.append(f"——————————————")
-    lines.append(f"Trades   : {total} ({wins}W / {losses}L)")
-    lines.append(f"Win Rate : {win_rate}%")
-    lines.append(f"{emoji} Total PnL : {'+' if total_pnl > 0 else ''}{total_pnl} USDT")
-    lines.append(f"——————————————\nNiti Journal")
+    lines.append("------------------------------")
+    lines.append("Trades   : " + str(total) + " (" + str(wins) + "W / " + str(losses) + "L)")
+    lines.append("Win Rate : " + str(win_rate) + "%")
+    lines.append("Total PnL: " + sign + str(total_pnl) + " USDT")
+    lines.append("------------------------------")
+    lines.append("Niti Journal")
 
     send_journal("\n".join(lines))
     daily_trades = []
@@ -390,37 +395,37 @@ def check_symbol(symbol):
                 trade_status = ""
                 if auto_trade_enabled:
                     order_id = place_order(symbol, "BUY", entry, sl, tp1, tp2)
-                    trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
+                    trade_status = "\nOrder placed: " + str(order_id) if order_id and order_id != "N/A" else "\nOrder failed"
                 else:
-                    trade_status = "\n⏸ Auto-trade OFF (signal only)"
+                    trade_status = "\nAuto-trade OFF (signal only)"
                 send_tg(
-                    f"🟢 BUY SIGNAL — {symbol}\n"
-                    f"——————————————\n"
-                    f"Timeframe : 15m\n"
-                    f"Strategy  : VWAP Cross + EMA50 + 2x Vol\n"
-                    f"——————————————\n"
-                    f"Entry     : {round(entry, 6)}\n"
-                    f"Stop Loss : {sl}\n"
-                    f"TP1 (1:2) : {tp1}\n"
-                    f"TP2 (1:4) : {tp2}\n"
-                    f"RSI       : {rsi_now:.1f}\n"
-                    f"Vol Ratio : {ratio:.1f}x\n"
-                    f"Amount    : ${TRADE_AMOUNT} x {LEVERAGE}x"
-                    f"{trade_status}\n"
-                    f"——————————————\n"
-                    f"Niti Tight Bot 2"
+                    "BUY SIGNAL - " + symbol + "\n"
+                    "------------------------------\n"
+                    "Timeframe : 15m\n"
+                    "Strategy  : VWAP Cross + EMA50 + 2x Vol\n"
+                    "------------------------------\n"
+                    "Entry     : " + str(round(entry, 6)) + "\n"
+                    "Stop Loss : " + str(sl) + "\n"
+                    "TP1 (1:2) : " + str(tp1) + "\n"
+                    "TP2 (1:4) : " + str(tp2) + "\n"
+                    "RSI       : " + str(round(rsi_now, 1)) + "\n"
+                    "Vol Ratio : " + str(round(ratio, 1)) + "x\n"
+                    "Amount    : $" + str(TRADE_AMOUNT) + " x " + str(LEVERAGE) + "x" +
+                    trade_status + "\n"
+                    "------------------------------\n"
+                    "Niti Tight Bot 2"
                 )
                 send_journal(
-                    f"📝 New Trade — {symbol}\n"
-                    f"——————————————\n"
-                    f"Side   : BUY\n"
-                    f"Entry  : {round(entry, 6)}\n"
-                    f"SL     : {sl}\n"
-                    f"TP1    : {tp1}\n"
-                    f"TP2    : {tp2}\n"
-                    f"RSI    : {rsi_now:.1f} | Vol: {ratio:.1f}x\n"
-                    f"——————————————\n"
-                    f"Niti Journal"
+                    "New Trade - " + symbol + "\n"
+                    "------------------------------\n"
+                    "Side  : BUY\n"
+                    "Entry : " + str(round(entry, 6)) + "\n"
+                    "SL    : " + str(sl) + "\n"
+                    "TP1   : " + str(tp1) + "\n"
+                    "TP2   : " + str(tp2) + "\n"
+                    "RSI   : " + str(round(rsi_now, 1)) + " | Vol: " + str(round(ratio, 1)) + "x\n"
+                    "------------------------------\n"
+                    "Niti Journal"
                 )
 
         # SHORT
@@ -445,37 +450,37 @@ def check_symbol(symbol):
                 trade_status = ""
                 if auto_trade_enabled:
                     order_id = place_order(symbol, "SELL", entry, sl, tp1, tp2)
-                    trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
+                    trade_status = "\nOrder placed: " + str(order_id) if order_id and order_id != "N/A" else "\nOrder failed"
                 else:
-                    trade_status = "\n⏸ Auto-trade OFF (signal only)"
+                    trade_status = "\nAuto-trade OFF (signal only)"
                 send_tg(
-                    f"🔴 SELL SIGNAL — {symbol}\n"
-                    f"——————————————\n"
-                    f"Timeframe : 15m\n"
-                    f"Strategy  : VWAP Cross + EMA50 + 2x Vol\n"
-                    f"——————————————\n"
-                    f"Entry     : {round(entry, 6)}\n"
-                    f"Stop Loss : {sl}\n"
-                    f"TP1 (1:2) : {tp1}\n"
-                    f"TP2 (1:4) : {tp2}\n"
-                    f"RSI       : {rsi_now:.1f}\n"
-                    f"Vol Ratio : {ratio:.1f}x\n"
-                    f"Amount    : ${TRADE_AMOUNT} x {LEVERAGE}x"
-                    f"{trade_status}\n"
-                    f"——————————————\n"
-                    f"Niti Tight Bot 2"
+                    "SELL SIGNAL - " + symbol + "\n"
+                    "------------------------------\n"
+                    "Timeframe : 15m\n"
+                    "Strategy  : VWAP Cross + EMA50 + 2x Vol\n"
+                    "------------------------------\n"
+                    "Entry     : " + str(round(entry, 6)) + "\n"
+                    "Stop Loss : " + str(sl) + "\n"
+                    "TP1 (1:2) : " + str(tp1) + "\n"
+                    "TP2 (1:4) : " + str(tp2) + "\n"
+                    "RSI       : " + str(round(rsi_now, 1)) + "\n"
+                    "Vol Ratio : " + str(round(ratio, 1)) + "x\n"
+                    "Amount    : $" + str(TRADE_AMOUNT) + " x " + str(LEVERAGE) + "x" +
+                    trade_status + "\n"
+                    "------------------------------\n"
+                    "Niti Tight Bot 2"
                 )
                 send_journal(
-                    f"📝 New Trade — {symbol}\n"
-                    f"——————————————\n"
-                    f"Side   : SELL\n"
-                    f"Entry  : {round(entry, 6)}\n"
-                    f"SL     : {sl}\n"
-                    f"TP1    : {tp1}\n"
-                    f"TP2    : {tp2}\n"
-                    f"RSI    : {rsi_now:.1f} | Vol: {ratio:.1f}x\n"
-                    f"——————————————\n"
-                    f"Niti Journal"
+                    "New Trade - " + symbol + "\n"
+                    "------------------------------\n"
+                    "Side  : SELL\n"
+                    "Entry : " + str(round(entry, 6)) + "\n"
+                    "SL    : " + str(sl) + "\n"
+                    "TP1   : " + str(tp1) + "\n"
+                    "TP2   : " + str(tp2) + "\n"
+                    "RSI   : " + str(round(rsi_now, 1)) + " | Vol: " + str(round(ratio, 1)) + "x\n"
+                    "------------------------------\n"
+                    "Niti Journal"
                 )
 
         return ratio
@@ -504,18 +509,18 @@ def handle_telegram_commands():
                     continue
                 if text == "/start":
                     auto_trade_enabled = True
-                    send_tg("🟢 Auto-trade ON\nSignal আসলে BingX-এ order দেওয়া হবে।")
+                    send_tg("Auto-trade ON. Signal ashle BingX-e order dewa hobe.")
                     print("[CMD] Auto-trade ENABLED")
                 elif text == "/stop":
                     auto_trade_enabled = False
-                    send_tg("🔴 Auto-trade OFF\nShudhu signal আসবে, order দেওয়া হবে না।")
+                    send_tg("Auto-trade OFF. Shudhu signal ashbe.")
                     print("[CMD] Auto-trade DISABLED")
                 elif text == "/status":
-                    state = "🟢 ON" if auto_trade_enabled else "🔴 OFF"
+                    state = "ON" if auto_trade_enabled else "OFF"
                     send_tg(
-                        f"Auto-trade: {state}\n"
-                        f"Strategy: VWAP + EMA50 + 2x Vol\n"
-                        f"Amount: ${TRADE_AMOUNT} | Leverage: {LEVERAGE}x"
+                        "Auto-trade: " + state + "\n"
+                        "Strategy: VWAP + EMA50 + 2x Vol\n"
+                        "Amount: $" + str(TRADE_AMOUNT) + " | Leverage: " + str(LEVERAGE) + "x"
                     )
         except Exception as e:
             print(f"[TG CMD] error: {e}")
@@ -523,7 +528,7 @@ def handle_telegram_commands():
 
 
 def monitor_loop():
-    print("Monitor started — 15m VWAP Cross + EMA50 + 2x Volume | TP1:1:2 TP2:1:4")
+    print("Monitor started - 15m VWAP Cross + EMA50 + 2x Volume | TP1:1:2 TP2:1:4")
     while True:
         try:
             symbols = get_futures_symbols()
@@ -541,7 +546,7 @@ def monitor_loop():
 
             if ratios:
                 top5 = sorted(ratios, reverse=True)[:5]
-                print(f"[VOL DEBUG] Top 5 ratios this scan: {[round(x,2) for x in top5]} | threshold={VOLUME_MULTIPLIER}x")
+                print(f"[VOL DEBUG] Top 5 ratios: {[round(x,2) for x in top5]} | threshold={VOLUME_MULTIPLIER}x")
             print("Scan complete. Sleeping 60s...")
         except Exception as e:
             print(f"Loop error: {e}")
@@ -550,7 +555,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight Bot 2 — VWAP + EMA50 + 2x Vol | TP1:1:2 TP2:1:4", 200
+    return "Niti Tight Bot 2 - VWAP + EMA50 + 2x Vol | TP1:1:2 TP2:1:4", 200
 
 
 if __name__ == "__main__":

@@ -14,14 +14,14 @@ LEVERAGE     = int(os.environ.get("LEVERAGE", 10))
 BASE_URL = "https://open-api.bingx.com"
 
 TIMEFRAME         = "15m"
-EMA_FAST          = 9
-EMA_SLOW          = 21
 RSI_LEN           = 14
 VOLUME_LOOKBACK   = 100
-VOLUME_MULTIPLIER = 5
-RR_RATIO          = 4
+VOLUME_MULTIPLIER = 3
+EMA_LEN           = 50
+SWING_LOOKBACK    = 10
 SL_BUFFER_PCT     = 0.15
-SWING_LOOKBACK    = 5
+RR_TP1            = 2.0
+RR_TP2            = 4.0
 MIN_PRICE         = 0.001
 MIN_RISK_PCT      = 0.1
 
@@ -72,6 +72,22 @@ def ema_series(closes, period):
     return result
 
 
+def vwap_series(candles):
+    cumulative_tp_vol = 0.0
+    cumulative_vol    = 0.0
+    result = []
+    for c in candles:
+        h  = float(c["high"])
+        l  = float(c["low"])
+        cl = float(c["close"])
+        v  = float(c["volume"])
+        tp = (h + l + cl) / 3
+        cumulative_tp_vol += tp * v
+        cumulative_vol    += v
+        result.append(cumulative_tp_vol / cumulative_vol if cumulative_vol > 0 else tp)
+    return result
+
+
 def rsi_series(closes, period=14):
     gains, losses = [], []
     for i in range(1, len(closes)):
@@ -105,54 +121,81 @@ def set_leverage(symbol):
         url = BASE_URL + "/openApi/swap/v2/trade/leverage"
         for side in ["LONG", "SHORT"]:
             params = build_signed_params({"symbol": symbol, "side": side, "leverage": LEVERAGE})
-            r = requests.post(url, params=params,
-                              headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-            print(f"[LEVERAGE] {symbol} {side}: {r}")
+            requests.post(url, params=params,
+                          headers={"X-BX-APIKEY": API_KEY}, timeout=10)
     except Exception as e:
         print(f"[LEVERAGE ERROR] {symbol}: {e}")
 
 
-def place_order(symbol, side, entry, sl, tp):
+def place_order(symbol, side, entry, sl, tp1, tp2):
     try:
         set_leverage(symbol)
         precision  = symbol_precision.get(symbol, 4)
-        quantity   = round(TRADE_AMOUNT * LEVERAGE / entry, precision)
-        if quantity <= 0:
-            print(f"[ORDER SKIP] {symbol} quantity=0")
+        total_qty  = round(TRADE_AMOUNT * LEVERAGE / entry, precision)
+        half_qty   = round(total_qty / 2, precision)
+        if total_qty <= 0 or half_qty <= 0:
+            print(f"[ORDER SKIP] {symbol} qty too small")
             return None
 
         pos_side   = "LONG"  if side == "BUY"  else "SHORT"
         close_side = "SELL"  if side == "BUY"  else "BUY"
         url        = BASE_URL + "/openApi/swap/v2/trade/order"
 
-        # Main order
+        # Main order — full quantity
         params = build_signed_params({
             "symbol":       symbol,
             "side":         side,
             "positionSide": pos_side,
             "type":         "MARKET",
-            "quantity":     quantity,
+            "quantity":     total_qty,
         })
         resp = requests.post(url, params=params,
                              headers={"X-BX-APIKEY": API_KEY}, timeout=10)
         r = resp.json()
         print(f"[ORDER RESPONSE] {symbol} {side}: {r}")
-
         order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
 
         if order_id != "N/A":
-            for price, order_type in [(sl, "STOP_MARKET"), (tp, "TAKE_PROFIT_MARKET")]:
-                p2 = build_signed_params({
-                    "symbol":        symbol,
-                    "side":          close_side,
-                    "positionSide":  pos_side,
-                    "type":          order_type,
-                    "stopPrice":     price,
-                    "closePosition": "true",
-                })
-                r2 = requests.post(url, params=p2,
-                                   headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-                print(f"[SL/TP RESPONSE] {symbol} {order_type}: {r2}")
+            # SL — full quantity
+            p_sl = build_signed_params({
+                "symbol":        symbol,
+                "side":          close_side,
+                "positionSide":  pos_side,
+                "type":          "STOP_MARKET",
+                "stopPrice":     sl,
+                "closePosition": "true",
+            })
+            r_sl = requests.post(url, params=p_sl,
+                                 headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            print(f"[SL] {symbol}: {r_sl}")
+
+            # TP1 — half quantity
+            p_tp1 = build_signed_params({
+                "symbol":        symbol,
+                "side":          close_side,
+                "positionSide":  pos_side,
+                "type":          "TAKE_PROFIT_MARKET",
+                "stopPrice":     tp1,
+                "quantity":      half_qty,
+                "closePosition": "false",
+            })
+            r_tp1 = requests.post(url, params=p_tp1,
+                                  headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            print(f"[TP1] {symbol}: {r_tp1}")
+
+            # TP2 — remaining half quantity
+            p_tp2 = build_signed_params({
+                "symbol":        symbol,
+                "side":          close_side,
+                "positionSide":  pos_side,
+                "type":          "TAKE_PROFIT_MARKET",
+                "stopPrice":     tp2,
+                "quantity":      half_qty,
+                "closePosition": "false",
+            })
+            r_tp2 = requests.post(url, params=p_tp2,
+                                  headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+            print(f"[TP2] {symbol}: {r_tp2}")
 
         return order_id
     except Exception as e:
@@ -166,115 +209,138 @@ last_alerted = set()
 def h(c):  return float(c["high"])
 def l(c):  return float(c["low"])
 def cl(c): return float(c["close"])
+def o(c):  return float(c["open"])
 def v(c):  return float(c["volume"])
 
 
 def check_symbol(symbol):
     try:
         candles = get_candles(symbol, limit=200)
-        if len(candles) < VOLUME_LOOKBACK + RSI_LEN + 10:
+        if len(candles) < VOLUME_LOOKBACK + RSI_LEN + EMA_LEN + 10:
             return
 
         confirmed = candles[:-1]
         closes = [cl(c) for c in confirmed]
+        opens  = [o(c)  for c in confirmed]
         vols   = [v(c)  for c in confirmed]
+        highs  = [h(c)  for c in confirmed]
+        lows   = [l(c)  for c in confirmed]
 
-        ema_fast_vals = ema_series(closes, EMA_FAST)
-        ema_slow_vals = ema_series(closes, EMA_SLOW)
-        rsi_vals      = rsi_series(closes, RSI_LEN)
+        ema_vals  = ema_series(closes, EMA_LEN)
+        vwap_vals = vwap_series(confirmed)
+        rsi_vals  = rsi_series(closes, RSI_LEN)
 
         i = len(confirmed) - 1
         p = i - 1
-        if p < VOLUME_LOOKBACK:
+
+        if p < VOLUME_LOOKBACK + EMA_LEN:
             return
 
-        bull_cross = (ema_fast_vals[p] <= ema_slow_vals[p] and
-                      ema_fast_vals[i] >  ema_slow_vals[i])
-        bear_cross = (ema_fast_vals[p] >= ema_slow_vals[p] and
-                      ema_fast_vals[i] <  ema_slow_vals[i])
+        entry     = closes[i]
+        vwap_now  = vwap_vals[i]
+        vwap_prev = vwap_vals[p]
+        ema_now   = ema_vals[i]
+        rsi_now   = rsi_vals[i]
 
-        if not bull_cross and not bear_cross:
-            return
+        avg_vol  = sum(vols[i - VOLUME_LOOKBACK:i]) / VOLUME_LOOKBACK
+        ratio    = vols[i] / avg_vol if avg_vol > 0 else 0
+        vol_ok   = ratio >= VOLUME_MULTIPLIER
 
-        rsi_now      = rsi_vals[i]
-        avg_vol      = sum(vols[i - VOLUME_LOOKBACK:i]) / VOLUME_LOOKBACK
-        max_vol      = max(vols[p], vols[i])
-        ratio        = max_vol / avg_vol if avg_vol > 0 else 0
-        ema_slow_now = ema_slow_vals[i]
-        entry        = closes[i]
-        swing_low    = min(l(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
-        swing_high   = max(h(c) for c in confirmed[i - SWING_LOOKBACK:i + 1])
+        swing_low  = min(lows[i - SWING_LOOKBACK:i + 1])
+        swing_high = max(highs[i - SWING_LOOKBACK:i + 1])
+
+        # VWAP cross: previous candle crossed, current candle confirms
+        vwap_cross_up   = closes[p] > vwap_vals[p] and closes[p-1] <= vwap_vals[p-1]
+        vwap_cross_down = closes[p] < vwap_vals[p] and closes[p-1] >= vwap_vals[p-1]
 
         if entry < MIN_PRICE:
             return
 
-        if bull_cross and 50 < rsi_now < 70:
-            sig_id = (symbol, "BUY", int(confirmed[i]["time"]))
+        # LONG
+        if (vwap_cross_up
+                and closes[i] > vwap_now
+                and closes[i] > ema_now
+                and vol_ok
+                and 40 <= rsi_now <= 65
+                and closes[i] > opens[i]):
+
+            sig_id = (symbol, "BUY", int(confirmed[p]["time"]))
             if sig_id not in last_alerted:
-                sl   = min(swing_low, ema_slow_now * (1 - SL_BUFFER_PCT / 100))
+                sl   = min(swing_low, vwap_now * (1 - SL_BUFFER_PCT / 100))
                 risk = entry - sl
                 if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
                     return
-                tp = round(entry + risk * RR_RATIO, 6)
-                sl = round(sl, 6)
-                print(f"[INFO] {symbol} BUY | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x")
-                if ratio >= VOLUME_MULTIPLIER:
-                    last_alerted.add(sig_id)
-                    if auto_trade_enabled:
-                        order_id = place_order(symbol, "BUY", entry, sl, tp)
-                        trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
-                    else:
-                        trade_status = "\n⏸ Auto-trade OFF (signal only)"
-                    send_tg(
-                        f"🟢 BUY SIGNAL — {symbol}\n"
-                        f"——————————————\n"
-                        f"Timeframe : 15m\n"
-                        f"Strategy  : EMA 9/21 + RSI + 5x Vol\n"
-                        f"——————————————\n"
-                        f"Entry     : {round(entry, 6)}\n"
-                        f"Stop Loss : {sl}\n"
-                        f"TP (1:4)  : {tp}\n"
-                        f"RSI       : {rsi_now:.1f}\n"
-                        f"Vol Ratio : {ratio:.1f}x\n"
-                        f"Amount    : ${TRADE_AMOUNT} x {LEVERAGE}x"
-                        f"{trade_status}\n"
-                        f"——————————————\n"
-                        f"Niti Tight Bot"
-                    )
+                tp1 = round(entry + risk * RR_TP1, 6)
+                tp2 = round(entry + risk * RR_TP2, 6)
+                sl  = round(sl, 6)
+                print(f"[INFO] {symbol} BUY | RSI={rsi_now:.1f} | vol={ratio:.1f}x | VWAP cross")
+                last_alerted.add(sig_id)
+                trade_status = ""
+                if auto_trade_enabled:
+                    order_id = place_order(symbol, "BUY", entry, sl, tp1, tp2)
+                    trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
+                else:
+                    trade_status = "\n⏸ Auto-trade OFF (signal only)"
+                send_tg(
+                    f"🟢 BUY SIGNAL — {symbol}\n"
+                    f"——————————————\n"
+                    f"Timeframe : 15m\n"
+                    f"Strategy  : VWAP Cross + EMA50 + 3x Vol\n"
+                    f"——————————————\n"
+                    f"Entry     : {round(entry, 6)}\n"
+                    f"Stop Loss : {sl}\n"
+                    f"TP1 (1:2) : {tp1}\n"
+                    f"TP2 (1:4) : {tp2}\n"
+                    f"RSI       : {rsi_now:.1f}\n"
+                    f"Vol Ratio : {ratio:.1f}x\n"
+                    f"Amount    : ${TRADE_AMOUNT} x {LEVERAGE}x"
+                    f"{trade_status}\n"
+                    f"——————————————\n"
+                    f"Niti Tight Bot 2"
+                )
 
-        if bear_cross and 30 < rsi_now < 50:
-            sig_id = (symbol, "SELL", int(confirmed[i]["time"]))
+        # SHORT
+        if (vwap_cross_down
+                and closes[i] < vwap_now
+                and closes[i] < ema_now
+                and vol_ok
+                and 35 <= rsi_now <= 60
+                and closes[i] < opens[i]):
+
+            sig_id = (symbol, "SELL", int(confirmed[p]["time"]))
             if sig_id not in last_alerted:
-                sl   = max(swing_high, ema_slow_now * (1 + SL_BUFFER_PCT / 100))
+                sl   = max(swing_high, vwap_now * (1 + SL_BUFFER_PCT / 100))
                 risk = sl - entry
                 if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
                     return
-                tp = round(entry - risk * RR_RATIO, 6)
-                sl = round(sl, 6)
-                print(f"[INFO] {symbol} SELL | RSI={rsi_now:.1f} | vol_ratio={ratio:.1f}x")
-                if ratio >= VOLUME_MULTIPLIER:
-                    last_alerted.add(sig_id)
-                    if auto_trade_enabled:
-                        order_id = place_order(symbol, "SELL", entry, sl, tp)
-                        trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
-                    else:
-                        trade_status = "\n⏸ Auto-trade OFF (signal only)"
-                    send_tg(
-                        f"🔴 SELL SIGNAL — {symbol}\n"
-                        f"——————————————\n"
-                        f"Timeframe : 15m\n"
-                        f"Strategy  : EMA 9/21 + RSI + 5x Vol\n"
-                        f"——————————————\n"
-                        f"Entry     : {round(entry, 6)}\n"
-                        f"Stop Loss : {sl}\n"
-                        f"TP (1:4)  : {tp}\n"
-                        f"RSI       : {rsi_now:.1f}\n"
-                        f"Vol Ratio : {ratio:.1f}x\n"
-                        f"Amount    : ${TRADE_AMOUNT} x {LEVERAGE}x"
-                        f"{trade_status}\n"
-                        f"——————————————\n"
-                        f"Niti Tight Bot"
-                    )
+                tp1 = round(entry - risk * RR_TP1, 6)
+                tp2 = round(entry - risk * RR_TP2, 6)
+                sl  = round(sl, 6)
+                print(f"[INFO] {symbol} SELL | RSI={rsi_now:.1f} | vol={ratio:.1f}x | VWAP cross")
+                last_alerted.add(sig_id)
+                trade_status = ""
+                if auto_trade_enabled:
+                    order_id = place_order(symbol, "SELL", entry, sl, tp1, tp2)
+                    trade_status = f"\n✅ Order placed | ID: {order_id}" if order_id and order_id != "N/A" else "\n❌ Order failed"
+                else:
+                    trade_status = "\n⏸ Auto-trade OFF (signal only)"
+                send_tg(
+                    f"🔴 SELL SIGNAL — {symbol}\n"
+                    f"——————————————\n"
+                    f"Timeframe : 15m\n"
+                    f"Strategy  : VWAP Cross + EMA50 + 3x Vol\n"
+                    f"——————————————\n"
+                    f"Entry     : {round(entry, 6)}\n"
+                    f"Stop Loss : {sl}\n"
+                    f"TP1 (1:2) : {tp1}\n"
+                    f"TP2 (1:4) : {tp2}\n"
+                    f"RSI       : {rsi_now:.1f}\n"
+                    f"Vol Ratio : {ratio:.1f}x\n"
+                    f"Amount    : ${TRADE_AMOUNT} x {LEVERAGE}x"
+                    f"{trade_status}\n"
+                    f"——————————————\n"
+                    f"Niti Tight Bot 2"
+                )
 
     except Exception as e:
         print(f"[{symbol}] error: {e}")
@@ -309,6 +375,7 @@ def handle_telegram_commands():
                     state = "🟢 ON" if auto_trade_enabled else "🔴 OFF"
                     send_tg(
                         f"Auto-trade: {state}\n"
+                        f"Strategy: VWAP + EMA50 + 3x Vol\n"
                         f"Amount: ${TRADE_AMOUNT} | Leverage: {LEVERAGE}x"
                     )
         except Exception as e:
@@ -317,7 +384,7 @@ def handle_telegram_commands():
 
 
 def monitor_loop():
-    print("Monitor started — 15m EMA 9/21 + RSI 14 + 5x Volume | RR 1:4")
+    print("Monitor started — 15m VWAP Cross + EMA50 + 3x Volume | TP1:1:2 TP2:1:4")
     while True:
         try:
             symbols = get_futures_symbols()
@@ -333,7 +400,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight Bot — 15m EMA 9/21 + RSI + 5x Vol | Auto-execution ready", 200
+    return "Niti Tight Bot 2 — VWAP + EMA50 + 3x Vol | TP1:1:2 TP2:1:4", 200
 
 
 if __name__ == "__main__":

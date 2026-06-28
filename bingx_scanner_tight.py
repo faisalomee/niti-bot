@@ -31,7 +31,7 @@ symbol_precision   = {}
 
 def build_signed_params(params: dict) -> dict:
     params["timestamp"] = int(time.time() * 1000)
-    qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
     params["signature"] = hmac.new(
         SECRET_KEY.encode(), qs.encode(), hashlib.sha256
     ).hexdigest()
@@ -213,7 +213,7 @@ def check_symbol(symbol):
     try:
         candles = get_candles(symbol, limit=200)
         if len(candles) < VOLUME_LOOKBACK + RSI_LEN + EMA_LEN + 10:
-            return None  # return ratio=None
+            return None
 
         confirmed = candles[:-1]
         closes = [cl(c) for c in confirmed]
@@ -287,7 +287,7 @@ def check_symbol(symbol):
                     f"🟢 BUY SIGNAL — {symbol}\n"
                     f"——————————————\n"
                     f"Timeframe : 15m\n"
-                    f"Strategy  : VWAP Cross + EMA50 + 3x Vol\n"
+                    f"Strategy  : VWAP Cross + EMA50 + 2x Vol\n"
                     f"——————————————\n"
                     f"Entry     : {round(entry, 6)}\n"
                     f"Stop Loss : {sl}\n"
@@ -330,7 +330,7 @@ def check_symbol(symbol):
                     f"🔴 SELL SIGNAL — {symbol}\n"
                     f"——————————————\n"
                     f"Timeframe : 15m\n"
-                    f"Strategy  : VWAP Cross + EMA50 + 3x Vol\n"
+                    f"Strategy  : VWAP Cross + EMA50 + 2x Vol\n"
                     f"——————————————\n"
                     f"Entry     : {round(entry, 6)}\n"
                     f"Stop Loss : {sl}\n"
@@ -380,7 +380,7 @@ def handle_telegram_commands():
                     state = "🟢 ON" if auto_trade_enabled else "🔴 OFF"
                     send_tg(
                         f"Auto-trade: {state}\n"
-                        f"Strategy: VWAP + EMA50 + 3x Vol\n"
+                        f"Strategy: VWAP + EMA50 + 2x Vol\n"
                         f"Amount: ${TRADE_AMOUNT} | Leverage: {LEVERAGE}x"
                     )
         except Exception as e:
@@ -389,7 +389,7 @@ def handle_telegram_commands():
 
 
 def monitor_loop():
-    print("Monitor started — 15m VWAP Cross + EMA50 + 3x Volume | TP1:1:2 TP2:1:4")
+    print("Monitor started — 15m VWAP Cross + EMA50 + 2x Volume | TP1:1:2 TP2:1:4")
     while True:
         try:
             symbols = get_futures_symbols()
@@ -413,7 +413,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight Bot 2 — VWAP + EMA50 + 3x Vol | TP1:1:2 TP2:1:4", 200
+    return "Niti Tight Bot 2 — VWAP + EMA50 + 2x Vol | TP1:1:2 TP2:1:4", 200
 
 
 if __name__ == "__main__":

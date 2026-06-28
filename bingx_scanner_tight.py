@@ -141,7 +141,6 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
         close_side = "SELL"  if side == "BUY"  else "BUY"
         url        = BASE_URL + "/openApi/swap/v2/trade/order"
 
-        # Main order — full quantity
         params = build_signed_params({
             "symbol":       symbol,
             "side":         side,
@@ -156,7 +155,6 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
         order_id = r.get("data", {}).get("order", {}).get("orderId", "N/A")
 
         if order_id != "N/A":
-            # SL — full quantity
             p_sl = build_signed_params({
                 "symbol":        symbol,
                 "side":          close_side,
@@ -169,7 +167,6 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
                                  headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
             print(f"[SL] {symbol}: {r_sl}")
 
-            # TP1 — half quantity
             p_tp1 = build_signed_params({
                 "symbol":        symbol,
                 "side":          close_side,
@@ -183,7 +180,6 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
                                   headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
             print(f"[TP1] {symbol}: {r_tp1}")
 
-            # TP2 — remaining half quantity
             p_tp2 = build_signed_params({
                 "symbol":        symbol,
                 "side":          close_side,
@@ -236,22 +232,32 @@ def check_symbol(symbol):
         if p < VOLUME_LOOKBACK + EMA_LEN:
             return
 
-        entry     = closes[i]
-        vwap_now  = vwap_vals[i]
-        vwap_prev = vwap_vals[p]
-        ema_now   = ema_vals[i]
-        rsi_now   = rsi_vals[i]
+        entry    = closes[i]
+        vwap_now = vwap_vals[i]
+        ema_now  = ema_vals[i]
+        rsi_now  = rsi_vals[i]
 
-        avg_vol  = sum(vols[i - VOLUME_LOOKBACK:i]) / VOLUME_LOOKBACK
-        ratio    = vols[i] / avg_vol if avg_vol > 0 else 0
-        vol_ok   = ratio >= VOLUME_MULTIPLIER
+        # FIX 3: avg = cross candle (p) এর আগের 100 candle, নিজে বাদ
+        avg_vol = sum(vols[p - VOLUME_LOOKBACK:p]) / VOLUME_LOOKBACK
+
+        # FIX 2: volume check cross candle (p) দিয়ে
+        ratio   = vols[p] / avg_vol if avg_vol > 0 else 0
+        vol_ok  = ratio >= VOLUME_MULTIPLIER
 
         swing_low  = min(lows[i - SWING_LOOKBACK:i + 1])
         swing_high = max(highs[i - SWING_LOOKBACK:i + 1])
 
-        # VWAP cross: previous candle crossed, current candle confirms
-        vwap_cross_up   = closes[p] > vwap_vals[p] and closes[p-1] <= vwap_vals[p-1]
-        vwap_cross_down = closes[p] < vwap_vals[p] and closes[p-1] >= vwap_vals[p-1]
+        # FIX 1: last 3 candle এর মধ্যে যেকোনো সময় cross হলেই চলবে
+        vwap_cross_up = any(
+            closes[j] > vwap_vals[j] and closes[j - 1] <= vwap_vals[j - 1]
+            for j in range(p - 1, p + 2)
+            if j > 0
+        )
+        vwap_cross_down = any(
+            closes[j] < vwap_vals[j] and closes[j - 1] >= vwap_vals[j - 1]
+            for j in range(p - 1, p + 2)
+            if j > 0
+        )
 
         if entry < MIN_PRICE:
             return

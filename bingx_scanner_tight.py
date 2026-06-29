@@ -56,7 +56,7 @@ def get_futures_symbols():
     return symbols
 
 
-def get_candles(symbol, limit=300):
+def get_candles(symbol, limit=350):
     params = build_signed_params({"symbol": symbol, "interval": TIMEFRAME, "limit": limit})
     url = BASE_URL + "/openApi/swap/v3/quote/klines"
     r = requests.get(url, params=params,

@@ -19,7 +19,7 @@ TIMEFRAME         = "15m"
 RSI_LEN           = 14
 VOLUME_LOOKBACK   = 100
 VOLUME_MULTIPLIER = 2
-EMA_LEN           = 50
+EMA50_LEN         = 50
 EMA200_LEN        = 200
 SWING_LOOKBACK    = 10
 SL_BUFFER_PCT     = 0.15
@@ -168,7 +168,6 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
 
         if order_id != "N/A":
             time.sleep(0.5)
-
             p_sl = build_signed_params({
                 "symbol":       symbol,
                 "side":         close_side,
@@ -190,7 +189,7 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
                 "quantity":     half_qty,
             })
             requests.post(url, params=p_tp1,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+                          headers={"X-BX-APIKEY": API_KEY}, timeout=10)
 
             p_tp2 = build_signed_params({
                 "symbol":       symbol,
@@ -201,7 +200,7 @@ def place_order(symbol, side, entry, sl, tp1, tp2):
                 "quantity":     half_qty,
             })
             requests.post(url, params=p_tp2,
-                          headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+                          headers={"X-BX-APIKEY": API_KEY}, timeout=10)
 
             open_trades[str(order_id)] = {
                 "symbol": symbol,
@@ -265,7 +264,6 @@ def track_open_trades():
                 )
             except Exception as e:
                 print(f"[TRACK ERROR] {e}")
-
     for oid in to_remove:
         open_trades.pop(oid, None)
 
@@ -275,12 +273,10 @@ def send_daily_summary():
     nzt   = timezone(timedelta(hours=12))
     now   = datetime.now(nzt)
     today = now.date()
-
     if last_summary_date == today:
         return
     if now.hour != 23 or now.minute < 55:
         return
-
     last_summary_date = today
     total_pnl = round(sum(t.get("pnl", 0) for t in daily_trades), 2)
     wins      = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
@@ -289,26 +285,22 @@ def send_daily_summary():
     win_rate  = round(wins / total * 100, 1) if total > 0 else 0
     sign      = "+" if total_pnl > 0 else ""
     date_str  = today.strftime("%b %d, %Y")
-
     lines = ["Daily Summary - " + date_str, "------------------------------"]
     for idx, t in enumerate(daily_trades, 1):
         p  = t.get("pnl", 0)
         ps = "+" if p > 0 else ""
         lines.append(str(idx) + ". " + t["symbol"] + " " + t["side"] + " | " + t.get("result","?") + " | " + ps + str(p) + " USDT")
-
     lines.append("------------------------------")
     lines.append("Trades   : " + str(total) + " (" + str(wins) + "W / " + str(losses) + "L)")
     lines.append("Win Rate : " + str(win_rate) + "%")
     lines.append("Total PnL: " + sign + str(total_pnl) + " USDT")
     lines.append("------------------------------")
     lines.append("Niti Journal")
-
     send_journal("\n".join(lines))
     daily_trades = []
 
 
 last_alerted = set()
-
 
 def h(c):  return float(c["high"])
 def l(c):  return float(c["low"])
@@ -319,8 +311,8 @@ def v(c):  return float(c["volume"])
 
 def check_symbol(symbol):
     try:
-        candles = get_candles(symbol, limit=300)
-        if len(candles) < VOLUME_LOOKBACK + RSI_LEN + EMA200_LEN + 10:
+        candles = get_candles(symbol, limit=350)
+        if len(candles) < 320:
             return None
 
         confirmed = candles[:-1]
@@ -330,19 +322,20 @@ def check_symbol(symbol):
         highs  = [h(c)  for c in confirmed]
         lows   = [l(c)  for c in confirmed]
 
-        ema50_vals  = ema_series(closes, EMA_LEN)
+        ema50_vals  = ema_series(closes, EMA50_LEN)
         ema200_vals = ema_series(closes, EMA200_LEN)
         vwap_vals   = vwap_series(confirmed)
         rsi_vals    = rsi_series(closes, RSI_LEN)
 
-        i = len(confirmed) - 1
-
-        # i   = current confirmed candle (entry candle)
+        # Index layout:
+        # i   = current candle (2nd confirmation)
         # i-1 = 1st confirmation candle
-        # i-2 = 2nd confirmation candle (or signal candle area)
-        # p   = VWAP cross check window starts here
+        # i-2 = signal candle (VWAP cross + volume)
+        i   = len(confirmed) - 1
+        c1  = i - 1   # 1st confirmation
+        sig = i - 2   # signal candle
 
-        if i < VOLUME_LOOKBACK + EMA200_LEN + 5:
+        if sig < VOLUME_LOOKBACK + EMA200_LEN:
             return None
 
         entry      = closes[i]
@@ -355,8 +348,7 @@ def check_symbol(symbol):
         trend_bull = entry > ema200_now
         trend_bear = entry < ema200_now
 
-        # Volume check on i-2 (signal candle)
-        sig = i - 2
+        # Volume on signal candle
         avg_vol = sum(vols[sig - VOLUME_LOOKBACK:sig]) / VOLUME_LOOKBACK
         ratio   = vols[sig] / avg_vol if avg_vol > 0 else 0
         vol_ok  = ratio >= VOLUME_MULTIPLIER
@@ -364,37 +356,32 @@ def check_symbol(symbol):
         swing_low  = min(lows[i - SWING_LOOKBACK:i + 1])
         swing_high = max(highs[i - SWING_LOOKBACK:i + 1])
 
-        # VWAP cross check around signal candle (i-2)
+        # VWAP cross on signal candle area (sig-1 to sig+1)
         vwap_cross_up = any(
-            closes[j] > vwap_vals[j] and closes[j - 1] <= vwap_vals[j - 1]
-            for j in range(i - 4, i - 1)
-            if j > 0
+            closes[j] > vwap_vals[j] and closes[j-1] <= vwap_vals[j-1]
+            for j in range(sig - 1, sig + 2)
+            if j > 0 and j < len(closes)
         )
         vwap_cross_down = any(
-            closes[j] < vwap_vals[j] and closes[j - 1] >= vwap_vals[j - 1]
-            for j in range(i - 4, i - 1)
-            if j > 0
+            closes[j] < vwap_vals[j] and closes[j-1] >= vwap_vals[j-1]
+            for j in range(sig - 1, sig + 2)
+            if j > 0 and j < len(closes)
         )
 
-        # 2 confirmation candles — i-1 and i both same direction
-        confirm1_bull = closes[i-1] > opens[i-1] and closes[i-1] > vwap_vals[i-1]
-        confirm2_bull = closes[i]   > opens[i]   and closes[i]   > vwap_vals[i]
-
-        confirm1_bear = closes[i-1] < opens[i-1] and closes[i-1] < vwap_vals[i-1]
-        confirm2_bear = closes[i]   < opens[i]   and closes[i]   < vwap_vals[i]
+        # 2 confirmation candles
+        conf1_bull = closes[c1] > opens[c1] and closes[c1] > vwap_vals[c1]
+        conf2_bull = closes[i]  > opens[i]  and closes[i]  > vwap_now
+        conf1_bear = closes[c1] < opens[c1] and closes[c1] < vwap_vals[c1]
+        conf2_bear = closes[i]  < opens[i]  and closes[i]  < vwap_now
 
         if entry < MIN_PRICE:
             return ratio
 
         # LONG
-        if (vwap_cross_up
-                and entry > vwap_now
-                and entry > ema50_now
-                and trend_bull
-                and vol_ok
+        if (vwap_cross_up and entry > vwap_now and entry > ema50_now
+                and trend_bull and vol_ok
                 and 40 <= rsi_now <= 65
-                and confirm1_bull
-                and confirm2_bull):
+                and conf1_bull and conf2_bull):
 
             sig_id = (symbol, "BUY", int(confirmed[sig]["time"]))
             if sig_id not in last_alerted:
@@ -405,7 +392,7 @@ def check_symbol(symbol):
                 tp1 = round(entry + risk * RR_TP1, 6)
                 tp2 = round(entry + risk * RR_TP2, 6)
                 sl  = round(sl, 6)
-                print(f"[INFO] {symbol} BUY | RSI={rsi_now:.1f} | vol={ratio:.1f}x | 2-confirm")
+                print(f"[INFO] {symbol} BUY | RSI={rsi_now:.1f} | vol={ratio:.1f}x | EMA200+2confirm")
                 last_alerted.add(sig_id)
                 trade_status = ""
                 if auto_trade_enabled:
@@ -417,7 +404,7 @@ def check_symbol(symbol):
                     "BUY SIGNAL - " + symbol + "\n"
                     "------------------------------\n"
                     "Timeframe : 15m\n"
-                    "Strategy  : VWAP + EMA50 + EMA200 + 2-Confirm\n"
+                    "Strategy  : VWAP+EMA50+EMA200+2Confirm\n"
                     "------------------------------\n"
                     "Entry     : " + str(round(entry, 6)) + "\n"
                     "Stop Loss : " + str(sl) + "\n"
@@ -444,14 +431,10 @@ def check_symbol(symbol):
                 )
 
         # SHORT
-        if (vwap_cross_down
-                and entry < vwap_now
-                and entry < ema50_now
-                and trend_bear
-                and vol_ok
+        if (vwap_cross_down and entry < vwap_now and entry < ema50_now
+                and trend_bear and vol_ok
                 and 35 <= rsi_now <= 60
-                and confirm1_bear
-                and confirm2_bear):
+                and conf1_bear and conf2_bear):
 
             sig_id = (symbol, "SELL", int(confirmed[sig]["time"]))
             if sig_id not in last_alerted:
@@ -462,7 +445,7 @@ def check_symbol(symbol):
                 tp1 = round(entry - risk * RR_TP1, 6)
                 tp2 = round(entry - risk * RR_TP2, 6)
                 sl  = round(sl, 6)
-                print(f"[INFO] {symbol} SELL | RSI={rsi_now:.1f} | vol={ratio:.1f}x | 2-confirm")
+                print(f"[INFO] {symbol} SELL | RSI={rsi_now:.1f} | vol={ratio:.1f}x | EMA200+2confirm")
                 last_alerted.add(sig_id)
                 trade_status = ""
                 if auto_trade_enabled:
@@ -474,7 +457,7 @@ def check_symbol(symbol):
                     "SELL SIGNAL - " + symbol + "\n"
                     "------------------------------\n"
                     "Timeframe : 15m\n"
-                    "Strategy  : VWAP + EMA50 + EMA200 + 2-Confirm\n"
+                    "Strategy  : VWAP+EMA50+EMA200+2Confirm\n"
                     "------------------------------\n"
                     "Entry     : " + str(round(entry, 6)) + "\n"
                     "Stop Loss : " + str(sl) + "\n"
@@ -536,7 +519,7 @@ def handle_telegram_commands():
                     state = "ON" if auto_trade_enabled else "OFF"
                     send_tg(
                         "Auto-trade: " + state + "\n"
-                        "Strategy: VWAP + EMA50 + EMA200 + 2-Confirm\n"
+                        "Strategy: VWAP+EMA50+EMA200+2Confirm\n"
                         "Amount: $" + str(TRADE_AMOUNT) + " | Leverage: " + str(LEVERAGE) + "x"
                     )
         except Exception as e:
@@ -545,25 +528,22 @@ def handle_telegram_commands():
 
 
 def monitor_loop():
-    print("Monitor started - 15m VWAP + EMA50 + EMA200 + 2-Confirm | TP1:1:2 TP2:1:4")
+    print("Monitor started - 15m VWAP+EMA50+EMA200+2Confirm | TP1:1:2 TP2:1:4")
     while True:
         try:
             symbols = get_futures_symbols()
             print(f"Scanning {len(symbols)} pairs... | auto_trade={auto_trade_enabled}")
-
             ratios = []
             for sym in symbols:
                 r = check_symbol(sym)
                 if r is not None:
                     ratios.append(r)
                 time.sleep(0.2)
-
             track_open_trades()
             send_daily_summary()
-
             if ratios:
                 top5 = sorted(ratios, reverse=True)[:5]
-                print(f"[VOL DEBUG] Top 5 ratios: {[round(x,2) for x in top5]} | threshold={VOLUME_MULTIPLIER}x")
+                print(f"[VOL DEBUG] Top 5: {[round(x,2) for x in top5]} | threshold={VOLUME_MULTIPLIER}x")
             print("Scan complete. Sleeping 60s...")
         except Exception as e:
             print(f"Loop error: {e}")
@@ -572,7 +552,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight Bot 2 - VWAP + EMA50 + EMA200 + 2-Confirm | TP1:1:2 TP2:1:4", 200
+    return "Niti Tight Bot 2 - VWAP+EMA50+EMA200+2Confirm | TP1:1:2 TP2:1:4", 200
 
 
 if __name__ == "__main__":

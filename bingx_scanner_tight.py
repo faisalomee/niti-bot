@@ -16,13 +16,15 @@ FAST_TRADE_AMOUNT = float(os.environ.get("FAST_TRADE_AMOUNT", 20))
 
 BASE_URL = "https://open-api.bingx.com"
 
-# ── Tight 2 params ──
+# Tight 2 params
 TIMEFRAME         = "15m"
 RSI_LEN           = 14
 VOLUME_LOOKBACK   = 100
 VOLUME_MULTIPLIER = 2
 EMA50_LEN         = 50
 EMA200_LEN        = 200
+ADX_LEN           = 14
+ADX_MIN           = 20    # below this = choppy, skip signal
 SWING_LOOKBACK    = 10
 SL_BUFFER_PCT     = 0.15
 RR_TP1            = 2.0
@@ -30,7 +32,7 @@ RR_TP2            = 4.0
 MIN_PRICE         = 0.001
 MIN_RISK_PCT      = 0.1
 
-# ── Fast Signal params ──
+# Fast Signal params
 FAST_TIMEFRAME    = "3m"
 FAST_VOL_MULT     = 5.0
 FAST_VOL_LB       = 50
@@ -131,6 +133,49 @@ def ema_series(closes, period):
         ema = c * k + ema * (1 - k)
         result.append(ema)
     return result
+
+
+def adx_series(highs, lows, closes, period=14):
+    n = len(closes)
+    if n < period + 2:
+        return [0.0] * n
+
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, n):
+        high_diff = highs[i] - highs[i-1]
+        low_diff  = lows[i-1] - lows[i]
+        tr  = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        pdm = high_diff if high_diff > low_diff and high_diff > 0 else 0
+        ndm = low_diff  if low_diff > high_diff and low_diff  > 0 else 0
+        tr_list.append(tr)
+        pdm_list.append(pdm)
+        ndm_list.append(ndm)
+
+    def smooth(lst, p):
+        result = [sum(lst[:p])]
+        for i in range(p, len(lst)):
+            result.append(result[-1] - result[-1] / p + lst[i])
+        return result
+
+    atr  = smooth(tr_list,  period)
+    pDM  = smooth(pdm_list, period)
+    nDM  = smooth(ndm_list, period)
+
+    adx_vals = [0.0] * (period + 1)
+    dx_list  = []
+    for i in range(len(atr)):
+        pdi = 100 * pDM[i] / atr[i] if atr[i] != 0 else 0
+        ndi = 100 * nDM[i] / atr[i] if atr[i] != 0 else 0
+        dx  = 100 * abs(pdi - ndi) / (pdi + ndi) if (pdi + ndi) != 0 else 0
+        dx_list.append(dx)
+
+    adx_smooth = [sum(dx_list[:period]) / period]
+    for i in range(period, len(dx_list)):
+        adx_smooth.append((adx_smooth[-1] * (period - 1) + dx_list[i]) / period)
+
+    result = [0.0] * (period + 1)
+    result += adx_smooth
+    return result[:n]
 
 
 def vwap_series(candles):
@@ -422,7 +467,7 @@ def v(c):  return float(c["volume"])
 
 
 def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
-                ema50_vals, ema200_vals, vwap_vals, rsi_vals):
+                ema50_vals, ema200_vals, vwap_vals, rsi_vals, adx_vals):
     i   = len(confirmed) - 1
     c1  = i - 1
     sig = i - 2
@@ -434,6 +479,11 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
     ema50_now  = ema50_vals[i]
     ema200_now = ema200_vals[i]
     rsi_now    = rsi_vals[i]
+    adx_now    = adx_vals[i]
+
+    # ADX filter — skip choppy market
+    if adx_now < ADX_MIN:
+        return None
 
     trend_bull = entry > ema200_now
     trend_bear = entry < ema200_now
@@ -474,7 +524,7 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
             tp1 = round(entry + risk * RR_TP1, 6)
             tp2 = round(entry + risk * RR_TP2, 6)
             sl  = round(sl, 6)
-            print(f"[TIGHT] {symbol} BUY | RSI={rsi_now:.1f} | vol={ratio:.1f}x")
+            print(f"[TIGHT] {symbol} BUY | RSI={rsi_now:.1f} | vol={ratio:.1f}x | ADX={adx_now:.1f}")
             tight_alerted.add(sig_id)
             trade_status = ""
             if tight_auto_trade_enabled:
@@ -486,11 +536,11 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
                 "TIGHT SIGNAL - BUY - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry,6)) + " | SL: " + str(sl) + "\n"
                 "TP1: " + str(tp1) + " | TP2: " + str(tp2) + "\n"
-                "RSI: " + str(round(rsi_now,1)) + " | Vol: " + str(round(ratio,1)) + "x" +
+                "RSI: " + str(round(rsi_now,1)) + " | Vol: " + str(round(ratio,1)) + "x | ADX: " + str(round(adx_now,1)) +
                 trade_status + "\n------------------------------\nNiti Tight 2"
             )
             send_journal("New Trade [Tight] - " + symbol + "\nSide: BUY | Entry: " + str(round(entry,6)) +
-                " | SL: " + str(sl) + "\nTP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nNiti Journal")
+                " | SL: " + str(sl) + "\nTP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nADX: " + str(round(adx_now,1)) + "\nNiti Journal")
 
     if (vwap_cross_down and entry < vwap_now and entry < ema50_now
             and trend_bear and vol_ok and 35 <= rsi_now <= 60
@@ -504,7 +554,7 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
             tp1 = round(entry - risk * RR_TP1, 6)
             tp2 = round(entry - risk * RR_TP2, 6)
             sl  = round(sl, 6)
-            print(f"[TIGHT] {symbol} SELL | RSI={rsi_now:.1f} | vol={ratio:.1f}x")
+            print(f"[TIGHT] {symbol} SELL | RSI={rsi_now:.1f} | vol={ratio:.1f}x | ADX={adx_now:.1f}")
             tight_alerted.add(sig_id)
             trade_status = ""
             if tight_auto_trade_enabled:
@@ -516,11 +566,11 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
                 "TIGHT SIGNAL - SELL - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry,6)) + " | SL: " + str(sl) + "\n"
                 "TP1: " + str(tp1) + " | TP2: " + str(tp2) + "\n"
-                "RSI: " + str(round(rsi_now,1)) + " | Vol: " + str(round(ratio,1)) + "x" +
+                "RSI: " + str(round(rsi_now,1)) + " | Vol: " + str(round(ratio,1)) + "x | ADX: " + str(round(adx_now,1)) +
                 trade_status + "\n------------------------------\nNiti Tight 2"
             )
             send_journal("New Trade [Tight] - " + symbol + "\nSide: SELL | Entry: " + str(round(entry,6)) +
-                " | SL: " + str(sl) + "\nTP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nNiti Journal")
+                " | SL: " + str(sl) + "\nTP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nADX: " + str(round(adx_now,1)) + "\nNiti Journal")
 
     return ratio
 
@@ -544,15 +594,11 @@ def check_fast(symbol):
         if entry < MIN_PRICE:
             return
 
-        # Volume spike on candle i-1
         avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
         ratio   = vols[i-1] / avg_vol if avg_vol > 0 else 0
         if ratio < FAST_VOL_MULT:
             return
 
-        # 2 consecutive candles same direction (momentum confirm)
-        # candle i-2 and i-1 both bullish → BUY
-        # candle i-2 and i-1 both bearish → SELL
         bull_c1 = closes[i-1] > opens[i-1]
         bull_c2 = closes[i-2] > opens[i-2]
         bear_c1 = closes[i-1] < opens[i-1]
@@ -564,7 +610,6 @@ def check_fast(symbol):
         if not long_signal and not short_signal:
             return
 
-        # Opposite signal — close only, no re-entry
         if symbol in fast_open_trades:
             current_side = fast_open_trades[symbol]["side"]
             if (current_side == "BUY" and short_signal) or (current_side == "SELL" and long_signal):
@@ -638,8 +683,9 @@ def check_symbol_tight(symbol):
         ema200_vals = ema_series(closes, EMA200_LEN)
         vwap_vals   = vwap_series(confirmed)
         rsi_vals    = rsi_series(closes, RSI_LEN)
+        adx_vals    = adx_series(highs, lows, closes, ADX_LEN)
         return check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
-                           ema50_vals, ema200_vals, vwap_vals, rsi_vals)
+                           ema50_vals, ema200_vals, vwap_vals, rsi_vals, adx_vals)
     except Exception as e:
         print(f"[{symbol}] error: {e}")
         return None
@@ -715,7 +761,7 @@ def fast_scan_loop():
 
 
 def monitor_loop():
-    print("Monitor started - Tight 2 (15m) | Fast Signal (3m top 50)")
+    print("Monitor started - Tight 2 (15m + ADX) | Fast Signal (3m top 50)")
     while True:
         try:
             symbols = get_futures_symbols()
@@ -739,7 +785,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight 2 + Fast Signal", 200
+    return "Niti Tight 2 (ADX) + Fast Signal", 200
 
 
 if __name__ == "__main__":

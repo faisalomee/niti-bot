@@ -24,7 +24,7 @@ VOLUME_MULTIPLIER = 2
 EMA50_LEN         = 50
 EMA200_LEN        = 200
 ADX_LEN           = 14
-ADX_MIN           = 20    # below this = choppy, skip signal
+ADX_MIN           = 20
 SWING_LOOKBACK    = 10
 SL_BUFFER_PCT     = 0.15
 RR_TP1            = 2.0
@@ -45,7 +45,6 @@ tight_auto_trade_enabled = False
 fast_auto_trade_enabled  = False
 symbol_precision  = {}
 symbol_max_lev    = {}
-
 tight_open_trades = {}
 tight_alerted     = set()
 fast_open_trades  = {}
@@ -157,12 +156,11 @@ def adx_series(highs, lows, closes, period=14):
             result.append(result[-1] - result[-1] / p + lst[i])
         return result
 
-    atr  = smooth(tr_list,  period)
-    pDM  = smooth(pdm_list, period)
-    nDM  = smooth(ndm_list, period)
+    atr = smooth(tr_list,  period)
+    pDM = smooth(pdm_list, period)
+    nDM = smooth(ndm_list, period)
 
-    adx_vals = [0.0] * (period + 1)
-    dx_list  = []
+    dx_list = []
     for i in range(len(atr)):
         pdi = 100 * pDM[i] / atr[i] if atr[i] != 0 else 0
         ndi = 100 * nDM[i] / atr[i] if atr[i] != 0 else 0
@@ -173,9 +171,8 @@ def adx_series(highs, lows, closes, period=14):
     for i in range(period, len(dx_list)):
         adx_smooth.append((adx_smooth[-1] * (period - 1) + dx_list[i]) / period)
 
-    result = [0.0] * (period + 1)
-    result += adx_smooth
-    return result[:n]
+    padding = n - len(adx_smooth)
+    return [0.0] * padding + adx_smooth
 
 
 def vwap_series(candles):
@@ -479,9 +476,8 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
     ema50_now  = ema50_vals[i]
     ema200_now = ema200_vals[i]
     rsi_now    = rsi_vals[i]
-    adx_now    = adx_vals[i]
+    adx_now    = adx_vals[i] if i < len(adx_vals) else 0
 
-    # ADX filter — skip choppy market
     if adx_now < ADX_MIN:
         return None
 

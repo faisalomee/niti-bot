@@ -31,22 +31,24 @@ MIN_PRICE         = 0.001
 MIN_RISK_PCT      = 0.1
 
 # Fast Signal params
+FAST_TIMEFRAME    = "3m"
 FAST_VOL_MULT     = 5.0
-FAST_SL_PCT       = 1.5    # 1.5% tight SL
-FAST_TRAIL_PCT    = 1.5    # 1.5% trailing stop
-FAST_TP1_RR       = 2.0    # 1:2
+FAST_VOL_LB       = 50
+FAST_EMA_LEN      = 50
+FAST_SL_PCT       = 1.5
+FAST_TRAIL_PCT    = 1.5
+FAST_TP1_RR       = 2.0
+FAST_TOP_N        = 50
 
 tight_auto_trade_enabled = False
 fast_auto_trade_enabled  = False
 symbol_precision  = {}
 symbol_max_lev    = {}
 
-# Tight 2 tracking
 tight_open_trades = {}
 tight_alerted     = set()
 
-# Fast Signal tracking
-fast_open_trades  = {}  # symbol -> {side, entry, sl, trail_price, qty, order_id, lev}
+fast_open_trades  = {}
 fast_alerted      = set()
 
 daily_trades      = []
@@ -78,8 +80,34 @@ def get_futures_symbols():
     return symbols
 
 
-def get_candles(symbol, limit=350):
-    params = build_signed_params({"symbol": symbol, "interval": TIMEFRAME, "limit": limit})
+def get_top_movers(symbols, top_n=50):
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/ticker"
+        r = requests.get(url, timeout=10).json()
+        tickers = r.get("data", [])
+        if not isinstance(tickers, list):
+            return symbols[:top_n]
+        sym_set = set(symbols)
+        movers = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if sym not in sym_set:
+                continue
+            try:
+                change = abs(float(t.get("priceChangePercent", 0)))
+                volume = float(t.get("volume", 0))
+                movers.append((sym, change, volume))
+            except:
+                pass
+        movers.sort(key=lambda x: x[1], reverse=True)
+        return [m[0] for m in movers[:top_n]]
+    except Exception as e:
+        print(f"[TOP MOVERS ERROR] {e}")
+        return symbols[:top_n]
+
+
+def get_candles(symbol, limit=350, interval="15m"):
+    params = build_signed_params({"symbol": symbol, "interval": interval, "limit": limit})
     url = BASE_URL + "/openApi/swap/v3/quote/klines"
     r = requests.get(url, params=params,
                      headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
@@ -189,7 +217,6 @@ def place_sl_order(symbol, close_side, pos_side, sl_price, qty):
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     print(f"[SL] {symbol}: {r}")
-    return r.get("data", {}).get("order", {}).get("orderId", "N/A")
 
 
 def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
@@ -201,18 +228,33 @@ def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
     requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10)
 
 
-def close_fast_position(symbol):
+def close_fast_position(symbol, reason=""):
     if symbol not in fast_open_trades:
         return
     trade = fast_open_trades[symbol]
     try:
         pos_side   = "LONG"  if trade["side"] == "BUY" else "SHORT"
         close_side = "SELL"  if trade["side"] == "BUY" else "BUY"
-        remaining_qty = trade.get("remaining_qty", 0)
-        if remaining_qty > 0:
-            place_market_order(symbol, close_side, remaining_qty, pos_side)
-            print(f"[FAST CLOSE] {symbol} {trade['side']} closed")
+        remaining  = trade.get("remaining_qty", 0)
+        if remaining > 0 and fast_auto_trade_enabled:
+            place_market_order(symbol, close_side, remaining, pos_side)
+        current = get_current_price(symbol)
+        lev = trade.get("lev", 3)
+        if trade["side"] == "BUY":
+            pnl = round((current - trade["entry"]) / trade["entry"] * FAST_TRADE_AMOUNT * lev, 2)
+        else:
+            pnl = round((trade["entry"] - current) / trade["entry"] * FAST_TRADE_AMOUNT * lev, 2)
+        sign = "+" if pnl > 0 else ""
+        send_journal(
+            "Trade Closed [Fast" + ((" " + reason) if reason else "") + "] - " + symbol + "\n"
+            "------------------------------\n"
+            "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
+            "Exit  : " + str(round(current, 6)) + "\n"
+            "PnL   : " + sign + str(pnl) + " USDT\n"
+            "------------------------------\nNiti Journal"
+        )
         del fast_open_trades[symbol]
+        print(f"[FAST CLOSE] {symbol} {reason}")
     except Exception as e:
         print(f"[FAST CLOSE ERROR] {symbol}: {e}")
 
@@ -225,19 +267,15 @@ def place_tight_order(symbol, side, entry, sl, tp1, tp2):
         half_qty  = round(total_qty / 2, precision)
         if total_qty <= 0 or half_qty <= 0:
             return None
-
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
-
         order_id = place_market_order(symbol, side, total_qty, pos_side)
         print(f"[TIGHT ORDER] {symbol} {side}: {order_id}")
-
         if order_id != "N/A":
             time.sleep(0.5)
             place_sl_order(symbol, close_side, pos_side, sl, total_qty)
             place_tp_order(symbol, close_side, pos_side, tp1, half_qty)
             place_tp_order(symbol, close_side, pos_side, tp2, half_qty)
-
             tight_open_trades[str(order_id)] = {
                 "symbol": symbol, "side": side, "entry": entry,
                 "sl": sl, "tp1": tp1, "tp2": tp2, "qty": total_qty,
@@ -258,35 +296,27 @@ def place_fast_order(symbol, side, entry):
         half_qty  = round(total_qty / 2, precision)
         if total_qty <= 0 or half_qty <= 0:
             return None
-
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
-
-        # SL price — 1.5% from entry
         if side == "BUY":
-            sl_price = round(entry * (1 - FAST_SL_PCT / 100), 6)
+            sl_price  = round(entry * (1 - FAST_SL_PCT / 100), 6)
             tp1_price = round(entry * (1 + FAST_SL_PCT * FAST_TP1_RR / 100), 6)
         else:
-            sl_price = round(entry * (1 + FAST_SL_PCT / 100), 6)
+            sl_price  = round(entry * (1 + FAST_SL_PCT / 100), 6)
             tp1_price = round(entry * (1 - FAST_SL_PCT * FAST_TP1_RR / 100), 6)
-
         order_id = place_market_order(symbol, side, total_qty, pos_side)
         print(f"[FAST ORDER] {symbol} {side} lev={lev}x: {order_id}")
-
         if order_id != "N/A":
             time.sleep(0.5)
             place_sl_order(symbol, close_side, pos_side, sl_price, total_qty)
             place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
-
             fast_open_trades[symbol] = {
                 "symbol": symbol, "side": side, "entry": entry,
                 "sl": sl_price, "tp1": tp1_price, "lev": lev,
                 "total_qty": total_qty, "remaining_qty": half_qty,
-                "trail_price": entry,
-                "order_id": order_id,
+                "trail_price": entry, "order_id": order_id,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
-
         return order_id
     except Exception as e:
         print(f"[FAST ORDER ERROR] {symbol}: {e}")
@@ -294,51 +324,26 @@ def place_fast_order(symbol, side, entry):
 
 
 def update_fast_trailing():
-    for symbol, trade in list(fast_open_trades.items()):
+    for symbol in list(fast_open_trades.keys()):
         try:
+            trade   = fast_open_trades[symbol]
             current = get_current_price(symbol)
             if current <= 0:
                 continue
-
-            side = trade["side"]
             trail_pct = FAST_TRAIL_PCT / 100
-
+            side = trade["side"]
             if side == "BUY":
-                # Update trail high
                 if current > trade["trail_price"]:
                     fast_open_trades[symbol]["trail_price"] = current
-                new_sl = trade["trail_price"] * (1 - trail_pct)
-                # Check if trailing SL hit
-                if current <= new_sl:
-                    print(f"[FAST TRAIL HIT] {symbol} BUY | price={current} trail_sl={new_sl:.6f}")
-                    close_fast_position(symbol)
-                    pnl = round((current - trade["entry"]) / trade["entry"] * FAST_TRADE_AMOUNT * trade["lev"], 2)
-                    sign = "+" if pnl > 0 else ""
-                    send_journal(
-                        "Trade Closed [Fast Trail] - " + symbol + "\n"
-                        "------------------------------\n"
-                        "Side   : BUY\nEntry  : " + str(trade["entry"]) + "\n"
-                        "Exit   : " + str(round(current, 6)) + "\n"
-                        "PnL    : " + sign + str(pnl) + " USDT\n"
-                        "------------------------------\nNiti Journal"
-                    )
+                trail_sl = trade["trail_price"] * (1 - trail_pct)
+                if current <= trail_sl:
+                    close_fast_position(symbol, "Trail")
             else:
                 if current < trade["trail_price"]:
                     fast_open_trades[symbol]["trail_price"] = current
-                new_sl = trade["trail_price"] * (1 + trail_pct)
-                if current >= new_sl:
-                    print(f"[FAST TRAIL HIT] {symbol} SELL | price={current} trail_sl={new_sl:.6f}")
-                    close_fast_position(symbol)
-                    pnl = round((trade["entry"] - current) / trade["entry"] * FAST_TRADE_AMOUNT * trade["lev"], 2)
-                    sign = "+" if pnl > 0 else ""
-                    send_journal(
-                        "Trade Closed [Fast Trail] - " + symbol + "\n"
-                        "------------------------------\n"
-                        "Side   : SELL\nEntry  : " + str(trade["entry"]) + "\n"
-                        "Exit   : " + str(round(current, 6)) + "\n"
-                        "PnL    : " + sign + str(pnl) + " USDT\n"
-                        "------------------------------\nNiti Journal"
-                    )
+                trail_sl = trade["trail_price"] * (1 + trail_pct)
+                if current >= trail_sl:
+                    close_fast_position(symbol, "Trail")
         except Exception as e:
             print(f"[TRAIL ERROR] {symbol}: {e}")
 
@@ -360,28 +365,23 @@ def track_tight_trades():
         status = check_tight_order_status(oid, trade["symbol"])
         if status in ("FILLED", "CANCELLED", "EXPIRED"):
             try:
-                candles = get_candles(trade["symbol"], limit=2)
-                current = float(candles[-1]["close"]) if candles else trade["entry"]
+                current = get_current_price(trade["symbol"])
                 if trade["side"] == "BUY":
                     pnl    = round((current - trade["entry"]) / trade["entry"] * TRADE_AMOUNT * LEVERAGE, 2)
                     result = "TP" if current >= trade["tp1"] else ("SL" if current <= trade["sl"] else "Open")
                 else:
                     pnl    = round((trade["entry"] - current) / trade["entry"] * TRADE_AMOUNT * LEVERAGE, 2)
                     result = "TP" if current <= trade["tp1"] else ("SL" if current >= trade["sl"] else "Open")
-
-                trade["pnl"]    = pnl
+                trade["pnl"] = pnl
                 trade["result"] = result
-                trade["label"]  = "Tight"
+                trade["label"] = "Tight"
                 daily_trades.append(trade)
                 to_remove.append(oid)
-
                 sign = "+" if pnl > 0 else ""
                 send_journal(
-                    "Trade Closed [Tight] - " + trade["symbol"] + "\n"
-                    "------------------------------\n"
-                    "Side   : " + trade["side"] + "\nEntry  : " + str(trade["entry"]) + "\n"
-                    "Result : " + result + "\nPnL    : " + sign + str(pnl) + " USDT\n"
-                    "------------------------------\nNiti Journal"
+                    "Trade Closed [Tight] - " + trade["symbol"] + "\n------------------------------\n"
+                    "Side: " + trade["side"] + " | Result: " + result + "\n"
+                    "PnL: " + sign + str(pnl) + " USDT\n------------------------------\nNiti Journal"
                 )
             except Exception as e:
                 print(f"[TRACK ERROR] {e}")
@@ -405,16 +405,13 @@ def send_daily_summary():
     total     = len(daily_trades)
     win_rate  = round(wins / total * 100, 1) if total > 0 else 0
     sign      = "+" if total_pnl > 0 else ""
-    date_str  = today.strftime("%b %d, %Y")
-    lines = ["Daily Summary - " + date_str, "------------------------------"]
+    lines = ["Daily Summary - " + today.strftime("%b %d, %Y"), "------------------------------"]
     for idx, t in enumerate(daily_trades, 1):
         p  = t.get("pnl", 0)
         ps = "+" if p > 0 else ""
-        lbl = t.get("label", "?")
-        lines.append(str(idx) + ". [" + lbl + "] " + t["symbol"] + " " + t["side"] + " | " + t.get("result","?") + " | " + ps + str(p) + " USDT")
+        lines.append(str(idx) + ". [" + t.get("label","?") + "] " + t["symbol"] + " " + t["side"] + " | " + t.get("result","?") + " | " + ps + str(p) + " USDT")
     lines.append("------------------------------")
-    lines.append("Trades   : " + str(total) + " (" + str(wins) + "W / " + str(losses) + "L)")
-    lines.append("Win Rate : " + str(win_rate) + "%")
+    lines.append("Trades: " + str(total) + " (" + str(wins) + "W/" + str(losses) + "L) | WR: " + str(win_rate) + "%")
     lines.append("Total PnL: " + sign + str(total_pnl) + " USDT")
     lines.append("------------------------------\nNiti Journal")
     send_journal("\n".join(lines))
@@ -496,8 +493,8 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
                 "RSI: " + str(round(rsi_now,1)) + " | Vol: " + str(round(ratio,1)) + "x" +
                 trade_status + "\n------------------------------\nNiti Tight 2"
             )
-            send_journal("New Trade [Tight] - " + symbol + "\nSide: BUY\nEntry: " + str(round(entry,6)) +
-                "\nSL: " + str(sl) + " | TP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nNiti Journal")
+            send_journal("New Trade [Tight] - " + symbol + "\nSide: BUY | Entry: " + str(round(entry,6)) +
+                " | SL: " + str(sl) + "\nTP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nNiti Journal")
 
     if (vwap_cross_down and entry < vwap_now and entry < ema50_now
             and trend_bear and vol_ok and 35 <= rsi_now <= 60
@@ -526,103 +523,114 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
                 "RSI: " + str(round(rsi_now,1)) + " | Vol: " + str(round(ratio,1)) + "x" +
                 trade_status + "\n------------------------------\nNiti Tight 2"
             )
-            send_journal("New Trade [Tight] - " + symbol + "\nSide: SELL\nEntry: " + str(round(entry,6)) +
-                "\nSL: " + str(sl) + " | TP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nNiti Journal")
+            send_journal("New Trade [Tight] - " + symbol + "\nSide: SELL | Entry: " + str(round(entry,6)) +
+                " | SL: " + str(sl) + "\nTP1: " + str(tp1) + " | TP2: " + str(tp2) + "\nNiti Journal")
 
     return ratio
 
 
-def check_fast(symbol, confirmed, closes, opens, vols, highs, lows, ema50_vals):
-    i = len(confirmed) - 1
-    if i < VOLUME_LOOKBACK + EMA50_LEN + 5:
-        return
-
-    entry     = closes[i]
-    ema50_now = ema50_vals[i]
-    if entry < MIN_PRICE:
-        return
-
-    avg_vol = sum(vols[i - VOLUME_LOOKBACK:i]) / VOLUME_LOOKBACK
-    ratio   = vols[i-1] / avg_vol if avg_vol > 0 else 0
-    if ratio < FAST_VOL_MULT:
-        return
-
-    trend_bull = entry > ema50_now
-    trend_bear = entry < ema50_now
-
-    breakout_high = max(highs[i-4:i])
-    breakout_low  = min(lows[i-4:i])
-
-    long_signal  = trend_bull and closes[i] > breakout_high and closes[i] > opens[i]
-    short_signal = trend_bear and closes[i] < breakout_low  and closes[i] < opens[i]
-
-    # Opposite signal — close only, no re-entry
-    if symbol in fast_open_trades:
-        current_side = fast_open_trades[symbol]["side"]
-        if (current_side == "BUY" and short_signal) or (current_side == "SELL" and long_signal):
-            print(f"[FAST CLOSE - OPPOSITE] {symbol}")
-            pnl_est = 0
-            if fast_auto_trade_enabled:
-                close_fast_position(symbol)
-            else:
-                fast_open_trades.pop(symbol, None)
+def check_fast(symbol):
+    try:
+        candles = get_candles(symbol, limit=100, interval=FAST_TIMEFRAME)
+        if len(candles) < FAST_VOL_LB + FAST_EMA_LEN + 5:
             return
 
-    # Same direction or no position
-    if symbol in fast_open_trades:
-        return  # Already in same direction, skip
+        confirmed = candles[:-1]
+        closes = [cl(c) for c in confirmed]
+        opens  = [o(c)  for c in confirmed]
+        vols   = [v(c)  for c in confirmed]
 
-    sig_id_long  = (symbol, "BUY",  int(confirmed[i]["time"]))
-    sig_id_short = (symbol, "SELL", int(confirmed[i]["time"]))
+        ema50_vals = ema_series(closes, FAST_EMA_LEN)
 
-    if long_signal and sig_id_long not in fast_alerted:
-        fast_alerted.add(sig_id_long)
-        print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x")
-        lev = get_fast_leverage(symbol)
-        sl_price  = round(entry * (1 - FAST_SL_PCT / 100), 6)
-        tp1_price = round(entry * (1 + FAST_SL_PCT * FAST_TP1_RR / 100), 6)
-        trade_status = ""
-        if fast_auto_trade_enabled:
-            oid = place_fast_order(symbol, "BUY", entry)
-            trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
-        else:
-            trade_status = "\nAuto-trade OFF"
-        send_tg(
-            "FAST SIGNAL - BUY - " + symbol + "\n------------------------------\n"
-            "Entry: " + str(round(entry,6)) + " | SL: " + str(sl_price) + "\n"
-            "TP1 (1:2): " + str(tp1_price) + " | Trail: 1.5%\n"
-            "Vol: " + str(round(ratio,1)) + "x | Lev: " + str(lev) + "x" +
-            trade_status + "\n------------------------------\nNiti Fast Signal"
-        )
-        send_journal("New Trade [Fast] - " + symbol + "\nSide: BUY\nEntry: " + str(round(entry,6)) +
-            "\nSL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x\nNiti Journal")
+        i = len(confirmed) - 1
+        if i < FAST_VOL_LB + FAST_EMA_LEN:
+            return
 
-    elif short_signal and sig_id_short not in fast_alerted:
-        fast_alerted.add(sig_id_short)
-        print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x")
-        lev = get_fast_leverage(symbol)
-        sl_price  = round(entry * (1 + FAST_SL_PCT / 100), 6)
-        tp1_price = round(entry * (1 - FAST_SL_PCT * FAST_TP1_RR / 100), 6)
-        trade_status = ""
-        if fast_auto_trade_enabled:
-            oid = place_fast_order(symbol, "SELL", entry)
-            trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
-        else:
-            trade_status = "\nAuto-trade OFF"
-        send_tg(
-            "FAST SIGNAL - SELL - " + symbol + "\n------------------------------\n"
-            "Entry: " + str(round(entry,6)) + " | SL: " + str(sl_price) + "\n"
-            "TP1 (1:2): " + str(tp1_price) + " | Trail: 1.5%\n"
-            "Vol: " + str(round(ratio,1)) + "x | Lev: " + str(lev) + "x" +
-            trade_status + "\n------------------------------\nNiti Fast Signal"
-        )
-        send_journal("New Trade [Fast] - " + symbol + "\nSide: SELL\nEntry: " + str(round(entry,6)) +
-            "\nSL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x\nNiti Journal")
+        entry     = closes[i]
+        ema50_now = ema50_vals[i]
+
+        if entry < MIN_PRICE:
+            return
+
+        # Volume check on previous candle
+        avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
+        ratio   = vols[i-1] / avg_vol if avg_vol > 0 else 0
+        if ratio < FAST_VOL_MULT:
+            return
+
+        trend_bull = entry > ema50_now
+        trend_bear = entry < ema50_now
+
+        # Previous candle direction
+        prev_bull = closes[i-1] > opens[i-1]
+        prev_bear = closes[i-1] < opens[i-1]
+
+        long_signal  = trend_bull and prev_bull
+        short_signal = trend_bear and prev_bear
+
+        # Opposite signal — close only
+        if symbol in fast_open_trades:
+            current_side = fast_open_trades[symbol]["side"]
+            if (current_side == "BUY" and short_signal) or (current_side == "SELL" and long_signal):
+                print(f"[FAST CLOSE - OPPOSITE] {symbol}")
+                close_fast_position(symbol, "Opposite")
+                return
+            return  # Same direction — skip (already in trade)
+
+        sig_id_long  = (symbol, "BUY",  int(confirmed[i-1]["time"]))
+        sig_id_short = (symbol, "SELL", int(confirmed[i-1]["time"]))
+
+        if long_signal and sig_id_long not in fast_alerted:
+            fast_alerted.add(sig_id_long)
+            lev = get_fast_leverage(symbol)
+            sl_price  = round(entry * (1 - FAST_SL_PCT / 100), 6)
+            tp1_price = round(entry * (1 + FAST_SL_PCT * FAST_TP1_RR / 100), 6)
+            print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x")
+            trade_status = ""
+            if fast_auto_trade_enabled:
+                oid = place_fast_order(symbol, "BUY", entry)
+                trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
+            else:
+                trade_status = "\nAuto-trade OFF"
+            send_tg(
+                "FAST SIGNAL - BUY - " + symbol + "\n------------------------------\n"
+                "Entry: " + str(round(entry,6)) + " | SL: " + str(sl_price) + "\n"
+                "TP1 (1:2): " + str(tp1_price) + " | Trail: 1.5%\n"
+                "Vol: " + str(round(ratio,1)) + "x | Lev: " + str(lev) + "x" +
+                trade_status + "\n------------------------------\nNiti Fast Signal"
+            )
+            send_journal("New Trade [Fast] - " + symbol + "\nSide: BUY | Entry: " + str(round(entry,6)) +
+                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x\nNiti Journal")
+
+        elif short_signal and sig_id_short not in fast_alerted:
+            fast_alerted.add(sig_id_short)
+            lev = get_fast_leverage(symbol)
+            sl_price  = round(entry * (1 + FAST_SL_PCT / 100), 6)
+            tp1_price = round(entry * (1 - FAST_SL_PCT * FAST_TP1_RR / 100), 6)
+            print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x")
+            trade_status = ""
+            if fast_auto_trade_enabled:
+                oid = place_fast_order(symbol, "SELL", entry)
+                trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
+            else:
+                trade_status = "\nAuto-trade OFF"
+            send_tg(
+                "FAST SIGNAL - SELL - " + symbol + "\n------------------------------\n"
+                "Entry: " + str(round(entry,6)) + " | SL: " + str(sl_price) + "\n"
+                "TP1 (1:2): " + str(tp1_price) + " | Trail: 1.5%\n"
+                "Vol: " + str(round(ratio,1)) + "x | Lev: " + str(lev) + "x" +
+                trade_status + "\n------------------------------\nNiti Fast Signal"
+            )
+            send_journal("New Trade [Fast] - " + symbol + "\nSide: SELL | Entry: " + str(round(entry,6)) +
+                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x\nNiti Journal")
+
+    except Exception as e:
+        print(f"[FAST {symbol}] error: {e}")
 
 
-def check_symbol(symbol):
+def check_symbol_tight(symbol):
     try:
-        candles = get_candles(symbol, limit=350)
+        candles = get_candles(symbol, limit=350, interval="15m")
         if len(candles) < 320:
             return None
 
@@ -638,11 +646,8 @@ def check_symbol(symbol):
         vwap_vals   = vwap_series(confirmed)
         rsi_vals    = rsi_series(closes, RSI_LEN)
 
-        ratio = check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
-                            ema50_vals, ema200_vals, vwap_vals, rsi_vals)
-        check_fast(symbol, confirmed, closes, opens, vols, highs, lows, ema50_vals)
-
-        return ratio
+        return check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
+                           ema50_vals, ema200_vals, vwap_vals, rsi_vals)
     except Exception as e:
         print(f"[{symbol}] error: {e}")
         return None
@@ -672,9 +677,9 @@ def handle_telegram_commands():
                     tight_auto_trade_enabled = False
                     send_tg("Tight 2 Auto-trade OFF.")
                 elif text == "/status":
-                    t_state = "ON" if tight_auto_trade_enabled else "OFF"
-                    f_state = "ON" if fast_auto_trade_enabled  else "OFF"
-                    send_tg("Tight 2: " + t_state + "\nFast Signal: " + f_state)
+                    t = "ON" if tight_auto_trade_enabled else "OFF"
+                    f = "ON" if fast_auto_trade_enabled  else "OFF"
+                    send_tg("Tight 2: " + t + "\nFast Signal: " + f)
                 elif text == "/fast_start":
                     fast_auto_trade_enabled = True
                     send_tg("Fast Signal Auto-trade ON.")
@@ -682,8 +687,8 @@ def handle_telegram_commands():
                     fast_auto_trade_enabled = False
                     send_tg("Fast Signal Auto-trade OFF.")
                 elif text == "/fast_status":
-                    f_state = "ON" if fast_auto_trade_enabled else "OFF"
-                    send_tg("Fast Signal Auto-trade: " + f_state)
+                    f = "ON" if fast_auto_trade_enabled else "OFF"
+                    send_tg("Fast Signal: " + f)
         except Exception as e:
             print(f"[TG CMD] error: {e}")
         time.sleep(1)
@@ -699,15 +704,36 @@ def trailing_loop():
         time.sleep(30)
 
 
+def fast_scan_loop():
+    print("Fast Signal loop started - 3m | Top 50 movers")
+    all_symbols = []
+    while True:
+        try:
+            if not all_symbols:
+                all_symbols = get_futures_symbols() or []
+
+            top_movers = get_top_movers(all_symbols, FAST_TOP_N)
+            print(f"[FAST SCAN] Scanning top {len(top_movers)} movers...")
+
+            for sym in top_movers:
+                check_fast(sym)
+                time.sleep(0.15)
+
+            print("[FAST SCAN] Done. Sleeping 60s...")
+        except Exception as e:
+            print(f"[FAST LOOP ERROR] {e}")
+        time.sleep(60)
+
+
 def monitor_loop():
-    print("Monitor started - Tight 2 + Fast Signal")
+    print("Monitor started - Tight 2 (15m) | Fast Signal (3m top 50)")
     while True:
         try:
             symbols = get_futures_symbols()
-            print(f"Scanning {len(symbols)} pairs... | Tight={tight_auto_trade_enabled} | Fast={fast_auto_trade_enabled}")
+            print(f"[TIGHT SCAN] Scanning {len(symbols)} pairs... | Tight={tight_auto_trade_enabled} | Fast={fast_auto_trade_enabled}")
             ratios = []
             for sym in symbols:
-                r = check_symbol(sym)
+                r = check_symbol_tight(sym)
                 if r is not None:
                     ratios.append(r)
                 time.sleep(0.2)
@@ -716,9 +742,9 @@ def monitor_loop():
             if ratios:
                 top5 = sorted(ratios, reverse=True)[:5]
                 print(f"[VOL DEBUG] Top 5: {[round(x,2) for x in top5]}")
-            print("Scan complete. Sleeping 60s...")
+            print("[TIGHT SCAN] Done. Sleeping 60s...")
         except Exception as e:
-            print(f"Loop error: {e}")
+            print(f"[TIGHT LOOP ERROR] {e}")
         time.sleep(60)
 
 
@@ -728,7 +754,8 @@ def health():
 
 
 if __name__ == "__main__":
-    Thread(target=monitor_loop,   daemon=True).start()
+    Thread(target=monitor_loop,             daemon=True).start()
+    Thread(target=fast_scan_loop,           daemon=True).start()
+    Thread(target=trailing_loop,            daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()
-    Thread(target=trailing_loop,  daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

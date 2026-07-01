@@ -16,7 +16,7 @@ FAST_TRADE_AMOUNT = float(os.environ.get("FAST_TRADE_AMOUNT", 20))
 
 BASE_URL = "https://open-api.bingx.com"
 
-# Tight 2 params
+# ── Tight 2 params ──
 TIMEFRAME         = "15m"
 RSI_LEN           = 14
 VOLUME_LOOKBACK   = 100
@@ -30,11 +30,10 @@ RR_TP2            = 4.0
 MIN_PRICE         = 0.001
 MIN_RISK_PCT      = 0.1
 
-# Fast Signal params
+# ── Fast Signal params ──
 FAST_TIMEFRAME    = "3m"
 FAST_VOL_MULT     = 5.0
 FAST_VOL_LB       = 50
-FAST_EMA_LEN      = 50
 FAST_SL_PCT       = 1.5
 FAST_TRAIL_PCT    = 1.5
 FAST_TP1_RR       = 2.0
@@ -47,10 +46,8 @@ symbol_max_lev    = {}
 
 tight_open_trades = {}
 tight_alerted     = set()
-
 fast_open_trades  = {}
 fast_alerted      = set()
-
 daily_trades      = []
 last_summary_date = None
 
@@ -95,8 +92,7 @@ def get_top_movers(symbols, top_n=50):
                 continue
             try:
                 change = abs(float(t.get("priceChangePercent", 0)))
-                volume = float(t.get("volume", 0))
-                movers.append((sym, change, volume))
+                movers.append((sym, change))
             except:
                 pass
         movers.sort(key=lambda x: x[1], reverse=True)
@@ -246,7 +242,7 @@ def close_fast_position(symbol, reason=""):
             pnl = round((trade["entry"] - current) / trade["entry"] * FAST_TRADE_AMOUNT * lev, 2)
         sign = "+" if pnl > 0 else ""
         send_journal(
-            "Trade Closed [Fast" + ((" " + reason) if reason else "") + "] - " + symbol + "\n"
+            "Trade Closed [Fast " + reason + "] - " + symbol + "\n"
             "------------------------------\n"
             "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
             "Exit  : " + str(round(current, 6)) + "\n"
@@ -372,9 +368,9 @@ def track_tight_trades():
                 else:
                     pnl    = round((trade["entry"] - current) / trade["entry"] * TRADE_AMOUNT * LEVERAGE, 2)
                     result = "TP" if current <= trade["tp1"] else ("SL" if current >= trade["sl"] else "Open")
-                trade["pnl"] = pnl
+                trade["pnl"]    = pnl
                 trade["result"] = result
-                trade["label"] = "Tight"
+                trade["label"]  = "Tight"
                 daily_trades.append(trade)
                 to_remove.append(oid)
                 sign = "+" if pnl > 0 else ""
@@ -532,7 +528,7 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
 def check_fast(symbol):
     try:
         candles = get_candles(symbol, limit=100, interval=FAST_TIMEFRAME)
-        if len(candles) < FAST_VOL_LB + FAST_EMA_LEN + 5:
+        if len(candles) < FAST_VOL_LB + 5:
             return
 
         confirmed = candles[:-1]
@@ -540,49 +536,48 @@ def check_fast(symbol):
         opens  = [o(c)  for c in confirmed]
         vols   = [v(c)  for c in confirmed]
 
-        ema50_vals = ema_series(closes, FAST_EMA_LEN)
-
         i = len(confirmed) - 1
-        if i < FAST_VOL_LB + FAST_EMA_LEN:
+        if i < FAST_VOL_LB + 2:
             return
 
-        entry     = closes[i]
-        ema50_now = ema50_vals[i]
-
+        entry = closes[i]
         if entry < MIN_PRICE:
             return
 
-        # Volume check on previous candle
+        # Volume spike on candle i-1
         avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
         ratio   = vols[i-1] / avg_vol if avg_vol > 0 else 0
         if ratio < FAST_VOL_MULT:
             return
 
-        trend_bull = entry > ema50_now
-        trend_bear = entry < ema50_now
+        # 2 consecutive candles same direction (momentum confirm)
+        # candle i-2 and i-1 both bullish → BUY
+        # candle i-2 and i-1 both bearish → SELL
+        bull_c1 = closes[i-1] > opens[i-1]
+        bull_c2 = closes[i-2] > opens[i-2]
+        bear_c1 = closes[i-1] < opens[i-1]
+        bear_c2 = closes[i-2] < opens[i-2]
 
-        # Previous candle direction
-        prev_bull = closes[i-1] > opens[i-1]
-        prev_bear = closes[i-1] < opens[i-1]
+        long_signal  = bull_c1 and bull_c2
+        short_signal = bear_c1 and bear_c2
 
-        long_signal  = trend_bull and prev_bull
-        short_signal = trend_bear and prev_bear
+        if not long_signal and not short_signal:
+            return
 
-        # Opposite signal — close only
+        # Opposite signal — close only, no re-entry
         if symbol in fast_open_trades:
             current_side = fast_open_trades[symbol]["side"]
             if (current_side == "BUY" and short_signal) or (current_side == "SELL" and long_signal):
                 print(f"[FAST CLOSE - OPPOSITE] {symbol}")
                 close_fast_position(symbol, "Opposite")
-                return
-            return  # Same direction — skip (already in trade)
+            return
 
         sig_id_long  = (symbol, "BUY",  int(confirmed[i-1]["time"]))
         sig_id_short = (symbol, "SELL", int(confirmed[i-1]["time"]))
 
         if long_signal and sig_id_long not in fast_alerted:
             fast_alerted.add(sig_id_long)
-            lev = get_fast_leverage(symbol)
+            lev       = get_fast_leverage(symbol)
             sl_price  = round(entry * (1 - FAST_SL_PCT / 100), 6)
             tp1_price = round(entry * (1 + FAST_SL_PCT * FAST_TP1_RR / 100), 6)
             print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x")
@@ -604,7 +599,7 @@ def check_fast(symbol):
 
         elif short_signal and sig_id_short not in fast_alerted:
             fast_alerted.add(sig_id_short)
-            lev = get_fast_leverage(symbol)
+            lev       = get_fast_leverage(symbol)
             sl_price  = round(entry * (1 + FAST_SL_PCT / 100), 6)
             tp1_price = round(entry * (1 - FAST_SL_PCT * FAST_TP1_RR / 100), 6)
             print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x")
@@ -633,19 +628,16 @@ def check_symbol_tight(symbol):
         candles = get_candles(symbol, limit=350, interval="15m")
         if len(candles) < 320:
             return None
-
         confirmed = candles[:-1]
         closes = [cl(c) for c in confirmed]
         opens  = [o(c)  for c in confirmed]
         vols   = [v(c)  for c in confirmed]
         highs  = [h(c)  for c in confirmed]
         lows   = [l(c)  for c in confirmed]
-
         ema50_vals  = ema_series(closes, EMA50_LEN)
         ema200_vals = ema_series(closes, EMA200_LEN)
         vwap_vals   = vwap_series(confirmed)
         rsi_vals    = rsi_series(closes, RSI_LEN)
-
         return check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
                            ema50_vals, ema200_vals, vwap_vals, rsi_vals)
     except Exception as e:
@@ -705,20 +697,17 @@ def trailing_loop():
 
 
 def fast_scan_loop():
-    print("Fast Signal loop started - 3m | Top 50 movers")
+    print("Fast Signal loop started - 3m | Top 50 movers | Vol 5x + 2-candle momentum")
     all_symbols = []
     while True:
         try:
             if not all_symbols:
                 all_symbols = get_futures_symbols() or []
-
             top_movers = get_top_movers(all_symbols, FAST_TOP_N)
             print(f"[FAST SCAN] Scanning top {len(top_movers)} movers...")
-
             for sym in top_movers:
                 check_fast(sym)
                 time.sleep(0.15)
-
             print("[FAST SCAN] Done. Sleeping 60s...")
         except Exception as e:
             print(f"[FAST LOOP ERROR] {e}")

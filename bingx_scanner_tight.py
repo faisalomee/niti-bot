@@ -76,7 +76,7 @@ FAST_SL_PCT             = 1.5
 FAST_TP1_RR             = 2.0
 FAST_TRAIL_PCT          = float(os.environ.get("FAST_TRAIL_PCT", 3.0))   # widened from 1.5
 FAST_TRAIL_ACTIVATE_RR  = 1.0     # trailing only starts after price moves 1R in favor
-FAST_RETEST_CONFIRM     = False   # optional 1-candle hold confirmation, OFF by default (keeps entries fast)
+FAST_RETEST_CONFIRM     = True    # 1-candle hold confirmation ON — reduces fakeouts, adds ~1x3min delay
 
 # ==================== GLOBAL STATE ====================
 tight_auto_trade_enabled = False
@@ -393,7 +393,8 @@ def send_journal(msg):
 def get_fast_leverage(symbol):
     max_lev = symbol_max_lev.get(symbol, 20)
     calc = int(max_lev * 0.20)
-    return max(calc, 3)
+    lev = max(calc, 10)          # minimum 10x
+    return min(lev, max_lev)     # never exceed the symbol's own exchange max leverage
 
 
 def set_leverage_api(symbol, lev):

@@ -76,6 +76,10 @@ FAST_VOL_MULT           = 3.0     # volume spike required on the breakout candle
 FAST_VOL_LB             = 20
 FAST_ATR_LEN            = 14
 FAST_SL_ATR_MULT        = 1.2     # SL distance = ATR x this, instead of a flat % (adapts to each coin's own volatility)
+FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 1.5))   # fixed $ risked per full-size trade, independent of leverage
+FAST_TREND_EMA_LEN      = 50      # medium-term EMA on the same 3m series, used only to gauge trend alignment (no extra API call)
+FAST_COUNTERTREND_MULT  = 0.5     # size multiplier when the breakout is against that medium-term trend (never blocks the signal)
+FAST_MARGIN_CAP_MULT    = 2.0     # safety cap: risk-based qty can't blow past this x the old flat $20 margin, in case ATR is unusually tight
 FAST_TP1_RR             = 2.0
 FAST_TRAIL_PCT          = float(os.environ.get("FAST_TRAIL_PCT", 3.0))   # widened from 1.5
 FAST_TRAIL_ACTIVATE_RR  = 1.0     # trailing only starts after price moves 1R in favor
@@ -539,20 +543,31 @@ def place_tight_order(symbol, side, entry, sl, tp1, tp2, trade_amount, mode):
         return None
 
 
-def place_fast_order(symbol, side, entry, sl_price, tp1_price):
+def place_fast_order(symbol, side, entry, sl_price, tp1_price, risk_usdt=FAST_RISK_USDT):
     try:
         lev       = get_fast_leverage(symbol)
         set_leverage_api(symbol, lev)
-        precision = symbol_precision.get(symbol, 4)
-        total_qty = round(FAST_TRADE_AMOUNT * lev / entry, precision)
-        half_qty  = round(total_qty / 2, precision)
+        precision  = symbol_precision.get(symbol, 4)
+        risk_dist  = abs(entry - sl_price)
+        if risk_dist <= 0:
+            return None
+
+        # Position size comes from the fixed $ risk divided by the SL distance -
+        # NOT from leverage. Leverage only decides how much margin that size ties
+        # up (capital efficiency); it no longer changes how many dollars are at
+        # stake if the SL is hit. This is what makes every trade's loss magnitude
+        # consistent regardless of which coin/leverage it happened to get.
+        risk_qty      = risk_usdt / risk_dist
+        margin_cap_qty = (FAST_TRADE_AMOUNT * FAST_MARGIN_CAP_MULT * lev) / entry
+        total_qty     = round(min(risk_qty, margin_cap_qty), precision)
+        half_qty      = round(total_qty / 2, precision)
         if total_qty <= 0 or half_qty <= 0:
             return None
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
         sl_pct = abs(entry - sl_price) / entry * 100
         order_id = place_market_order(symbol, side, total_qty, pos_side)
-        print(f"[FAST ORDER] {symbol} {side} lev={lev}x: {order_id}")
+        print(f"[FAST ORDER] {symbol} {side} lev={lev}x qty={total_qty} risk=${risk_usdt}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
             sl_id  = place_sl_order(symbol, close_side, pos_side, sl_price, total_qty)
@@ -971,7 +986,7 @@ def check_symbol_tight(symbol):
 def check_fast(symbol):
     try:
         candles = get_candles(symbol, limit=100, interval=FAST_TIMEFRAME)
-        min_needed = FAST_CONSOL_LOOKBACK + FAST_VOL_LB + FAST_ATR_LEN + 5
+        min_needed = max(FAST_CONSOL_LOOKBACK + FAST_VOL_LB + FAST_ATR_LEN + 5, FAST_TREND_EMA_LEN + 5)
         if len(candles) < min_needed:
             return
 
@@ -992,6 +1007,13 @@ def check_fast(symbol):
 
         atr_vals = atr_series(highs, lows, closes, FAST_ATR_LEN)
         atr_now  = atr_vals[i]
+
+        # Medium-term trend on the same 3m series (no extra API call) - used only
+        # to scale position size down on counter-trend breakouts, never to block
+        # a signal outright (so a genuine sudden reversal move still gets taken).
+        trend_ema_vals = ema_series(closes, FAST_TREND_EMA_LEN)
+        trend_up   = entry > trend_ema_vals[i]
+        trend_down = entry < trend_ema_vals[i]
 
         # Box is computed from the window BEFORE the retest candle (i-1), so the
         # retest check below isn't comparing a candle against a box that already
@@ -1032,14 +1054,17 @@ def check_fast(symbol):
 
         if long_signal and sig_id_long not in fast_alerted:
             fast_alerted.add(sig_id_long)
-            lev       = get_fast_leverage(symbol)
-            risk      = atr_now * FAST_SL_ATR_MULT
-            sl_price  = round(entry - risk, 6)
-            tp1_price = round(entry + risk * FAST_TP1_RR, 6)
-            print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x")
+            lev        = get_fast_leverage(symbol)
+            risk       = atr_now * FAST_SL_ATR_MULT
+            sl_price   = round(entry - risk, 6)
+            tp1_price  = round(entry + risk * FAST_TP1_RR, 6)
+            aligned    = trend_up   # BUY breakout with the medium-term trend
+            risk_usdt  = FAST_RISK_USDT if aligned else FAST_RISK_USDT * FAST_COUNTERTREND_MULT
+            trend_tag  = "with-trend" if aligned else "counter-trend (half size)"
+            print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x | {trend_tag}")
             trade_status = ""
             if fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price)
+                oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price, risk_usdt)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
@@ -1047,22 +1072,25 @@ def check_fast(symbol):
                 "FAST SIGNAL - BUY - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
                 "TP1 (1:2): " + str(tp1_price) + " | Trail: " + str(FAST_TRAIL_PCT) + "% (after " + str(FAST_TRAIL_ACTIVATE_RR) + "R)\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x" +
+                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) +
                 trade_status + "\n------------------------------\nNiti Fast Signal"
             )
             send_journal("New Trade [Fast] - " + symbol + "\nSide: BUY | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x\nNiti Journal")
+                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
 
         elif short_signal and sig_id_short not in fast_alerted:
             fast_alerted.add(sig_id_short)
-            lev       = get_fast_leverage(symbol)
-            risk      = atr_now * FAST_SL_ATR_MULT
-            sl_price  = round(entry + risk, 6)
-            tp1_price = round(entry - risk * FAST_TP1_RR, 6)
-            print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x")
+            lev        = get_fast_leverage(symbol)
+            risk       = atr_now * FAST_SL_ATR_MULT
+            sl_price   = round(entry + risk, 6)
+            tp1_price  = round(entry - risk * FAST_TP1_RR, 6)
+            aligned    = trend_down   # SELL breakout with the medium-term trend
+            risk_usdt  = FAST_RISK_USDT if aligned else FAST_RISK_USDT * FAST_COUNTERTREND_MULT
+            trend_tag  = "with-trend" if aligned else "counter-trend (half size)"
+            print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x | {trend_tag}")
             trade_status = ""
             if fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price)
+                oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price, risk_usdt)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
@@ -1070,11 +1098,11 @@ def check_fast(symbol):
                 "FAST SIGNAL - SELL - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
                 "TP1 (1:2): " + str(tp1_price) + " | Trail: " + str(FAST_TRAIL_PCT) + "% (after " + str(FAST_TRAIL_ACTIVATE_RR) + "R)\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x" +
+                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) +
                 trade_status + "\n------------------------------\nNiti Fast Signal"
             )
             send_journal("New Trade [Fast] - " + symbol + "\nSide: SELL | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x\nNiti Journal")
+                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
 
     except Exception as e:
         print(f"[FAST {symbol}] error: {e}")

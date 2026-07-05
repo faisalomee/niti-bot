@@ -75,7 +75,7 @@ FAST_BREAKOUT_ATR_MULT  = 0.3     # breakout must clear the box by this many ATR
 FAST_VOL_MULT           = 3.0     # volume spike required on the breakout candle itself
 FAST_VOL_LB             = 20
 FAST_ATR_LEN            = 14
-FAST_SL_PCT             = 1.5
+FAST_SL_ATR_MULT        = 1.2     # SL distance = ATR x this, instead of a flat % (adapts to each coin's own volatility)
 FAST_TP1_RR             = 2.0
 FAST_TRAIL_PCT          = float(os.environ.get("FAST_TRAIL_PCT", 3.0))   # widened from 1.5
 FAST_TRAIL_ACTIVATE_RR  = 1.0     # trailing only starts after price moves 1R in favor
@@ -539,7 +539,7 @@ def place_tight_order(symbol, side, entry, sl, tp1, tp2, trade_amount, mode):
         return None
 
 
-def place_fast_order(symbol, side, entry):
+def place_fast_order(symbol, side, entry, sl_price, tp1_price):
     try:
         lev       = get_fast_leverage(symbol)
         set_leverage_api(symbol, lev)
@@ -550,12 +550,7 @@ def place_fast_order(symbol, side, entry):
             return None
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
-        if side == "BUY":
-            sl_price  = round(entry * (1 - FAST_SL_PCT / 100), 6)
-            tp1_price = round(entry * (1 + FAST_SL_PCT * FAST_TP1_RR / 100), 6)
-        else:
-            sl_price  = round(entry * (1 + FAST_SL_PCT / 100), 6)
-            tp1_price = round(entry * (1 - FAST_SL_PCT * FAST_TP1_RR / 100), 6)
+        sl_pct = abs(entry - sl_price) / entry * 100
         order_id = place_market_order(symbol, side, total_qty, pos_side)
         print(f"[FAST ORDER] {symbol} {side} lev={lev}x: {order_id}")
         if order_id != "N/A":
@@ -565,6 +560,7 @@ def place_fast_order(symbol, side, entry):
             fast_open_trades[symbol] = {
                 "symbol": symbol, "side": side, "entry": entry,
                 "sl": sl_price, "sl_id": sl_id, "tp1": tp1_price, "tp1_id": tp1_id, "lev": lev,
+                "sl_pct": sl_pct, "close_side": close_side, "pos_side": pos_side,
                 "total_qty": total_qty, "remaining_qty": total_qty, "tp1_filled": False, "partial_pnl": 0.0,
                 "trail_price": entry, "activated": False, "order_id": order_id,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
@@ -591,9 +587,21 @@ def track_fast_trades():
                     trade["partial_pnl"]   = trade.get("partial_pnl", 0.0) + leg_pnl
                     trade["remaining_qty"] = trade["total_qty"] - half_qty
                     trade["tp1_filled"]    = True
+
+                    # Move the resting exchange SL to breakeven for the remaining half now that
+                    # TP1 has actually filled - previously the old SL (sized for the full qty,
+                    # at the original level) just sat there unchanged.
+                    if trade.get("sl_id"):
+                        cancel_order(symbol, trade["sl_id"])
+                    new_sl_id = place_sl_order(
+                        symbol, trade["close_side"], trade["pos_side"], trade["entry"], trade["remaining_qty"]
+                    )
+                    trade["sl_id"] = new_sl_id
+                    trade["sl"]    = trade["entry"]
+
                     send_journal(
                         "TP1 hit [Fast] - " + symbol + "\nBanked: " + str(round(leg_pnl, 2)) +
-                        " USDT | Remaining: " + str(trade["remaining_qty"]) + "\nNiti Journal"
+                        " USDT | Remaining: " + str(trade["remaining_qty"]) + " | SL moved to breakeven (" + str(trade["entry"]) + ")\nNiti Journal"
                     )
 
             sl_status = check_tight_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
@@ -624,7 +632,7 @@ def update_fast_trailing():
             if current <= 0:
                 continue
             side = trade["side"]
-            activate_pct = (FAST_TRAIL_ACTIVATE_RR * FAST_SL_PCT) / 100
+            activate_pct = (FAST_TRAIL_ACTIVATE_RR * trade.get("sl_pct", 1.5)) / 100
             trail_pct    = FAST_TRAIL_PCT / 100
 
             if not trade.get("activated"):
@@ -1025,12 +1033,13 @@ def check_fast(symbol):
         if long_signal and sig_id_long not in fast_alerted:
             fast_alerted.add(sig_id_long)
             lev       = get_fast_leverage(symbol)
-            sl_price  = round(entry * (1 - FAST_SL_PCT / 100), 6)
-            tp1_price = round(entry * (1 + FAST_SL_PCT * FAST_TP1_RR / 100), 6)
+            risk      = atr_now * FAST_SL_ATR_MULT
+            sl_price  = round(entry - risk, 6)
+            tp1_price = round(entry + risk * FAST_TP1_RR, 6)
             print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x")
             trade_status = ""
             if fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "BUY", entry)
+                oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
@@ -1047,12 +1056,13 @@ def check_fast(symbol):
         elif short_signal and sig_id_short not in fast_alerted:
             fast_alerted.add(sig_id_short)
             lev       = get_fast_leverage(symbol)
-            sl_price  = round(entry * (1 + FAST_SL_PCT / 100), 6)
-            tp1_price = round(entry * (1 - FAST_SL_PCT * FAST_TP1_RR / 100), 6)
+            risk      = atr_now * FAST_SL_ATR_MULT
+            sl_price  = round(entry + risk, 6)
+            tp1_price = round(entry - risk * FAST_TP1_RR, 6)
             print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x")
             trade_status = ""
             if fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "SELL", entry)
+                oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"

@@ -75,11 +75,13 @@ FAST_BREAKOUT_ATR_MULT  = 0.3     # breakout must clear the box by this many ATR
 FAST_VOL_MULT           = 3.0     # volume spike required on the breakout candle itself
 FAST_VOL_LB             = 20
 FAST_ATR_LEN            = 14
-FAST_SL_ATR_MULT        = 1.2     # SL distance = ATR x this, instead of a flat % (adapts to each coin's own volatility)
+FAST_SL_ATR_MULT        = 1.2     # ATR buffer added beyond the box edge for the structural SL (not used standalone anymore)
 FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 1.5))   # fixed $ risked per full-size trade, independent of leverage
-FAST_TREND_EMA_LEN      = 50      # medium-term EMA on the same 3m series, used only to gauge trend alignment (no extra API call)
-FAST_COUNTERTREND_MULT  = 0.5     # size multiplier when the breakout is against that medium-term trend (never blocks the signal)
-FAST_MARGIN_CAP_MULT    = 2.0     # safety cap: risk-based qty can't blow past this x the old flat $20 margin, in case ATR is unusually tight
+FAST_EXCLUDE_TOP_N       = 75      # skip the top-N coins by 24h quote volume (majors) - Tight 2 already covers these, Fast wants small/mid-cap gainers
+FAST_EXTENSION_LOOKBACK  = 20      # bars (on the 3m series) used to measure how far a coin has already run
+FAST_EXTENSION_LIMIT     = 4.0     # if |move over that lookback| > this many ATRs, the move is "already extended" -> half size, never blocked outright
+FAST_EXTENSION_MULT      = 0.5     # size multiplier applied when a breakout is judged already-extended
+FAST_MARGIN_CAP_MULT     = 5.0     # safety cap: risk-based qty can't blow past this x the old flat $20 margin (loosened - this is only meant to catch outliers, not bind on small-cap coins)
 FAST_TP1_RR             = 2.0
 FAST_TRAIL_PCT          = float(os.environ.get("FAST_TRAIL_PCT", 3.0))   # widened from 1.5
 FAST_TRAIL_ACTIVATE_RR  = 1.0     # trailing only starts after price moves 1R in favor
@@ -128,17 +130,17 @@ def get_futures_symbols():
     return symbols
 
 
-def get_liquid_symbols(symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX_SYMBOLS):
-    """Replaces the old 'top 50 movers by 24h %change' selection for Fast Signal.
-    Ranking by % change picks coins that already pumped; instead we just filter
-    for adequate liquidity and let the breakout scan (check_fast) find the
-    early-stage moves across the whole liquid universe."""
+def get_liquid_symbols(symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX_SYMBOLS, exclude_top_n=0):
+    """Filters by 24h liquidity. exclude_top_n drops that many of the most-liquid
+    coins first (majors like BTC/ETH/SOL structurally don't produce the small/mid-cap
+    gainer breakouts Fast Signal is looking for - Tight 2 already covers them).
+    max_n=None returns the full remaining eligible list with no truncation."""
     try:
         url = BASE_URL + "/openApi/swap/v2/quote/ticker"
         r = requests.get(url, timeout=10).json()
         tickers = r.get("data", [])
         if not isinstance(tickers, list):
-            return symbols[:max_n]
+            return symbols[:max_n] if max_n else symbols
         sym_set = set(symbols)
         liquid = []
         for t in tickers:
@@ -152,10 +154,14 @@ def get_liquid_symbols(symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX
             if qvol >= min_quote_vol:
                 liquid.append((sym, qvol))
         liquid.sort(key=lambda x: x[1], reverse=True)
-        return [s for s, _ in liquid[:max_n]]
+        if exclude_top_n > 0:
+            liquid = liquid[exclude_top_n:]
+        if max_n is not None:
+            liquid = liquid[:max_n]
+        return [s for s, _ in liquid]
     except Exception as e:
         print(f"[LIQUID SYMBOLS ERROR] {e}")
-        return symbols[:max_n]
+        return symbols[:max_n] if max_n else symbols
 
 
 def get_candles(symbol, limit=350, interval="15m"):
@@ -986,7 +992,7 @@ def check_symbol_tight(symbol):
 def check_fast(symbol):
     try:
         candles = get_candles(symbol, limit=100, interval=FAST_TIMEFRAME)
-        min_needed = max(FAST_CONSOL_LOOKBACK + FAST_VOL_LB + FAST_ATR_LEN + 5, FAST_TREND_EMA_LEN + 5)
+        min_needed = max(FAST_CONSOL_LOOKBACK + FAST_VOL_LB + FAST_ATR_LEN + 5, FAST_EXTENSION_LOOKBACK + 5)
         if len(candles) < min_needed:
             return
 
@@ -1008,12 +1014,13 @@ def check_fast(symbol):
         atr_vals = atr_series(highs, lows, closes, FAST_ATR_LEN)
         atr_now  = atr_vals[i]
 
-        # Medium-term trend on the same 3m series (no extra API call) - used only
-        # to scale position size down on counter-trend breakouts, never to block
-        # a signal outright (so a genuine sudden reversal move still gets taken).
-        trend_ema_vals = ema_series(closes, FAST_TREND_EMA_LEN)
-        trend_up   = entry > trend_ema_vals[i]
-        trend_down = entry < trend_ema_vals[i]
+        # Extension check (no extra API call): how far has price already run over the
+        # last FAST_EXTENSION_LOOKBACK bars, relative to its own ATR? A move that's
+        # already run many ATRs is closer to exhausted - scale size down, never block
+        # outright (a genuine strong continuation still gets taken, just smaller).
+        ext_move  = abs(closes[i] - closes[i - FAST_EXTENSION_LOOKBACK])
+        extension = ext_move / atr_now if atr_now > 0 else 0
+        is_extended = extension > FAST_EXTENSION_LIMIT
 
         # Box is computed from the window BEFORE the retest candle (i-1), so the
         # retest check below isn't comparing a candle against a box that already
@@ -1055,13 +1062,16 @@ def check_fast(symbol):
         if long_signal and sig_id_long not in fast_alerted:
             fast_alerted.add(sig_id_long)
             lev        = get_fast_leverage(symbol)
-            risk       = atr_now * FAST_SL_ATR_MULT
-            sl_price   = round(entry - risk, 6)
+            # Structural SL: below the box floor (the level whose breach invalidates
+            # this breakout), not an arbitrary ATR multiple from entry.
+            sl_price   = round(box_low - atr_now * SL_ATR_BUFFER_MULT, 6)
+            risk       = entry - sl_price
+            if risk <= 0:
+                return
             tp1_price  = round(entry + risk * FAST_TP1_RR, 6)
-            aligned    = trend_up   # BUY breakout with the medium-term trend
-            risk_usdt  = FAST_RISK_USDT if aligned else FAST_RISK_USDT * FAST_COUNTERTREND_MULT
-            trend_tag  = "with-trend" if aligned else "counter-trend (half size)"
-            print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x | {trend_tag}")
+            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
+            ext_tag    = "extended (half size)" if is_extended else "fresh move"
+            print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             trade_status = ""
             if fast_auto_trade_enabled:
                 oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price, risk_usdt)
@@ -1072,22 +1082,24 @@ def check_fast(symbol):
                 "FAST SIGNAL - BUY - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
                 "TP1 (1:2): " + str(tp1_price) + " | Trail: " + str(FAST_TRAIL_PCT) + "% (after " + str(FAST_TRAIL_ACTIVATE_RR) + "R)\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) +
+                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
                 trade_status + "\n------------------------------\nNiti Fast Signal"
             )
             send_journal("New Trade [Fast] - " + symbol + "\nSide: BUY | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
+                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
 
         elif short_signal and sig_id_short not in fast_alerted:
             fast_alerted.add(sig_id_short)
             lev        = get_fast_leverage(symbol)
-            risk       = atr_now * FAST_SL_ATR_MULT
-            sl_price   = round(entry + risk, 6)
+            # Structural SL: above the box ceiling.
+            sl_price   = round(box_high + atr_now * SL_ATR_BUFFER_MULT, 6)
+            risk       = sl_price - entry
+            if risk <= 0:
+                return
             tp1_price  = round(entry - risk * FAST_TP1_RR, 6)
-            aligned    = trend_down   # SELL breakout with the medium-term trend
-            risk_usdt  = FAST_RISK_USDT if aligned else FAST_RISK_USDT * FAST_COUNTERTREND_MULT
-            trend_tag  = "with-trend" if aligned else "counter-trend (half size)"
-            print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x | {trend_tag}")
+            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
+            ext_tag    = "extended (half size)" if is_extended else "fresh move"
+            print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             trade_status = ""
             if fast_auto_trade_enabled:
                 oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price, risk_usdt)
@@ -1098,11 +1110,11 @@ def check_fast(symbol):
                 "FAST SIGNAL - SELL - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
                 "TP1 (1:2): " + str(tp1_price) + " | Trail: " + str(FAST_TRAIL_PCT) + "% (after " + str(FAST_TRAIL_ACTIVATE_RR) + "R)\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) +
+                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
                 trade_status + "\n------------------------------\nNiti Fast Signal"
             )
             send_journal("New Trade [Fast] - " + symbol + "\nSide: SELL | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | Trend: " + trend_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
+                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
 
     except Exception as e:
         print(f"[FAST {symbol}] error: {e}")
@@ -1166,21 +1178,27 @@ def trailing_loop():
 
 
 def fast_scan_loop():
-    print("Fast Signal loop started - 3m | liquidity-filtered universe | consolidation breakout")
+    print("Fast Signal loop started - 3m | small/mid-cap universe (majors excluded) | consolidation breakout")
     all_symbols = []
     while True:
         try:
             if not all_symbols:
                 all_symbols = get_futures_symbols() or []
-            liquid = get_liquid_symbols(all_symbols)
-            print(f"[FAST SCAN] Scanning {len(liquid)} liquid pairs for breakouts...")
+            # No max_n truncation - scan the whole eligible small/mid-cap universe every
+            # cycle so a real gainer never loses out to an arbitrary liquidity-rank cutoff.
+            # Top FAST_EXCLUDE_TOP_N by volume (majors) are dropped since Tight 2 covers
+            # those and they structurally don't produce this kind of breakout.
+            liquid = get_liquid_symbols(
+                all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=None, exclude_top_n=FAST_EXCLUDE_TOP_N
+            )
+            print(f"[FAST SCAN] Scanning {len(liquid)} small/mid-cap liquid pairs for breakouts...")
             for sym in liquid:
                 check_fast(sym)
                 time.sleep(0.15)
-            print("[FAST SCAN] Done. Sleeping 60s...")
+            print("[FAST SCAN] Done. Sleeping 180s...")
         except Exception as e:
             print(f"[FAST LOOP ERROR] {e}")
-        time.sleep(60)
+        time.sleep(180)   # aligned to the 3m candle cadence - a new confirmed candle only shows up this often anyway
 
 
 def monitor_loop():

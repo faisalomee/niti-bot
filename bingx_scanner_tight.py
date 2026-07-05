@@ -28,6 +28,9 @@ ADX_MIN            = 20
 SWING_LOOKBACK     = 10
 MIN_PRICE          = 0.001
 MIN_RISK_PCT       = 0.1
+MAX_RISK_PCT       = 3.0        # reject entries whose SL distance exceeds this % of entry (blown-out sweep protection)
+TIGHT_MIN_QUOTE_VOL = float(os.environ.get("TIGHT_MIN_QUOTE_VOL", 1_000_000))  # 24h liquidity floor for Tight 2 universe
+TIGHT_MAX_SYMBOLS   = 400       # safety cap so a slow API day doesn't blow the 60s scan loop
 
 # Liquidity sweep
 SWEEP_LOOKBACK     = 15
@@ -240,10 +243,19 @@ def atr_series(highs, lows, closes, period=14):
 
 
 def vwap_series(candles):
+    """Resets at each UTC calendar day boundary so this behaves as a real
+    session/daily VWAP instead of an anchored-forever average that goes
+    flat after a few hundred candles."""
     cum_tp_vol = 0.0
     cum_vol    = 0.0
+    last_day   = None
     result = []
     for c in candles:
+        candle_day = datetime.fromtimestamp(int(c["time"]) / 1000, tz=timezone.utc).date()
+        if candle_day != last_day:
+            cum_tp_vol = 0.0
+            cum_vol    = 0.0
+            last_day   = candle_day
         h  = float(c["high"])
         l  = float(c["low"])
         cl = float(c["close"])
@@ -462,19 +474,21 @@ def close_fast_position(symbol, reason=""):
         remaining  = trade.get("remaining_qty", 0)
         if remaining > 0 and fast_auto_trade_enabled:
             place_market_order(symbol, close_side, remaining, pos_side)
+        if trade.get("sl_id"):
+            cancel_order(symbol, trade["sl_id"])   # avoid a dangling SL order after this manual/trail/opposite close
         current = get_current_price(symbol)
-        lev = trade.get("lev", 3)
         if trade["side"] == "BUY":
-            pnl = round((current - trade["entry"]) / trade["entry"] * FAST_TRADE_AMOUNT * lev, 2)
+            leg_pnl = (current - trade["entry"]) * remaining
         else:
-            pnl = round((trade["entry"] - current) / trade["entry"] * FAST_TRADE_AMOUNT * lev, 2)
-        sign = "+" if pnl > 0 else ""
+            leg_pnl = (trade["entry"] - current) * remaining
+        total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
+        sign = "+" if total_pnl > 0 else ""
         send_journal(
             "Trade Closed [Fast " + reason + "] - " + symbol + "\n"
             "------------------------------\n"
             "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
             "Exit  : " + str(round(current, 6)) + "\n"
-            "PnL   : " + sign + str(pnl) + " USDT\n"
+            "PnL   : " + sign + str(total_pnl) + " USDT\n"
             "------------------------------\nNiti Journal"
         )
         del fast_open_trades[symbol]
@@ -546,12 +560,12 @@ def place_fast_order(symbol, side, entry):
         print(f"[FAST ORDER] {symbol} {side} lev={lev}x: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
-            place_sl_order(symbol, close_side, pos_side, sl_price, total_qty)
-            place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
+            sl_id  = place_sl_order(symbol, close_side, pos_side, sl_price, total_qty)
+            tp1_id = place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
             fast_open_trades[symbol] = {
                 "symbol": symbol, "side": side, "entry": entry,
-                "sl": sl_price, "tp1": tp1_price, "lev": lev,
-                "total_qty": total_qty, "remaining_qty": half_qty,
+                "sl": sl_price, "sl_id": sl_id, "tp1": tp1_price, "tp1_id": tp1_id, "lev": lev,
+                "total_qty": total_qty, "remaining_qty": total_qty, "tp1_filled": False, "partial_pnl": 0.0,
                 "trail_price": entry, "activated": False, "order_id": order_id,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
@@ -559,6 +573,47 @@ def place_fast_order(symbol, side, entry):
     except Exception as e:
         print(f"[FAST ORDER ERROR] {symbol}: {e}")
         return None
+
+
+def track_fast_trades():
+    """Fast Signal previously had no polling at all for its resting SL/TP1 orders -
+    if either filled naturally on the exchange, the bot never found out, kept the
+    symbol 'stuck' as open, and never journaled the real outcome. This closes that gap."""
+    for symbol in list(fast_open_trades.keys()):
+        try:
+            trade = fast_open_trades[symbol]
+
+            if not trade.get("tp1_filled") and trade.get("tp1_id"):
+                status = check_tight_order_status(trade["tp1_id"], symbol)
+                if status == "FILLED":
+                    half_qty = round(trade["total_qty"] / 2, symbol_precision.get(symbol, 4))
+                    leg_pnl  = (trade["tp1"] - trade["entry"]) * half_qty if trade["side"] == "BUY" else (trade["entry"] - trade["tp1"]) * half_qty
+                    trade["partial_pnl"]   = trade.get("partial_pnl", 0.0) + leg_pnl
+                    trade["remaining_qty"] = trade["total_qty"] - half_qty
+                    trade["tp1_filled"]    = True
+                    send_journal(
+                        "TP1 hit [Fast] - " + symbol + "\nBanked: " + str(round(leg_pnl, 2)) +
+                        " USDT | Remaining: " + str(trade["remaining_qty"]) + "\nNiti Journal"
+                    )
+
+            sl_status = check_tight_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
+            if sl_status == "FILLED":
+                remaining = trade.get("remaining_qty", 0)
+                if trade["side"] == "BUY":
+                    leg_pnl = (trade["sl"] - trade["entry"]) * remaining
+                else:
+                    leg_pnl = (trade["entry"] - trade["sl"]) * remaining
+                total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
+                sign = "+" if total_pnl > 0 else ""
+                send_journal(
+                    "Trade Closed [Fast SL] - " + symbol + "\n------------------------------\n"
+                    "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
+                    "Exit  : " + str(trade["sl"]) + "\nPnL   : " + sign + str(total_pnl) + " USDT\n"
+                    "------------------------------\nNiti Journal"
+                )
+                del fast_open_trades[symbol]
+        except Exception as e:
+            print(f"[FAST TRACK ERROR] {symbol}: {e}")
 
 
 def update_fast_trailing():
@@ -608,42 +663,62 @@ def check_tight_order_status(order_id, symbol):
 
 
 def track_tight_trades():
+    """Polls the SL/TP1/TP2 order IDs (not the entry order, which fills instantly
+    and would otherwise make every trade look 'closed' one loop after opening)."""
     global daily_trades, tight_loss_streak, tight_cooldown_until
     to_remove = []
     for oid, trade in list(tight_open_trades.items()):
         try:
-            # --- move remaining runner to breakeven once TP1 has filled (trend mode only) ---
+            symbol = trade["symbol"]
+            entry  = trade["entry"]
+            side   = trade["side"]
+
+            # --- Step 1: TP1 fill -> bank partial PnL + move remaining runner to breakeven (TREND mode only) ---
             if not trade.get("breakeven_done") and trade.get("tp1_id"):
-                tp1_status = check_tight_order_status(trade["tp1_id"], trade["symbol"])
+                tp1_status = check_tight_order_status(trade["tp1_id"], symbol)
                 if tp1_status == "FILLED":
-                    cancel_order(trade["symbol"], trade["sl_id"])
+                    leg_qty = trade["half_qty"]
+                    leg_pnl = (trade["tp1"] - entry) * leg_qty if side == "BUY" else (entry - trade["tp1"]) * leg_qty
+                    trade["partial_pnl"] = trade.get("partial_pnl", 0.0) + leg_pnl
+                    cancel_order(symbol, trade["sl_id"])
                     new_sl_id = place_sl_order(
-                        trade["symbol"], trade["close_side"], trade["pos_side"],
-                        trade["entry"], trade["half_qty"]
+                        symbol, trade["close_side"], trade["pos_side"], entry, leg_qty
                     )
                     trade["sl_id"] = new_sl_id
                     trade["breakeven_done"] = True
                     send_journal(
-                        "TP1 hit [Tight] - " + trade["symbol"] +
-                        "\nRemaining position SL moved to breakeven (" + str(trade["entry"]) + ")\nNiti Journal"
+                        "TP1 hit [Tight] - " + symbol + "\nBanked: " + str(round(leg_pnl, 2)) +
+                        " USDT | Remaining SL moved to breakeven (" + str(entry) + ")\nNiti Journal"
                     )
 
-            status = check_tight_order_status(oid, trade["symbol"])
-            if status in ("FILLED", "CANCELLED", "EXPIRED"):
-                current = get_current_price(trade["symbol"])
-                if trade["side"] == "BUY":
-                    pnl    = round((current - trade["entry"]) / trade["entry"] * (trade["qty"] * trade["entry"] / LEVERAGE) * LEVERAGE, 2)
-                    result = "TP" if current >= trade["tp1"] else ("SL" if current <= trade["sl"] else "Open")
-                else:
-                    pnl    = round((trade["entry"] - current) / trade["entry"] * (trade["qty"] * trade["entry"] / LEVERAGE) * LEVERAGE, 2)
-                    result = "TP" if current <= trade["tp1"] else ("SL" if current >= trade["sl"] else "Open")
-                trade["pnl"]    = pnl
+            # --- Step 2: final exit - either the (possibly breakeven) SL fires, or the last target fires ---
+            target_id    = trade["tp2_id"] if trade.get("tp2_id") else trade["tp1_id"]
+            target_price = trade["tp2"]    if trade.get("tp2_id") else trade["tp1"]
+            final_qty    = trade["half_qty"] if trade.get("breakeven_done") else trade["qty"]
+
+            sl_status  = check_tight_order_status(trade["sl_id"], symbol)
+            tgt_status = check_tight_order_status(target_id, symbol) if target_id else ""
+
+            final_price = None
+            result      = None
+            if sl_status == "FILLED":
+                final_price = entry if trade.get("breakeven_done") else trade["sl"]
+                result      = "BE" if trade.get("breakeven_done") else "SL"
+            elif tgt_status == "FILLED":
+                final_price = target_price
+                result      = "TP"
+
+            if final_price is not None:
+                leg_pnl   = (final_price - entry) * final_qty if side == "BUY" else (entry - final_price) * final_qty
+                total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
+
+                trade["pnl"]    = total_pnl
                 trade["result"] = result
                 trade["label"]  = "Tight"
                 daily_trades.append(trade)
                 to_remove.append(oid)
 
-                if pnl < 0:
+                if total_pnl < 0:
                     tight_loss_streak += 1
                 else:
                     tight_loss_streak = 0
@@ -652,11 +727,11 @@ def track_tight_trades():
                     tight_loss_streak = 0
                     send_journal(f"Tight 2 cooldown triggered - pausing new entries for {COOLDOWN_MINUTES} minutes\nNiti Journal")
 
-                sign = "+" if pnl > 0 else ""
+                sign = "+" if total_pnl > 0 else ""
                 send_journal(
-                    "Trade Closed [Tight] - " + trade["symbol"] + "\n------------------------------\n"
-                    "Side: " + trade["side"] + " | Result: " + result + "\n"
-                    "PnL: " + sign + str(pnl) + " USDT\n------------------------------\nNiti Journal"
+                    "Trade Closed [Tight] - " + symbol + "\n------------------------------\n"
+                    "Side: " + side + " | Result: " + result + "\n"
+                    "PnL: " + sign + str(total_pnl) + " USDT\n------------------------------\nNiti Journal"
                 )
         except Exception as e:
             print(f"[TRACK ERROR] {e}")
@@ -780,8 +855,9 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
         if sig_id not in tight_alerted:
             sl   = bull_pt - atr_now * SL_ATR_BUFFER_MULT
             risk = entry - sl
-            if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
-                return ratio
+            risk_pct = (risk / entry * 100) if entry > 0 else 0
+            if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
+                return ratio   # sweep point too close (noise) or too far (blown-out / stale sweep) - skip
             sweep_depth_pct = abs(bull_pool - bull_pt) / bull_pool * 100 if bull_pool else SWEEP_MIN_PCT
             score  = confidence_score(ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, sweep_depth_pct)
             amount = amount_for_score(score)
@@ -820,8 +896,9 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
         if sig_id not in tight_alerted:
             sl   = bear_pt + atr_now * SL_ATR_BUFFER_MULT
             risk = sl - entry
-            if risk <= 0 or (risk / entry * 100) < MIN_RISK_PCT:
-                return ratio
+            risk_pct = (risk / entry * 100) if entry > 0 else 0
+            if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
+                return ratio   # sweep point too close (noise) or too far (blown-out / stale sweep) - skip
             sweep_depth_pct = abs(bear_pt - bear_pool) / bear_pool * 100 if bear_pool else SWEEP_MIN_PCT
             score  = confidence_score(ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, sweep_depth_pct)
             amount = amount_for_score(score)
@@ -908,8 +985,13 @@ def check_fast(symbol):
         atr_vals = atr_series(highs, lows, closes, FAST_ATR_LEN)
         atr_now  = atr_vals[i]
 
-        box_high = max(highs[i - FAST_CONSOL_LOOKBACK:i])
-        box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
+        # Box is computed from the window BEFORE the retest candle (i-1), so the
+        # retest check below isn't comparing a candle against a box that already
+        # includes that same candle's own high/low (which made retest_confirm
+        # impossible to ever trigger).
+        box_end = i - 1 if FAST_RETEST_CONFIRM else i
+        box_high = max(highs[box_end - FAST_CONSOL_LOOKBACK:box_end])
+        box_low  = min(lows[box_end - FAST_CONSOL_LOOKBACK:box_end])
 
         avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
         ratio   = vols[i] / avg_vol if avg_vol > 0 else 0
@@ -1038,6 +1120,7 @@ def trailing_loop():
     while True:
         try:
             if fast_open_trades:
+                track_fast_trades()
                 update_fast_trailing()
         except Exception as e:
             print(f"[TRAIL LOOP ERROR] {e}")
@@ -1066,8 +1149,9 @@ def monitor_loop():
     print("Monitor started - Tight 2 (15m, sweep+regime+dynamic SL) | Fast Signal (3m breakout)")
     while True:
         try:
-            symbols = get_futures_symbols()
-            print(f"[TIGHT SCAN] Scanning {len(symbols)} pairs... | Tight={tight_auto_trade_enabled} | Fast={fast_auto_trade_enabled}")
+            all_symbols = get_futures_symbols()
+            symbols = get_liquid_symbols(all_symbols, min_quote_vol=TIGHT_MIN_QUOTE_VOL, max_n=TIGHT_MAX_SYMBOLS)
+            print(f"[TIGHT SCAN] Scanning {len(symbols)}/{len(all_symbols)} liquid pairs (min 24h vol ${TIGHT_MIN_QUOTE_VOL:,.0f}) | Tight={tight_auto_trade_enabled} | Fast={fast_auto_trade_enabled}")
             ratios = []
             for sym in symbols:
                 r = check_symbol_tight(sym)

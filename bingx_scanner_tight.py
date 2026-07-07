@@ -1,9 +1,4 @@
-<div style="padding:1rem 0;font-family:sans-serif">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-<span style="font-size:13px;color:#888">bingx_scanner_tight.py — full file, Tight 2 + Fast Signal, all confirmed fixes</span>
-<button id="copybtn" style="padding:8px 16px;cursor:pointer;font-size:13px">Copy code</button>
-</div>
-<textarea id="codebox" readonly style="width:100%;height:520px;font-family:monospace;font-size:11px;line-height:1.5;padding:12px;background:#1e1e1e;color:#d4d4d4;border:1px solid #444;border-radius:8px;resize:vertical;white-space:pre;overflow:auto">import os, time, hmac, hashlib, requests
+import os, time, hmac, hashlib, requests
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone, timedelta
@@ -79,8 +74,8 @@ TIER_STRONG_MULT   = 1.5
 # ---- New market-regime filters (all independently toggleable - added 2026-07-08) ----
 BTC_SYMBOL                 = "BTC-USDT"
 BTC_REGIME_FILTER_ENABLED  = os.environ.get("BTC_REGIME_FILTER_ENABLED", "true").lower() == "true"
-BTC_UNCERTAIN_RATIO        = float(os.environ.get("BTC_UNCERTAIN_RATIO", 1.5))   # BTC's own ATR-ratio above this = elevated uncertainty -&gt; halve alt size
-VOL_COOLDOWN_ATR_RATIO     = float(os.environ.get("VOL_COOLDOWN_ATR_RATIO", 2.0))  # BTC ATR-ratio above this -&gt; proactive market-wide cooldown
+BTC_UNCERTAIN_RATIO        = float(os.environ.get("BTC_UNCERTAIN_RATIO", 1.5))   # BTC's own ATR-ratio above this = elevated uncertainty -> halve alt size
+VOL_COOLDOWN_ATR_RATIO     = float(os.environ.get("VOL_COOLDOWN_ATR_RATIO", 2.0))  # BTC ATR-ratio above this -> proactive market-wide cooldown
 
 MTF_FILTER_ENABLED         = os.environ.get("MTF_FILTER_ENABLED", "true").lower() == "true"
 MTF_INTERVAL               = os.environ.get("MTF_INTERVAL", "1h")
@@ -147,9 +142,9 @@ mtf_cache        = {}
 
 
 # ==================== CORE API HELPERS ====================
-def build_signed_params(params: dict) -&gt; dict:
+def build_signed_params(params: dict) -> dict:
     params["timestamp"] = int(time.time() * 1000)
-    qs = "&amp;".join(f"{k}={v}" for k, v in params.items())
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
     params["signature"] = hmac.new(
         SECRET_KEY.encode(), qs.encode(), hashlib.sha256
     ).hexdigest()
@@ -189,10 +184,10 @@ def get_liquid_symbols(symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX
                 qvol = float(t.get("quoteVolume", 0))
             except Exception:
                 qvol = 0
-            if qvol &gt;= min_quote_vol:
+            if qvol >= min_quote_vol:
                 liquid.append((sym, qvol))
         liquid.sort(key=lambda x: x[1], reverse=True)
-        if exclude_top_n &gt; 0:
+        if exclude_top_n > 0:
             liquid = liquid[exclude_top_n:]
         if max_n is not None:
             liquid = liquid[:max_n]
@@ -248,7 +243,7 @@ def ema_series(closes, period):
 
 def adx_series(highs, lows, closes, period=14):
     n = len(closes)
-    if n &lt; period + 2:
+    if n < period + 2:
         return [0.0] * n
 
     tr_list, pdm_list, ndm_list = [], [], []
@@ -256,8 +251,8 @@ def adx_series(highs, lows, closes, period=14):
         high_diff = highs[i] - highs[i-1]
         low_diff  = lows[i-1] - lows[i]
         tr  = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        pdm = high_diff if high_diff &gt; low_diff and high_diff &gt; 0 else 0
-        ndm = low_diff  if low_diff &gt; high_diff and low_diff  &gt; 0 else 0
+        pdm = high_diff if high_diff > low_diff and high_diff > 0 else 0
+        ndm = low_diff  if low_diff > high_diff and low_diff  > 0 else 0
         tr_list.append(tr)
         pdm_list.append(pdm)
         ndm_list.append(ndm)
@@ -289,7 +284,7 @@ def adx_series(highs, lows, closes, period=14):
 
 def atr_series(highs, lows, closes, period=14):
     n = len(closes)
-    if n &lt; period + 1:
+    if n < period + 1:
         return [max(h - l, 0.0001) for h, l in zip(highs, lows)]
     tr_list = [highs[0] - lows[0]]
     for i in range(1, n):
@@ -320,7 +315,7 @@ def vwap_series(candles):
         tp = (h + l + cl) / 3
         cum_tp_vol += tp * v
         cum_vol    += v
-        result.append(cum_tp_vol / cum_vol if cum_vol &gt; 0 else tp)
+        result.append(cum_tp_vol / cum_vol if cum_vol > 0 else tp)
     return result
 
 
@@ -330,7 +325,7 @@ def rsi_series(closes, period=14):
         diff = closes[i] - closes[i - 1]
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
-    if len(gains) &lt; period:
+    if len(gains) < period:
         return [50.0] * len(closes)
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -344,30 +339,30 @@ def rsi_series(closes, period=14):
 
 
 def efficiency_ratio(closes, period=ER_LOOKBACK):
-    if len(closes) &lt; period + 1:
+    if len(closes) < period + 1:
         return 0.0
     net_change = abs(closes[-1] - closes[-1 - period])
     path_sum = sum(abs(closes[-i] - closes[-i - 1]) for i in range(1, period + 1))
-    return net_change / path_sum if path_sum &gt; 0 else 0.0
+    return net_change / path_sum if path_sum > 0 else 0.0
 
 
 # ==================== LIQUIDITY SWEEP DETECTION ====================
 def detect_bull_sweep(lows, closes, idx, lookback=SWEEP_LOOKBACK, min_pct=SWEEP_MIN_PCT):
-    if idx - lookback &lt; 0:
+    if idx - lookback < 0:
         return False, None, None
     pool_low = min(lows[idx - lookback:idx])
     wick_low = lows[idx]
-    if wick_low &lt; pool_low * (1 - min_pct / 100) and closes[idx] &gt; pool_low:
+    if wick_low < pool_low * (1 - min_pct / 100) and closes[idx] > pool_low:
         return True, wick_low, pool_low
     return False, None, None
 
 
 def detect_bear_sweep(highs, closes, idx, lookback=SWEEP_LOOKBACK, min_pct=SWEEP_MIN_PCT):
-    if idx - lookback &lt; 0:
+    if idx - lookback < 0:
         return False, None, None
     pool_high = max(highs[idx - lookback:idx])
     wick_high = highs[idx]
-    if wick_high &gt; pool_high * (1 + min_pct / 100) and closes[idx] &lt; pool_high:
+    if wick_high > pool_high * (1 + min_pct / 100) and closes[idx] < pool_high:
         return True, wick_high, pool_high
     return False, None, None
 
@@ -390,20 +385,20 @@ def compute_atr_ratio(highs, lows, closes, atr_vals):
     (TREND/RANGE) and the BTC-wide uncertainty/cooldown checks."""
     atr_pct_series = []
     for i in range(len(closes)):
-        atr_pct_series.append((atr_vals[i] / closes[i] * 100) if closes[i] &gt; 0 else 0.0)
+        atr_pct_series.append((atr_vals[i] / closes[i] * 100) if closes[i] > 0 else 0.0)
     base_len = min(ATR_BASE_LEN, len(atr_pct_series))
-    baseline = sum(atr_pct_series[-base_len:]) / base_len if base_len &gt; 0 else 1.0
+    baseline = sum(atr_pct_series[-base_len:]) / base_len if base_len > 0 else 1.0
     atr_pct_now = atr_pct_series[-1]
-    ratio = atr_pct_now / baseline if baseline &gt; 0 else 1.0
+    ratio = atr_pct_now / baseline if baseline > 0 else 1.0
     return ratio
 
 
 def update_regime(symbol, highs, lows, closes, atr_vals):
     ratio = compute_atr_ratio(highs, lows, closes, atr_vals)
     prev = regime_state.get(symbol, "TREND")
-    if ratio &lt;= RANGE_ENTER_RATIO:
+    if ratio <= RANGE_ENTER_RATIO:
         regime_state[symbol] = "RANGE"
-    elif ratio &gt;= TREND_ENTER_RATIO:
+    elif ratio >= TREND_ENTER_RATIO:
         regime_state[symbol] = "TREND"
     else:
         regime_state[symbol] = prev
@@ -414,11 +409,11 @@ def get_btc_regime():
     """Cached (60s) BTC ATR-ratio, used to gate/downsize alt entries when BTC itself is
     in an elevated-uncertainty regime, and to trigger a proactive volatility cooldown."""
     now = time.time()
-    if now - btc_regime_cache["ts"] &lt; 60:
+    if now - btc_regime_cache["ts"] < 60:
         return btc_regime_cache["ratio"]
     try:
         candles = get_candles(BTC_SYMBOL, limit=100, interval="15m")
-        if len(candles) &lt; 60:
+        if len(candles) < 60:
             return btc_regime_cache["ratio"]
         closes = [cl(c) for c in candles]
         highs  = [h(c) for c in candles]
@@ -438,15 +433,15 @@ def get_mtf_trend(symbol):
     require the 15m Tight 2 signal direction agrees with the bigger picture."""
     now = time.time()
     cached = mtf_cache.get(symbol)
-    if cached and now - cached["ts"] &lt; 300:
+    if cached and now - cached["ts"] < 300:
         return cached["trend"]
     try:
         candles = get_candles(symbol, limit=250, interval=MTF_INTERVAL)
-        if len(candles) &lt; 210:
+        if len(candles) < 210:
             return cached["trend"] if cached else None
         closes = [cl(c) for c in candles]
         ema200 = ema_series(closes, EMA200_LEN)
-        trend = "UP" if closes[-1] &gt; ema200[-1] else "DOWN"
+        trend = "UP" if closes[-1] > ema200[-1] else "DOWN"
         mtf_cache[symbol] = {"trend": trend, "ts": now}
         return trend
     except Exception as e:
@@ -461,39 +456,39 @@ def count_open_direction(side):
 # ==================== CONFIDENCE SCORING ====================
 def confidence_score(vol_ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, sweep_depth_pct):
     score = 0
-    if vol_ratio &gt;= 3.5:
+    if vol_ratio >= 3.5:
         score += 25
-    elif vol_ratio &gt;= VOLUME_MULTIPLIER:
+    elif vol_ratio >= VOLUME_MULTIPLIER:
         score += 15
 
-    if adx_now &gt;= 35:
+    if adx_now >= 35:
         score += 25
-    elif adx_now &gt;= 25:
+    elif adx_now >= 25:
         score += 15
 
-    if er_now &gt;= 0.6:
+    if er_now >= 0.6:
         score += 25
-    elif er_now &gt;= 0.4:
+    elif er_now >= 0.4:
         score += 15
 
     mid = (rsi_low + rsi_high) / 2
     band_half = (rsi_high - rsi_low) / 2
-    if band_half &gt; 0:
+    if band_half > 0:
         closeness = max(0.0, 1 - (abs(rsi_now - mid) / band_half))
         score += round(15 * closeness)
 
-    depth_ratio = sweep_depth_pct / SWEEP_MIN_PCT if SWEEP_MIN_PCT &gt; 0 else 1
+    depth_ratio = sweep_depth_pct / SWEEP_MIN_PCT if SWEEP_MIN_PCT > 0 else 1
     score += min(10, round(depth_ratio * 3))
 
     return min(100, score)
 
 
 def tier_mult_for_score(score):
-    if score &lt; CONF_WEAK_MIN:
+    if score < CONF_WEAK_MIN:
         return None
-    if score &lt; CONF_GOOD_MIN:
+    if score < CONF_GOOD_MIN:
         return TIER_WEAK_MULT
-    if score &lt; CONF_STRONG_MIN:
+    if score < CONF_STRONG_MIN:
         return TIER_NORMAL_MULT
     return TIER_STRONG_MULT
 
@@ -514,7 +509,7 @@ def journal_closed_trade(trade):
     """Single consolidated journal entry - only called for trades that were actually
     placed (auto-trade ON, real order id) and have now fully closed. Replaces the old
     per-signal 'New Trade' and per-leg 'TP1 hit' journal messages."""
-    sign = "+" if trade.get("pnl", 0) &gt; 0 else ""
+    sign = "+" if trade.get("pnl", 0) > 0 else ""
     send_journal(
         "Trade Closed [" + trade.get("label", "?") + "] - " + trade["symbol"] + "\n"
         "------------------------------\n"
@@ -527,11 +522,11 @@ def journal_closed_trade(trade):
 
 def _update_loss_streak(total_pnl):
     global tight_loss_streak, tight_cooldown_until
-    if total_pnl &lt; 0:
+    if total_pnl < 0:
         tight_loss_streak += 1
     else:
         tight_loss_streak = 0
-    if tight_loss_streak &gt;= LOSS_STREAK_N:
+    if tight_loss_streak >= LOSS_STREAK_N:
         tight_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
         tight_loss_streak = 0
         send_journal(f"Tight 2 cooldown triggered - pausing new entries for {COOLDOWN_MINUTES} minutes\nNiti Journal")
@@ -615,7 +610,7 @@ def close_fast_position(symbol, reason=""):
         pos_side   = "LONG"  if trade["side"] == "BUY" else "SHORT"
         close_side = "SELL"  if trade["side"] == "BUY" else "BUY"
         remaining  = trade.get("remaining_qty", 0)
-        if remaining &gt; 0 and fast_auto_trade_enabled:
+        if remaining > 0 and fast_auto_trade_enabled:
             place_market_order(symbol, close_side, remaining, pos_side)
         # Cancel BOTH counterpart resting orders - previously only sl_id was cancelled here,
         # leaving a dangling tp1_id order behind if TP1 hadn't filled yet.
@@ -652,7 +647,7 @@ def close_tight_position(oid, reason=""):
         close_side = trade["close_side"]
         remaining  = trade.get("half_qty", 0)
         entry      = trade["entry"]
-        if remaining &gt; 0 and tight_auto_trade_enabled:
+        if remaining > 0 and tight_auto_trade_enabled:
             place_market_order(symbol, close_side, remaining, pos_side)
         if trade.get("sl_id"):
             cancel_order(symbol, trade["sl_id"])
@@ -681,11 +676,11 @@ def place_tight_order(symbol, side, entry, sl, tp1, trade_amount_mult, mode):
         set_leverage_api(symbol, LEVERAGE)
         precision   = symbol_precision.get(symbol, 4)
         risk_dist   = abs(entry - sl)
-        if risk_dist &lt;= 0:
+        if risk_dist <= 0:
             return None
         risk_usdt   = TIGHT_RISK_USDT * trade_amount_mult
         total_qty   = round(risk_usdt / risk_dist, precision)
-        if total_qty &lt;= 0:
+        if total_qty <= 0:
             return None
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
@@ -729,14 +724,14 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usd
         set_leverage_api(symbol, lev)
         precision  = symbol_precision.get(symbol, 4)
         risk_dist  = abs(entry - sl_price)
-        if risk_dist &lt;= 0:
+        if risk_dist <= 0:
             return None
 
         risk_qty      = risk_usdt / risk_dist
         margin_cap_qty = (FAST_TRADE_AMOUNT * FAST_MARGIN_CAP_MULT * lev) / entry
         total_qty     = round(min(risk_qty, margin_cap_qty), precision)
         half_qty      = round(total_qty / 2, precision)
-        if total_qty &lt;= 0 or half_qty &lt;= 0:
+        if total_qty <= 0 or half_qty <= 0:
             return None
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
@@ -810,20 +805,20 @@ def track_fast_trades():
             # favorably by at least FAST_PROGRESS_MIN_R; if yes, extend the deadline; if
             # flat/dead, exit now. A hard cap still applies regardless of progress.
             now_ts = time.time()
-            if now_ts &gt;= trade.get("next_check_ts", now_ts + 1):
+            if now_ts >= trade.get("next_check_ts", now_ts + 1):
                 opened_ts = trade.get("opened_ts", now_ts)
-                if now_ts - opened_ts &gt;= FAST_MAX_HOLD_CAP_SECONDS:
+                if now_ts - opened_ts >= FAST_MAX_HOLD_CAP_SECONDS:
                     print(f"[FAST TIME EXIT] {symbol} - hard cap reached")
                     close_fast_position(symbol, "TimeExit")
                     continue
                 current = get_current_price(symbol)
                 risk_dist = trade.get("risk_dist", 0)
-                if current &gt; 0 and risk_dist &gt; 0:
+                if current > 0 and risk_dist > 0:
                     if trade["side"] == "BUY":
                         favorable_r = (current - trade["entry"]) / risk_dist
                     else:
                         favorable_r = (trade["entry"] - current) / risk_dist
-                    if favorable_r &gt;= FAST_PROGRESS_MIN_R:
+                    if favorable_r >= FAST_PROGRESS_MIN_R:
                         trade["next_check_ts"] = now_ts + FAST_PROGRESS_CHECK_SECONDS
                         print(f"[FAST PROGRESS] {symbol} extended - {favorable_r:.2f}R favorable")
                     else:
@@ -841,33 +836,33 @@ def update_fast_trailing():
         try:
             trade   = fast_open_trades[symbol]
             current = get_current_price(symbol)
-            if current &lt;= 0:
+            if current <= 0:
                 continue
             side = trade["side"]
             activate_pct = (FAST_TRAIL_ACTIVATE_RR * trade.get("sl_pct", 1.5)) / 100
             atr_ref    = trade.get("atr_at_entry", 0)
-            trail_dist = atr_ref * FAST_TRAIL_ATR_MULT if atr_ref &gt; 0 else trade["entry"] * (FAST_TRAIL_PCT_FALLBACK / 100)
+            trail_dist = atr_ref * FAST_TRAIL_ATR_MULT if atr_ref > 0 else trade["entry"] * (FAST_TRAIL_PCT_FALLBACK / 100)
 
             if not trade.get("activated"):
-                if side == "BUY" and current &gt;= trade["entry"] * (1 + activate_pct):
+                if side == "BUY" and current >= trade["entry"] * (1 + activate_pct):
                     fast_open_trades[symbol]["activated"]   = True
                     fast_open_trades[symbol]["trail_price"] = current
-                elif side == "SELL" and current &lt;= trade["entry"] * (1 - activate_pct):
+                elif side == "SELL" and current <= trade["entry"] * (1 - activate_pct):
                     fast_open_trades[symbol]["activated"]   = True
                     fast_open_trades[symbol]["trail_price"] = current
                 continue
 
             if side == "BUY":
-                if current &gt; trade["trail_price"]:
+                if current > trade["trail_price"]:
                     fast_open_trades[symbol]["trail_price"] = current
                 trail_sl = trade["trail_price"] - trail_dist
-                if current &lt;= trail_sl:
+                if current <= trail_sl:
                     close_fast_position(symbol, "Trail")
             else:
-                if current &lt; trade["trail_price"]:
+                if current < trade["trail_price"]:
                     fast_open_trades[symbol]["trail_price"] = current
                 trail_sl = trade["trail_price"] + trail_dist
-                if current &gt;= trail_sl:
+                if current >= trail_sl:
                     close_fast_position(symbol, "Trail")
         except Exception as e:
             print(f"[TRAIL ERROR] {symbol}: {e}")
@@ -884,21 +879,21 @@ def update_tight_trailing():
         try:
             symbol  = trade["symbol"]
             current = get_current_price(symbol)
-            if current &lt;= 0:
+            if current <= 0:
                 continue
             side       = trade["side"]
             trail_pct  = TIGHT_TRAIL_PCT / 100
             if side == "BUY":
-                if current &gt; trade["trail_price"]:
+                if current > trade["trail_price"]:
                     trade["trail_price"] = current
                 trail_sl = trade["trail_price"] * (1 - trail_pct)
-                if current &lt;= trail_sl:
+                if current <= trail_sl:
                     close_tight_position(oid, "Trail")
             else:
-                if current &lt; trade["trail_price"]:
+                if current < trade["trail_price"]:
                     trade["trail_price"] = current
                 trail_sl = trade["trail_price"] * (1 + trail_pct)
-                if current &gt;= trail_sl:
+                if current >= trail_sl:
                     close_tight_position(oid, "Trail")
         except Exception as e:
             print(f"[TIGHT TRAIL ERROR] {oid}: {e}")
@@ -923,7 +918,7 @@ def track_tight_trades():
             side   = trade["side"]
             mode   = trade.get("mode", "TREND")
 
-            # --- Step 1: TP1 fill (TREND mode only) -&gt; bank partial PnL, move remaining
+            # --- Step 1: TP1 fill (TREND mode only) -> bank partial PnL, move remaining
             # to breakeven immediately, then hand off to the trailing loop (TP2 removed). ---
             if mode == "TREND" and not trade.get("breakeven_done") and trade.get("tp1_id"):
                 tp1_status = check_tight_order_status(trade["tp1_id"], symbol)
@@ -951,7 +946,7 @@ def track_tight_trades():
             if trade.get("trailing_active"):
                 sl_status = check_tight_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
                 if sl_status == "FILLED":
-                    total_pnl = round(trade.get("partial_pnl", 0.0), 2)   # breakeven fill -&gt; ~0 on this leg
+                    total_pnl = round(trade.get("partial_pnl", 0.0), 2)   # breakeven fill -> ~0 on this leg
                     trade["pnl"]    = total_pnl
                     trade["result"] = "BE"
                     trade["label"]  = "Tight"
@@ -1006,19 +1001,19 @@ def send_daily_summary():
     today = now.date()
     if last_summary_date == today:
         return
-    if now.hour != 23 or now.minute &lt; 55:
+    if now.hour != 23 or now.minute < 55:
         return
     last_summary_date = today
     total_pnl = round(sum(t.get("pnl", 0) for t in daily_trades), 2)
-    wins      = sum(1 for t in daily_trades if t.get("pnl", 0) &gt; 0)
-    losses    = sum(1 for t in daily_trades if t.get("pnl", 0) &lt;= 0)
+    wins      = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
+    losses    = sum(1 for t in daily_trades if t.get("pnl", 0) <= 0)
     total     = len(daily_trades)
-    win_rate  = round(wins / total * 100, 1) if total &gt; 0 else 0
-    sign      = "+" if total_pnl &gt; 0 else ""
+    win_rate  = round(wins / total * 100, 1) if total > 0 else 0
+    sign      = "+" if total_pnl > 0 else ""
     lines = ["Daily Summary - " + today.strftime("%b %d, %Y"), "------------------------------"]
     for idx, t in enumerate(daily_trades, 1):
         p  = t.get("pnl", 0)
-        ps = "+" if p &gt; 0 else ""
+        ps = "+" if p > 0 else ""
         lines.append(str(idx) + ". [" + t.get("label", "?") + "] " + t["symbol"] + " " + t["side"] + " | " + t.get("result", "?") + " | " + ps + str(p) + " USDT")
     lines.append("------------------------------")
     lines.append("Trades: " + str(total) + " (" + str(wins) + "W/" + str(losses) + "L) | WR: " + str(win_rate) + "%")
@@ -1040,72 +1035,72 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
                 ema50_vals, ema200_vals, vwap_vals, rsi_vals, adx_vals, atr_vals):
     global tight_cooldown_until
 
-    if tight_cooldown_until and datetime.now(timezone.utc) &lt; tight_cooldown_until:
+    if tight_cooldown_until and datetime.now(timezone.utc) < tight_cooldown_until:
         return None
 
     i   = len(confirmed) - 1
     sig = i - 2
-    if sig &lt; VOLUME_LOOKBACK + EMA200_LEN:
+    if sig < VOLUME_LOOKBACK + EMA200_LEN:
         return None
 
     entry      = closes[i]
-    if entry &lt; MIN_PRICE:
+    if entry < MIN_PRICE:
         return None
 
     vwap_now   = vwap_vals[i]
     ema50_now  = ema50_vals[i]
     ema200_now = ema200_vals[i]
     rsi_now    = rsi_vals[i]
-    adx_now    = adx_vals[i] if i &lt; len(adx_vals) else 0
-    atr_now    = atr_vals[i] if i &lt; len(atr_vals) else (highs[i] - lows[i])
+    adx_now    = adx_vals[i] if i < len(adx_vals) else 0
+    atr_now    = atr_vals[i] if i < len(atr_vals) else (highs[i] - lows[i])
 
     er_now = efficiency_ratio(closes[:i+1], ER_LOOKBACK)
-    if er_now &lt; ER_MIN:
+    if er_now < ER_MIN:
         return None
 
     mode, atr_ratio = update_regime(symbol, highs[:i+1], lows[:i+1], closes[:i+1], atr_vals[:i+1])
 
     avg_vol = sum(vols[sig - VOLUME_LOOKBACK:sig]) / VOLUME_LOOKBACK
-    ratio   = vols[sig] / avg_vol if avg_vol &gt; 0 else 0
-    vol_ok  = ratio &gt;= VOLUME_MULTIPLIER
+    ratio   = vols[sig] / avg_vol if avg_vol > 0 else 0
+    vol_ok  = ratio >= VOLUME_MULTIPLIER
 
-    trend_bull = entry &gt; ema200_now
-    trend_bear = entry &lt; ema200_now
+    trend_bull = entry > ema200_now
+    trend_bear = entry < ema200_now
 
     vwap_cross_up = any(
-        closes[j] &gt; vwap_vals[j] and closes[j-1] &lt;= vwap_vals[j-1]
-        for j in range(sig-1, sig+2) if j &gt; 0 and j &lt; len(closes)
+        closes[j] > vwap_vals[j] and closes[j-1] <= vwap_vals[j-1]
+        for j in range(sig-1, sig+2) if j > 0 and j < len(closes)
     )
     vwap_cross_down = any(
-        closes[j] &lt; vwap_vals[j] and closes[j-1] &gt;= vwap_vals[j-1]
-        for j in range(sig-1, sig+2) if j &gt; 0 and j &lt; len(closes)
+        closes[j] < vwap_vals[j] and closes[j-1] >= vwap_vals[j-1]
+        for j in range(sig-1, sig+2) if j > 0 and j < len(closes)
     )
 
-    conf1_bull = closes[i-1] &gt; opens[i-1] and closes[i-1] &gt; vwap_vals[i-1]
-    conf2_bull = closes[i]   &gt; opens[i]   and closes[i]   &gt; vwap_now
-    conf1_bear = closes[i-1] &lt; opens[i-1] and closes[i-1] &lt; vwap_vals[i-1]
-    conf2_bear = closes[i]   &lt; opens[i]   and closes[i]   &lt; vwap_now
+    conf1_bull = closes[i-1] > opens[i-1] and closes[i-1] > vwap_vals[i-1]
+    conf2_bull = closes[i]   > opens[i]   and closes[i]   > vwap_now
+    conf1_bear = closes[i-1] < opens[i-1] and closes[i-1] < vwap_vals[i-1]
+    conf2_bear = closes[i]   < opens[i]   and closes[i]   < vwap_now
 
     bull_ok, bull_pt, bull_pool = sweep_recent(highs, lows, closes, i, bull=True)
     bear_ok, bear_pt, bear_pool = sweep_recent(highs, lows, closes, i, bull=False)
 
-    range_high = max(highs[i - RANGE_BOUNDARY_LEN:i]) if i &gt;= RANGE_BOUNDARY_LEN else max(highs[:i+1])
-    range_low  = min(lows[i - RANGE_BOUNDARY_LEN:i])  if i &gt;= RANGE_BOUNDARY_LEN else min(lows[:i+1])
-    near_range_low  = lows[i]  &lt;= range_low  * 1.002
-    near_range_high = highs[i] &gt;= range_high * 0.998
+    range_high = max(highs[i - RANGE_BOUNDARY_LEN:i]) if i >= RANGE_BOUNDARY_LEN else max(highs[:i+1])
+    range_low  = min(lows[i - RANGE_BOUNDARY_LEN:i])  if i >= RANGE_BOUNDARY_LEN else min(lows[:i+1])
+    near_range_low  = lows[i]  <= range_low  * 1.002
+    near_range_high = highs[i] >= range_high * 0.998
 
     long_signal  = False
     short_signal = False
 
     if mode == "TREND":
-        long_signal  = (vwap_cross_up and entry &gt; vwap_now and entry &gt; ema50_now
-                         and trend_bull and vol_ok and 40 &lt;= rsi_now &lt;= 65
+        long_signal  = (vwap_cross_up and entry > vwap_now and entry > ema50_now
+                         and trend_bull and vol_ok and 40 <= rsi_now <= 65
                          and conf1_bull and conf2_bull and bull_ok
-                         and adx_now &gt;= ADX_MIN)
-        short_signal = (vwap_cross_down and entry &lt; vwap_now and entry &lt; ema50_now
-                         and trend_bear and vol_ok and 35 &lt;= rsi_now &lt;= 60
+                         and adx_now >= ADX_MIN)
+        short_signal = (vwap_cross_down and entry < vwap_now and entry < ema50_now
+                         and trend_bear and vol_ok and 35 <= rsi_now <= 60
                          and conf1_bear and conf2_bear and bear_ok
-                         and adx_now &gt;= ADX_MIN)
+                         and adx_now >= ADX_MIN)
         rsi_low, rsi_high = (40, 65) if long_signal else (35, 60)
 
         # --- Multi-timeframe confirmation (TREND mode only) ---
@@ -1121,20 +1116,20 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
 
         # --- Exposure cap (TREND mode only) ---
         if (long_signal or short_signal) and EXPOSURE_CAP_ENABLED:
-            if long_signal and count_open_direction("BUY") &gt;= MAX_SAME_DIRECTION_TRADES:
+            if long_signal and count_open_direction("BUY") >= MAX_SAME_DIRECTION_TRADES:
                 print(f"[EXPOSURE SKIP] {symbol} long blocked - {MAX_SAME_DIRECTION_TRADES} same-direction cap reached")
                 long_signal = False
-            if short_signal and count_open_direction("SELL") &gt;= MAX_SAME_DIRECTION_TRADES:
+            if short_signal and count_open_direction("SELL") >= MAX_SAME_DIRECTION_TRADES:
                 print(f"[EXPOSURE SKIP] {symbol} short blocked - {MAX_SAME_DIRECTION_TRADES} same-direction cap reached")
                 short_signal = False
 
         # --- Funding rate check (TREND mode only, only queried if a signal would otherwise fire) ---
         if (long_signal or short_signal) and FUNDING_FILTER_ENABLED:
             funding_val = get_funding_rate(symbol)
-            if long_signal and funding_val &gt; FUNDING_RATE_EXTREME_PCT:
+            if long_signal and funding_val > FUNDING_RATE_EXTREME_PCT:
                 print(f"[FUNDING SKIP] {symbol} long blocked - funding {funding_val:.3f}% (crowded long)")
                 long_signal = False
-            if short_signal and funding_val &lt; -FUNDING_RATE_EXTREME_PCT:
+            if short_signal and funding_val < -FUNDING_RATE_EXTREME_PCT:
                 print(f"[FUNDING SKIP] {symbol} short blocked - funding {funding_val:.3f}% (crowded short)")
                 short_signal = False
     else:  # RANGE mode - fade off the sweep at the boundary (unchanged)
@@ -1145,15 +1140,15 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
     # --- BTC-wide uncertainty check - downsizes (never blocks outright) TREND-mode alt
     # entries when BTC itself is in an elevated-volatility/uncertain regime. ---
     btc_ratio = get_btc_regime() if BTC_REGIME_FILTER_ENABLED else 1.0
-    btc_uncertain = BTC_REGIME_FILTER_ENABLED and mode == "TREND" and btc_ratio &gt;= BTC_UNCERTAIN_RATIO
+    btc_uncertain = BTC_REGIME_FILTER_ENABLED and mode == "TREND" and btc_ratio >= BTC_UNCERTAIN_RATIO
 
     if long_signal:
         sig_id = (symbol, "BUY", int(confirmed[sig]["time"]))
         if sig_id not in tight_alerted:
             sl   = bull_pt - atr_now * SL_ATR_BUFFER_MULT
             risk = entry - sl
-            risk_pct = (risk / entry * 100) if entry &gt; 0 else 0
-            if risk &lt;= 0 or risk_pct &lt; MIN_RISK_PCT or risk_pct &gt; MAX_RISK_PCT:
+            risk_pct = (risk / entry * 100) if entry > 0 else 0
+            if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
                 return ratio
             sweep_depth_pct = abs(bull_pool - bull_pt) / bull_pool * 100 if bull_pool else SWEEP_MIN_PCT
             score  = confidence_score(ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, sweep_depth_pct)
@@ -1190,8 +1185,8 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
         if sig_id not in tight_alerted:
             sl   = bear_pt + atr_now * SL_ATR_BUFFER_MULT
             risk = sl - entry
-            risk_pct = (risk / entry * 100) if entry &gt; 0 else 0
-            if risk &lt;= 0 or risk_pct &lt; MIN_RISK_PCT or risk_pct &gt; MAX_RISK_PCT:
+            risk_pct = (risk / entry * 100) if entry > 0 else 0
+            if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
                 return ratio
             sweep_depth_pct = abs(bear_pt - bear_pool) / bear_pool * 100 if bear_pool else SWEEP_MIN_PCT
             score  = confidence_score(ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, sweep_depth_pct)
@@ -1229,7 +1224,7 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
 def check_symbol_tight(symbol):
     try:
         candles = get_candles(symbol, limit=350, interval="15m")
-        if len(candles) &lt; 320:
+        if len(candles) < 320:
             return None
         confirmed = candles[:-1]
         closes = [cl(c) for c in confirmed]
@@ -1255,7 +1250,7 @@ def check_fast(symbol):
     try:
         candles = get_candles(symbol, limit=100, interval=FAST_TIMEFRAME)
         min_needed = max(FAST_CONSOL_LOOKBACK + FAST_VOL_LB + FAST_ATR_LEN + 5, FAST_EXTENSION_LOOKBACK + 5)
-        if len(candles) &lt; min_needed:
+        if len(candles) < min_needed:
             return
 
         confirmed = candles[:-1]
@@ -1266,19 +1261,19 @@ def check_fast(symbol):
         vols   = [v(c)  for c in confirmed]
 
         i = len(confirmed) - 1
-        if i &lt; min_needed:
+        if i < min_needed:
             return
 
         entry = closes[i]
-        if entry &lt; MIN_PRICE:
+        if entry < MIN_PRICE:
             return
 
         atr_vals = atr_series(highs, lows, closes, FAST_ATR_LEN)
         atr_now  = atr_vals[i]
 
         ext_move  = abs(closes[i] - closes[i - FAST_EXTENSION_LOOKBACK])
-        extension = ext_move / atr_now if atr_now &gt; 0 else 0
-        is_extended = extension &gt; FAST_EXTENSION_LIMIT
+        extension = ext_move / atr_now if atr_now > 0 else 0
+        is_extended = extension > FAST_EXTENSION_LIMIT
 
         # Box computed strictly from the window BEFORE the current candle - no
         # self-reference, and (per updated design) no retest wait needed either.
@@ -1286,19 +1281,19 @@ def check_fast(symbol):
         box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
 
         avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
-        ratio   = vols[i] / avg_vol if avg_vol &gt; 0 else 0
-        vol_ok  = ratio &gt;= FAST_VOL_MULT
+        ratio   = vols[i] / avg_vol if avg_vol > 0 else 0
+        vol_ok  = ratio >= FAST_VOL_MULT
 
         candle_range = highs[i] - lows[i]
-        bull_close_strength = (closes[i] - lows[i]) / candle_range if candle_range &gt; 0 else 0
-        bear_close_strength = (highs[i] - closes[i]) / candle_range if candle_range &gt; 0 else 0
+        bull_close_strength = (closes[i] - lows[i]) / candle_range if candle_range > 0 else 0
+        bear_close_strength = (highs[i] - closes[i]) / candle_range if candle_range > 0 else 0
 
         # Same-candle close-position filter, replacing the old 1-candle retest-confirm
         # delay - no waiting required, just requires a decisive (not wicky) close.
-        bull_breakout = (closes[i] &gt; box_high + atr_now * FAST_BREAKOUT_ATR_MULT
-                         and bull_close_strength &gt;= FAST_CLOSE_POSITION_MIN)
-        bear_breakout = (closes[i] &lt; box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
-                         and bear_close_strength &gt;= FAST_CLOSE_POSITION_MIN)
+        bull_breakout = (closes[i] > box_high + atr_now * FAST_BREAKOUT_ATR_MULT
+                         and bull_close_strength >= FAST_CLOSE_POSITION_MIN)
+        bear_breakout = (closes[i] < box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
+                         and bear_close_strength >= FAST_CLOSE_POSITION_MIN)
 
         long_signal  = bull_breakout and vol_ok
         short_signal = bear_breakout and vol_ok
@@ -1321,7 +1316,7 @@ def check_fast(symbol):
             lev        = get_fast_leverage(symbol)
             sl_price   = round(box_low - atr_now * SL_ATR_BUFFER_MULT, 6)
             risk       = entry - sl_price
-            if risk &lt;= 0:
+            if risk <= 0:
                 return
             tp1_price  = round(entry + risk * FAST_TP1_RR, 6)
             risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
@@ -1347,7 +1342,7 @@ def check_fast(symbol):
             lev        = get_fast_leverage(symbol)
             sl_price   = round(box_high + atr_now * SL_ATR_BUFFER_MULT, 6)
             risk       = sl_price - entry
-            if risk &lt;= 0:
+            if risk <= 0:
                 return
             tp1_price  = round(entry - risk * FAST_TP1_RR, 6)
             risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
@@ -1400,7 +1395,7 @@ def handle_telegram_commands():
                     t = "ON" if tight_auto_trade_enabled else "OFF"
                     f = "ON" if fast_auto_trade_enabled  else "OFF"
                     cd = ""
-                    if tight_cooldown_until and datetime.now(timezone.utc) &lt; tight_cooldown_until:
+                    if tight_cooldown_until and datetime.now(timezone.utc) < tight_cooldown_until:
                         mins_left = int((tight_cooldown_until - datetime.now(timezone.utc)).total_seconds() / 60)
                         cd = f"\nTight 2 cooldown: {mins_left} min left"
                     send_tg("Tight 2: " + t + "\nFast Signal: " + f + cd)
@@ -1459,8 +1454,8 @@ def monitor_loop():
             # Proactive volatility-aware cooldown - checked once per cycle, not per symbol.
             if BTC_REGIME_FILTER_ENABLED:
                 btc_ratio_now = get_btc_regime()
-                already_cooling = tight_cooldown_until and datetime.now(timezone.utc) &lt; tight_cooldown_until
-                if btc_ratio_now &gt;= VOL_COOLDOWN_ATR_RATIO and not already_cooling:
+                already_cooling = tight_cooldown_until and datetime.now(timezone.utc) < tight_cooldown_until
+                if btc_ratio_now >= VOL_COOLDOWN_ATR_RATIO and not already_cooling:
                     tight_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
                     send_journal(
                         f"Tight 2 volatility cooldown triggered (BTC ATR ratio {btc_ratio_now:.2f}) - "
@@ -1498,17 +1493,3 @@ if __name__ == "__main__":
     Thread(target=trailing_loop,            daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-</textarea>
-</div>
-<script>
-document.getElementById('copybtn').addEventListener('click', function() {
-  var box = document.getElementById('codebox');
-  box.select();
-  navigator.clipboard.writeText(box.value).then(function(){
-    var btn = document.getElementById('copybtn');
-    var orig = btn.innerHTML;
-    btn.innerHTML = 'Copied!';
-    setTimeout(function(){ btn.innerHTML = orig; }, 1500);
-  });
-});
-</script>

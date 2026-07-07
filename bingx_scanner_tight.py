@@ -20,72 +20,103 @@ BASE_URL = "https://open-api.bingx.com"
 TIMEFRAME          = "15m"
 RSI_LEN            = 14
 VOLUME_LOOKBACK    = 100
-VOLUME_MULTIPLIER  = 2
+VOLUME_MULTIPLIER  = 2                          # UNCHANGED - user explicitly wants this kept
 EMA50_LEN          = 50
 EMA200_LEN         = 200
 ADX_LEN            = 14
-ADX_MIN            = 20
+ADX_MIN            = int(os.environ.get("TIGHT_ADX_MIN", 26))     # raised from 20 - fewer false-trend entries on squeeze-driven spikes. TBD/tunable.
 SWING_LOOKBACK     = 10
 MIN_PRICE          = 0.001
 MIN_RISK_PCT       = 0.1
-MAX_RISK_PCT       = 3.0        # reject entries whose SL distance exceeds this % of entry (blown-out sweep protection)
-TIGHT_MIN_QUOTE_VOL = float(os.environ.get("TIGHT_MIN_QUOTE_VOL", 1_000_000))  # 24h liquidity floor for Tight 2 universe
-TIGHT_MAX_SYMBOLS   = 400       # safety cap so a slow API day doesn't blow the 60s scan loop
+MAX_RISK_PCT       = float(os.environ.get("TIGHT_MAX_RISK_PCT", 1.8))   # tightened from 3.0 - keeps fixed-$ sizing from producing oversized qty on wide sweeps
+TIGHT_MIN_QUOTE_VOL = float(os.environ.get("TIGHT_MIN_QUOTE_VOL", 1_000_000))
+TIGHT_MAX_SYMBOLS   = 400
 
 # Liquidity sweep
 SWEEP_LOOKBACK     = 15
 SWEEP_MIN_PCT      = 0.05
-SWEEP_WINDOW       = 3          # bars a sweep stays "valid" for triggering entry
+SWEEP_WINDOW       = 3
 
-# Adaptive regime detection (ATR% ratio vs own baseline, with hysteresis)
+# Adaptive regime detection
 ATR_LEN            = 14
 ATR_BASE_LEN       = 50
-RANGE_ENTER_RATIO  = 0.6        # atrRatio <= this  -> RANGE mode
-TREND_ENTER_RATIO  = 1.0        # atrRatio >= this  -> TREND mode
-RANGE_BOUNDARY_LEN = 20         # lookback used for range-mode fade boundaries
+RANGE_ENTER_RATIO  = 0.6
+TREND_ENTER_RATIO  = 1.0
+RANGE_BOUNDARY_LEN = 20
 
-# Dynamic SL / TP
+# Dynamic SL / entry RR reference (TP2 removed - see TIGHT_TRAIL_* below)
 SL_ATR_BUFFER_MULT = 0.3
 RR_TP1             = 2.0
-RR_TP2             = 4.0
 RANGE_RR           = 2.0
+
+# Fixed-$ risk sizing (TIGHT 2) - replaces margin-based sizing, mirrors Fast Signal's model
+TIGHT_RISK_USDT    = float(os.environ.get("TIGHT_RISK_USDT", 5.0))
+
+# Trailing (replaces TP2 entirely) - after TP1 fills: breakeven immediately, then trail uncapped
+TIGHT_TRAIL_PCT    = float(os.environ.get("TIGHT_TRAIL_PCT", 2.5))   # TBD/tunable
 
 # Cooldown after consecutive losses
 LOSS_STREAK_N      = 3
-COOLDOWN_MINUTES   = 300        # ~20 x 15m candles
+COOLDOWN_MINUTES   = 300
 
-# Efficiency Ratio coin-quality pre-filter (skips choppy/grinding coins)
+# Efficiency Ratio coin-quality pre-filter
 ER_LOOKBACK        = 50
-ER_MIN             = 0.25
+ER_MIN             = float(os.environ.get("TIGHT_ER_MIN", 0.38))   # raised from 0.25 - filters choppier coins. TBD/tunable.
 
-# Confidence-based position sizing
+# Confidence-based position sizing (used as a size-tier multiplier alongside fixed-$ risk)
 CONF_WEAK_MIN      = 40
 CONF_GOOD_MIN      = 60
 CONF_STRONG_MIN    = 80
-AMOUNT_WEAK        = 15.0
-AMOUNT_NORMAL      = 20.0
-AMOUNT_STRONG      = 30.0
+TIER_WEAK_MULT     = 0.5
+TIER_NORMAL_MULT   = 1.0
+TIER_STRONG_MULT   = 1.5
+
+# ---- New market-regime filters (all independently toggleable - added 2026-07-08) ----
+BTC_SYMBOL                 = "BTC-USDT"
+BTC_REGIME_FILTER_ENABLED  = os.environ.get("BTC_REGIME_FILTER_ENABLED", "true").lower() == "true"
+BTC_UNCERTAIN_RATIO        = float(os.environ.get("BTC_UNCERTAIN_RATIO", 1.5))   # BTC's own ATR-ratio above this = elevated uncertainty -> halve alt size
+VOL_COOLDOWN_ATR_RATIO     = float(os.environ.get("VOL_COOLDOWN_ATR_RATIO", 2.0))  # BTC ATR-ratio above this -> proactive market-wide cooldown
+
+MTF_FILTER_ENABLED         = os.environ.get("MTF_FILTER_ENABLED", "true").lower() == "true"
+MTF_INTERVAL               = os.environ.get("MTF_INTERVAL", "1h")
+
+FUNDING_FILTER_ENABLED     = os.environ.get("FUNDING_FILTER_ENABLED", "true").lower() == "true"
+FUNDING_RATE_EXTREME_PCT   = float(os.environ.get("FUNDING_RATE_EXTREME_PCT", 0.05))   # % per interval considered "crowded"
+
+EXPOSURE_CAP_ENABLED       = os.environ.get("EXPOSURE_CAP_ENABLED", "true").lower() == "true"
+MAX_SAME_DIRECTION_TRADES  = int(os.environ.get("MAX_SAME_DIRECTION_TRADES", 4))
 
 # ==================== FAST SIGNAL CONFIG ====================
 FAST_TIMEFRAME          = "3m"
-FAST_MIN_QUOTE_VOL      = float(os.environ.get("FAST_MIN_QUOTE_VOL", 2_000_000))  # 24h liquidity filter
-FAST_MAX_SYMBOLS        = 150     # safety cap per scan cycle
-FAST_CONSOL_LOOKBACK    = 20      # bars that define the pre-breakout box
-FAST_BREAKOUT_ATR_MULT  = 0.3     # breakout must clear the box by this many ATR
-FAST_VOL_MULT           = 3.0     # volume spike required on the breakout candle itself
+FAST_MIN_QUOTE_VOL      = float(os.environ.get("FAST_MIN_QUOTE_VOL", 2_000_000))
+FAST_MAX_SYMBOLS        = 150
+FAST_CONSOL_LOOKBACK    = 20
+FAST_BREAKOUT_ATR_MULT  = 0.3
+FAST_VOL_MULT           = 3.0                    # UNCHANGED
 FAST_VOL_LB             = 20
 FAST_ATR_LEN            = 14
-FAST_SL_ATR_MULT        = 1.2     # ATR buffer added beyond the box edge for the structural SL (not used standalone anymore)
-FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 1.5))   # fixed $ risked per full-size trade, independent of leverage
-FAST_EXCLUDE_TOP_N       = 75      # skip the top-N coins by 24h quote volume (majors) - Tight 2 already covers these, Fast wants small/mid-cap gainers
-FAST_EXTENSION_LOOKBACK  = 20      # bars (on the 3m series) used to measure how far a coin has already run
-FAST_EXTENSION_LIMIT     = 4.0     # if |move over that lookback| > this many ATRs, the move is "already extended" -> half size, never blocked outright
-FAST_EXTENSION_MULT      = 0.5     # size multiplier applied when a breakout is judged already-extended
-FAST_MARGIN_CAP_MULT     = 5.0     # safety cap: risk-based qty can't blow past this x the old flat $20 margin (loosened - this is only meant to catch outliers, not bind on small-cap coins)
-FAST_TP1_RR             = 2.0
-FAST_TRAIL_PCT          = float(os.environ.get("FAST_TRAIL_PCT", 3.0))   # widened from 1.5
-FAST_TRAIL_ACTIVATE_RR  = 1.0     # trailing only starts after price moves 1R in favor
-FAST_RETEST_CONFIRM     = True    # 1-candle hold confirmation ON — reduces fakeouts, adds ~1x3min delay
+FAST_SL_ATR_MULT        = 1.2
+FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 1.5))   # UNCHANGED - already correct model, used as the reference for Tight 2's fix
+FAST_EXCLUDE_TOP_N       = 75
+FAST_EXTENSION_LOOKBACK  = 20
+FAST_EXTENSION_LIMIT     = 4.0
+FAST_EXTENSION_MULT      = 0.5
+FAST_MARGIN_CAP_MULT     = 5.0
+FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 0.8))   # smaller/more aggressive first target (was 2.0) - locks profit fast on pump-and-fade moves. TBD/tunable.
+FAST_TRAIL_ACTIVATE_RR  = 1.0
+
+# Retest-confirm REMOVED (was adding a 1-candle delay that hurt entry timing on fast-moving
+# small caps). Replaced with a same-candle close-position filter - no waiting required.
+FAST_CLOSE_POSITION_MIN = float(os.environ.get("FAST_CLOSE_POSITION_MIN", 0.7))   # breakout candle must close in the outer 30% of its own range
+
+# ATR-adaptive trailing (replaces fixed FAST_TRAIL_PCT) - a fixed % trail can't keep up with
+# the intra-candle jumps these coins produce.
+FAST_TRAIL_ATR_MULT     = float(os.environ.get("FAST_TRAIL_ATR_MULT", 1.5))    # TBD/tunable
+FAST_TRAIL_PCT_FALLBACK = float(os.environ.get("FAST_TRAIL_PCT_FALLBACK", 3.0))  # only used if ATR unavailable
+
+# Max hold duration (time-boxed exit) - pump-and-fade moves die fast; force-close a trade
+# still open past this age regardless of price action.
+FAST_MAX_HOLD_SECONDS   = int(os.environ.get("FAST_MAX_HOLD_SECONDS", 600))   # 10 min default. TBD/tunable.
 
 # ==================== GLOBAL STATE ====================
 tight_auto_trade_enabled = False
@@ -99,9 +130,12 @@ fast_alerted       = set()
 daily_trades       = []
 last_summary_date  = None
 
-regime_state        = {}   # symbol -> "TREND" / "RANGE", persisted for hysteresis
-tight_loss_streak   = 0
-tight_cooldown_until = None   # datetime or None
+regime_state         = {}
+tight_loss_streak    = 0
+tight_cooldown_until = None
+
+btc_regime_cache = {"ratio": 1.0, "ts": 0.0}
+mtf_cache        = {}
 
 
 # ==================== CORE API HELPERS ====================
@@ -131,10 +165,6 @@ def get_futures_symbols():
 
 
 def get_liquid_symbols(symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX_SYMBOLS, exclude_top_n=0):
-    """Filters by 24h liquidity. exclude_top_n drops that many of the most-liquid
-    coins first (majors like BTC/ETH/SOL structurally don't produce the small/mid-cap
-    gainer breakouts Fast Signal is looking for - Tight 2 already covers them).
-    max_n=None returns the full remaining eligible list with no truncation."""
     try:
         url = BASE_URL + "/openApi/swap/v2/quote/ticker"
         r = requests.get(url, timeout=10).json()
@@ -183,6 +213,18 @@ def get_current_price(symbol):
         return float(r.get("data", {}).get("price", 0))
     except Exception:
         return 0
+
+
+def get_funding_rate(symbol):
+    """NOTE: endpoint/field names not yet verified against current BingX docs in this
+    conversation - verify before relying on this live, same caveat as cancel_order()."""
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/premiumIndex"
+        r = requests.get(url, params={"symbol": symbol}, timeout=5).json()
+        return float(r.get("data", {}).get("lastFundingRate", 0)) * 100
+    except Exception as e:
+        print(f"[FUNDING ERROR] {symbol}: {e}")
+        return 0.0
 
 
 # ==================== INDICATORS ====================
@@ -253,9 +295,6 @@ def atr_series(highs, lows, closes, period=14):
 
 
 def vwap_series(candles):
-    """Resets at each UTC calendar day boundary so this behaves as a real
-    session/daily VWAP instead of an anchored-forever average that goes
-    flat after a few hundred candles."""
     cum_tp_vol = 0.0
     cum_vol    = 0.0
     last_day   = None
@@ -297,7 +336,6 @@ def rsi_series(closes, period=14):
 
 
 def efficiency_ratio(closes, period=ER_LOOKBACK):
-    """1.0 = price moved in a straight line (clean trend). ~0 = pure chop."""
     if len(closes) < period + 1:
         return 0.0
     net_change = abs(closes[-1] - closes[-1 - period])
@@ -327,7 +365,6 @@ def detect_bear_sweep(highs, closes, idx, lookback=SWEEP_LOOKBACK, min_pct=SWEEP
 
 
 def sweep_recent(highs, lows, closes, idx, bull=True, window=SWEEP_WINDOW):
-    """Looks back `window` bars from idx for a sweep event (not just same-bar)."""
     floor = max(idx - window, 0)
     for j in range(idx, floor - 1, -1):
         if bull:
@@ -340,7 +377,9 @@ def sweep_recent(highs, lows, closes, idx, bull=True, window=SWEEP_WINDOW):
 
 
 # ==================== REGIME DETECTION ====================
-def update_regime(symbol, highs, lows, closes, atr_vals):
+def compute_atr_ratio(highs, lows, closes, atr_vals):
+    """Shared helper: current ATR% vs its own baseline. Used for both per-symbol regime
+    (TREND/RANGE) and the BTC-wide uncertainty/cooldown checks."""
     atr_pct_series = []
     for i in range(len(closes)):
         atr_pct_series.append((atr_vals[i] / closes[i] * 100) if closes[i] > 0 else 0.0)
@@ -348,7 +387,11 @@ def update_regime(symbol, highs, lows, closes, atr_vals):
     baseline = sum(atr_pct_series[-base_len:]) / base_len if base_len > 0 else 1.0
     atr_pct_now = atr_pct_series[-1]
     ratio = atr_pct_now / baseline if baseline > 0 else 1.0
+    return ratio
 
+
+def update_regime(symbol, highs, lows, closes, atr_vals):
+    ratio = compute_atr_ratio(highs, lows, closes, atr_vals)
     prev = regime_state.get(symbol, "TREND")
     if ratio <= RANGE_ENTER_RATIO:
         regime_state[symbol] = "RANGE"
@@ -357,6 +400,54 @@ def update_regime(symbol, highs, lows, closes, atr_vals):
     else:
         regime_state[symbol] = prev
     return regime_state[symbol], ratio
+
+
+def get_btc_regime():
+    """Cached (60s) BTC ATR-ratio, used to gate/downsize alt entries when BTC itself is
+    in an elevated-uncertainty regime, and to trigger a proactive volatility cooldown."""
+    now = time.time()
+    if now - btc_regime_cache["ts"] < 60:
+        return btc_regime_cache["ratio"]
+    try:
+        candles = get_candles(BTC_SYMBOL, limit=100, interval="15m")
+        if len(candles) < 60:
+            return btc_regime_cache["ratio"]
+        closes = [cl(c) for c in candles]
+        highs  = [h(c) for c in candles]
+        lows   = [l(c) for c in candles]
+        atr_vals = atr_series(highs, lows, closes, ATR_LEN)
+        ratio = compute_atr_ratio(highs, lows, closes, atr_vals)
+        btc_regime_cache["ratio"] = ratio
+        btc_regime_cache["ts"] = now
+        return ratio
+    except Exception as e:
+        print(f"[BTC REGIME ERROR] {e}")
+        return btc_regime_cache["ratio"]
+
+
+def get_mtf_trend(symbol):
+    """Cached (5 min) higher-timeframe (MTF_INTERVAL) EMA200 trend direction, used to
+    require the 15m Tight 2 signal direction agrees with the bigger picture."""
+    now = time.time()
+    cached = mtf_cache.get(symbol)
+    if cached and now - cached["ts"] < 300:
+        return cached["trend"]
+    try:
+        candles = get_candles(symbol, limit=250, interval=MTF_INTERVAL)
+        if len(candles) < 210:
+            return cached["trend"] if cached else None
+        closes = [cl(c) for c in candles]
+        ema200 = ema_series(closes, EMA200_LEN)
+        trend = "UP" if closes[-1] > ema200[-1] else "DOWN"
+        mtf_cache[symbol] = {"trend": trend, "ts": now}
+        return trend
+    except Exception as e:
+        print(f"[MTF ERROR] {symbol}: {e}")
+        return cached["trend"] if cached else None
+
+
+def count_open_direction(side):
+    return sum(1 for t in tight_open_trades.values() if t["side"] == side)
 
 
 # ==================== CONFIDENCE SCORING ====================
@@ -389,14 +480,14 @@ def confidence_score(vol_ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, swe
     return min(100, score)
 
 
-def amount_for_score(score):
+def tier_mult_for_score(score):
     if score < CONF_WEAK_MIN:
         return None
     if score < CONF_GOOD_MIN:
-        return AMOUNT_WEAK
+        return TIER_WEAK_MULT
     if score < CONF_STRONG_MIN:
-        return AMOUNT_NORMAL
-    return AMOUNT_STRONG
+        return TIER_NORMAL_MULT
+    return TIER_STRONG_MULT
 
 
 # ==================== TELEGRAM ====================
@@ -411,12 +502,39 @@ def send_journal(msg):
         send_tg(msg, chat_id=TG_JOURNAL_ID)
 
 
+def journal_closed_trade(trade):
+    """Single consolidated journal entry - only called for trades that were actually
+    placed (auto-trade ON, real order id) and have now fully closed. Replaces the old
+    per-signal 'New Trade' and per-leg 'TP1 hit' journal messages."""
+    sign = "+" if trade.get("pnl", 0) > 0 else ""
+    send_journal(
+        "Trade Closed [" + trade.get("label", "?") + "] - " + trade["symbol"] + "\n"
+        "------------------------------\n"
+        "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
+        "Result: " + trade.get("result", "?") + "\n"
+        "PnL   : " + sign + str(trade.get("pnl", 0)) + " USDT\n"
+        "------------------------------\nNiti Journal"
+    )
+
+
+def _update_loss_streak(total_pnl):
+    global tight_loss_streak, tight_cooldown_until
+    if total_pnl < 0:
+        tight_loss_streak += 1
+    else:
+        tight_loss_streak = 0
+    if tight_loss_streak >= LOSS_STREAK_N:
+        tight_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
+        tight_loss_streak = 0
+        send_journal(f"Tight 2 cooldown triggered - pausing new entries for {COOLDOWN_MINUTES} minutes\nNiti Journal")
+
+
 # ==================== LEVERAGE ====================
 def get_fast_leverage(symbol):
     max_lev = symbol_max_lev.get(symbol, 20)
     calc = int(max_lev * 0.20)
-    lev = max(calc, 10)          # minimum 10x
-    return min(lev, max_lev)     # never exceed the symbol's own exchange max leverage
+    lev = max(calc, 10)
+    return min(lev, max_lev)
 
 
 def set_leverage_api(symbol, lev):
@@ -441,10 +559,15 @@ def place_market_order(symbol, side, qty, pos_side):
 
 
 def place_sl_order(symbol, close_side, pos_side, sl_price, qty):
+    """NOTE: reduceOnly added as a safety net against a dangling order re-opening an
+    unintended position after the original position is already closed - verify this
+    parameter name/behavior against current BingX hedge-mode docs before relying on it
+    live, same caveat as cancel_order()."""
     url = BASE_URL + "/openApi/swap/v2/trade/order"
     params = build_signed_params({
         "symbol": symbol, "side": close_side, "positionSide": pos_side,
         "type": "STOP_MARKET", "stopPrice": round(sl_price, 6), "quantity": qty,
+        "reduceOnly": "true",
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     print(f"[SL] {symbol}: {r}")
@@ -452,10 +575,12 @@ def place_sl_order(symbol, close_side, pos_side, sl_price, qty):
 
 
 def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
+    """NOTE: reduceOnly added - see place_sl_order() comment above."""
     url = BASE_URL + "/openApi/swap/v2/trade/order"
     params = build_signed_params({
         "symbol": symbol, "side": close_side, "positionSide": pos_side,
         "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp_price, 6), "quantity": qty,
+        "reduceOnly": "true",
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     return r.get("data", {}).get("order", {}).get("orderId", "N/A")
@@ -484,63 +609,104 @@ def close_fast_position(symbol, reason=""):
         remaining  = trade.get("remaining_qty", 0)
         if remaining > 0 and fast_auto_trade_enabled:
             place_market_order(symbol, close_side, remaining, pos_side)
+        # Cancel BOTH counterpart resting orders - previously only sl_id was cancelled here,
+        # leaving a dangling tp1_id order behind if TP1 hadn't filled yet.
         if trade.get("sl_id"):
-            cancel_order(symbol, trade["sl_id"])   # avoid a dangling SL order after this manual/trail/opposite close
+            cancel_order(symbol, trade["sl_id"])
+        if not trade.get("tp1_filled") and trade.get("tp1_id"):
+            cancel_order(symbol, trade["tp1_id"])
         current = get_current_price(symbol)
         if trade["side"] == "BUY":
             leg_pnl = (current - trade["entry"]) * remaining
         else:
             leg_pnl = (trade["entry"] - current) * remaining
         total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
-        sign = "+" if total_pnl > 0 else ""
-        send_journal(
-            "Trade Closed [Fast " + reason + "] - " + symbol + "\n"
-            "------------------------------\n"
-            "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
-            "Exit  : " + str(round(current, 6)) + "\n"
-            "PnL   : " + sign + str(total_pnl) + " USDT\n"
-            "------------------------------\nNiti Journal"
-        )
+        trade["pnl"]    = total_pnl
+        trade["result"] = reason
+        trade["label"]  = "Fast"
+        trade["symbol"] = symbol
+        journal_closed_trade(trade)
         del fast_open_trades[symbol]
         print(f"[FAST CLOSE] {symbol} {reason}")
     except Exception as e:
         print(f"[FAST CLOSE ERROR] {symbol}: {e}")
 
 
-def place_tight_order(symbol, side, entry, sl, tp1, tp2, trade_amount, mode):
+def close_tight_position(oid, reason=""):
+    """Closes the trailing runner leg (post-TP1, TREND mode) - market-closes the
+    remaining half_qty, cancels the resting breakeven SL, journals the consolidated result."""
+    trade = tight_open_trades.get(oid)
+    if not trade:
+        return
+    try:
+        symbol     = trade["symbol"]
+        pos_side   = trade["pos_side"]
+        close_side = trade["close_side"]
+        remaining  = trade.get("half_qty", 0)
+        entry      = trade["entry"]
+        if remaining > 0 and tight_auto_trade_enabled:
+            place_market_order(symbol, close_side, remaining, pos_side)
+        if trade.get("sl_id"):
+            cancel_order(symbol, trade["sl_id"])
+        current = get_current_price(symbol)
+        if trade["side"] == "BUY":
+            leg_pnl = (current - entry) * remaining
+        else:
+            leg_pnl = (entry - current) * remaining
+        total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
+        trade["pnl"]    = total_pnl
+        trade["result"] = reason
+        trade["label"]  = "Tight"
+        daily_trades.append(trade)
+        _update_loss_streak(total_pnl)
+        journal_closed_trade(trade)
+        tight_open_trades.pop(oid, None)
+        print(f"[TIGHT CLOSE] {symbol} {reason}")
+    except Exception as e:
+        print(f"[TIGHT CLOSE ERROR] {oid}: {e}")
+
+
+def place_tight_order(symbol, side, entry, sl, tp1, trade_amount_mult, mode):
+    """trade_amount_mult is the confidence-tier size multiplier (0.5 / 1.0 / 1.5);
+    actual position size now comes from fixed $ risk (TIGHT_RISK_USDT), not margin."""
     try:
         set_leverage_api(symbol, LEVERAGE)
-        precision = symbol_precision.get(symbol, 4)
-        total_qty = round(trade_amount * LEVERAGE / entry, precision)
+        precision   = symbol_precision.get(symbol, 4)
+        risk_dist   = abs(entry - sl)
+        if risk_dist <= 0:
+            return None
+        risk_usdt   = TIGHT_RISK_USDT * trade_amount_mult
+        total_qty   = round(risk_usdt / risk_dist, precision)
         if total_qty <= 0:
             return None
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
         order_id = place_market_order(symbol, side, total_qty, pos_side)
-        print(f"[TIGHT ORDER] {symbol} {side}: {order_id}")
+        print(f"[TIGHT ORDER] {symbol} {side} qty={total_qty} risk=${round(risk_usdt,2)}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
             sl_id = place_sl_order(symbol, close_side, pos_side, sl, total_qty)
-            if mode == "TREND" and tp2 is not None:
+            if mode == "TREND":
                 half_qty = round(total_qty / 2, precision)
                 tp1_id = place_tp_order(symbol, close_side, pos_side, tp1, half_qty)
-                tp2_id = place_tp_order(symbol, close_side, pos_side, tp2, half_qty)
                 tight_open_trades[str(order_id)] = {
                     "symbol": symbol, "side": side, "entry": entry, "mode": mode,
-                    "sl": sl, "tp1": tp1, "tp2": tp2, "qty": total_qty, "half_qty": half_qty,
-                    "sl_id": sl_id, "tp1_id": tp1_id, "tp2_id": tp2_id,
+                    "sl": sl, "tp1": tp1, "qty": total_qty, "half_qty": half_qty,
+                    "sl_id": sl_id, "tp1_id": tp1_id,
                     "close_side": close_side, "pos_side": pos_side,
-                    "breakeven_done": False,
+                    "breakeven_done": False, "trailing_active": False,
+                    "partial_pnl": 0.0,
                     "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
                 }
-            else:
+            else:  # RANGE mode - single target, full qty, unchanged behavior
                 tp1_id = place_tp_order(symbol, close_side, pos_side, tp1, total_qty)
                 tight_open_trades[str(order_id)] = {
                     "symbol": symbol, "side": side, "entry": entry, "mode": mode,
-                    "sl": sl, "tp1": tp1, "tp2": None, "qty": total_qty, "half_qty": total_qty,
-                    "sl_id": sl_id, "tp1_id": tp1_id, "tp2_id": None,
+                    "sl": sl, "tp1": tp1, "qty": total_qty, "half_qty": total_qty,
+                    "sl_id": sl_id, "tp1_id": tp1_id,
                     "close_side": close_side, "pos_side": pos_side,
-                    "breakeven_done": True,   # single-target range trade, no breakeven step needed
+                    "breakeven_done": True, "trailing_active": False,
+                    "partial_pnl": 0.0,
                     "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
                 }
         return order_id
@@ -549,7 +715,7 @@ def place_tight_order(symbol, side, entry, sl, tp1, tp2, trade_amount, mode):
         return None
 
 
-def place_fast_order(symbol, side, entry, sl_price, tp1_price, risk_usdt=FAST_RISK_USDT):
+def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usdt=FAST_RISK_USDT):
     try:
         lev       = get_fast_leverage(symbol)
         set_leverage_api(symbol, lev)
@@ -558,11 +724,6 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, risk_usdt=FAST_RI
         if risk_dist <= 0:
             return None
 
-        # Position size comes from the fixed $ risk divided by the SL distance -
-        # NOT from leverage. Leverage only decides how much margin that size ties
-        # up (capital efficiency); it no longer changes how many dollars are at
-        # stake if the SL is hit. This is what makes every trade's loss magnitude
-        # consistent regardless of which coin/leverage it happened to get.
         risk_qty      = risk_usdt / risk_dist
         margin_cap_qty = (FAST_TRADE_AMOUNT * FAST_MARGIN_CAP_MULT * lev) / entry
         total_qty     = round(min(risk_qty, margin_cap_qty), precision)
@@ -584,6 +745,7 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, risk_usdt=FAST_RI
                 "sl_pct": sl_pct, "close_side": close_side, "pos_side": pos_side,
                 "total_qty": total_qty, "remaining_qty": total_qty, "tp1_filled": False, "partial_pnl": 0.0,
                 "trail_price": entry, "activated": False, "order_id": order_id,
+                "atr_at_entry": atr_now, "opened_ts": time.time(),
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
@@ -593,9 +755,6 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, risk_usdt=FAST_RI
 
 
 def track_fast_trades():
-    """Fast Signal previously had no polling at all for its resting SL/TP1 orders -
-    if either filled naturally on the exchange, the bot never found out, kept the
-    symbol 'stuck' as open, and never journaled the real outcome. This closes that gap."""
     for symbol in list(fast_open_trades.keys()):
         try:
             trade = fast_open_trades[symbol]
@@ -609,9 +768,6 @@ def track_fast_trades():
                     trade["remaining_qty"] = trade["total_qty"] - half_qty
                     trade["tp1_filled"]    = True
 
-                    # Move the resting exchange SL to breakeven for the remaining half now that
-                    # TP1 has actually filled - previously the old SL (sized for the full qty,
-                    # at the original level) just sat there unchanged.
                     if trade.get("sl_id"):
                         cancel_order(symbol, trade["sl_id"])
                     new_sl_id = place_sl_order(
@@ -619,28 +775,32 @@ def track_fast_trades():
                     )
                     trade["sl_id"] = new_sl_id
                     trade["sl"]    = trade["entry"]
-
-                    send_journal(
-                        "TP1 hit [Fast] - " + symbol + "\nBanked: " + str(round(leg_pnl, 2)) +
-                        " USDT | Remaining: " + str(trade["remaining_qty"]) + " | SL moved to breakeven (" + str(trade["entry"]) + ")\nNiti Journal"
-                    )
+                    # Trailing engages via update_fast_trailing()'s "activated" flag from here.
 
             sl_status = check_tight_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
             if sl_status == "FILLED":
+                # Cancel the counterpart TP1 order if it hasn't filled yet - previously left dangling.
+                if not trade.get("tp1_filled") and trade.get("tp1_id"):
+                    cancel_order(symbol, trade["tp1_id"])
                 remaining = trade.get("remaining_qty", 0)
                 if trade["side"] == "BUY":
                     leg_pnl = (trade["sl"] - trade["entry"]) * remaining
                 else:
                     leg_pnl = (trade["entry"] - trade["sl"]) * remaining
                 total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
-                sign = "+" if total_pnl > 0 else ""
-                send_journal(
-                    "Trade Closed [Fast SL] - " + symbol + "\n------------------------------\n"
-                    "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
-                    "Exit  : " + str(trade["sl"]) + "\nPnL   : " + sign + str(total_pnl) + " USDT\n"
-                    "------------------------------\nNiti Journal"
-                )
+                trade["pnl"]    = total_pnl
+                trade["result"] = "BE" if trade.get("tp1_filled") else "SL"
+                trade["label"]  = "Fast"
+                trade["symbol"] = symbol
+                journal_closed_trade(trade)
                 del fast_open_trades[symbol]
+                continue
+
+            # Time-boxed exit - pump-and-fade moves die fast, don't let a trade linger forever.
+            opened_ts = trade.get("opened_ts")
+            if opened_ts and (time.time() - opened_ts) > FAST_MAX_HOLD_SECONDS:
+                print(f"[FAST TIME EXIT] {symbol}")
+                close_fast_position(symbol, "TimeExit")
         except Exception as e:
             print(f"[FAST TRACK ERROR] {symbol}: {e}")
 
@@ -654,7 +814,8 @@ def update_fast_trailing():
                 continue
             side = trade["side"]
             activate_pct = (FAST_TRAIL_ACTIVATE_RR * trade.get("sl_pct", 1.5)) / 100
-            trail_pct    = FAST_TRAIL_PCT / 100
+            atr_ref    = trade.get("atr_at_entry", 0)
+            trail_dist = atr_ref * FAST_TRAIL_ATR_MULT if atr_ref > 0 else trade["entry"] * (FAST_TRAIL_PCT_FALLBACK / 100)
 
             if not trade.get("activated"):
                 if side == "BUY" and current >= trade["entry"] * (1 + activate_pct):
@@ -663,22 +824,53 @@ def update_fast_trailing():
                 elif side == "SELL" and current <= trade["entry"] * (1 - activate_pct):
                     fast_open_trades[symbol]["activated"]   = True
                     fast_open_trades[symbol]["trail_price"] = current
-                continue   # not activated yet - exchange-side SL/TP1 still protect the trade
+                continue
 
             if side == "BUY":
                 if current > trade["trail_price"]:
                     fast_open_trades[symbol]["trail_price"] = current
-                trail_sl = trade["trail_price"] * (1 - trail_pct)
+                trail_sl = trade["trail_price"] - trail_dist
                 if current <= trail_sl:
                     close_fast_position(symbol, "Trail")
             else:
                 if current < trade["trail_price"]:
                     fast_open_trades[symbol]["trail_price"] = current
-                trail_sl = trade["trail_price"] * (1 + trail_pct)
+                trail_sl = trade["trail_price"] + trail_dist
                 if current >= trail_sl:
                     close_fast_position(symbol, "Trail")
         except Exception as e:
             print(f"[TRAIL ERROR] {symbol}: {e}")
+
+
+def update_tight_trailing():
+    """Post-TP1 runner leg (TREND mode only) - trails the remaining half_qty with no
+    fixed second target, replacing the old TP2. Breakeven SL was already placed the
+    moment TP1 filled (see track_tight_trades Step 1); this just trails it further."""
+    for oid in list(tight_open_trades.keys()):
+        trade = tight_open_trades.get(oid)
+        if not trade or not trade.get("trailing_active"):
+            continue
+        try:
+            symbol  = trade["symbol"]
+            current = get_current_price(symbol)
+            if current <= 0:
+                continue
+            side       = trade["side"]
+            trail_pct  = TIGHT_TRAIL_PCT / 100
+            if side == "BUY":
+                if current > trade["trail_price"]:
+                    trade["trail_price"] = current
+                trail_sl = trade["trail_price"] * (1 - trail_pct)
+                if current <= trail_sl:
+                    close_tight_position(oid, "Trail")
+            else:
+                if current < trade["trail_price"]:
+                    trade["trail_price"] = current
+                trail_sl = trade["trail_price"] * (1 + trail_pct)
+                if current >= trail_sl:
+                    close_tight_position(oid, "Trail")
+        except Exception as e:
+            print(f"[TIGHT TRAIL ERROR] {oid}: {e}")
 
 
 def check_tight_order_status(order_id, symbol):
@@ -692,50 +884,72 @@ def check_tight_order_status(order_id, symbol):
 
 
 def track_tight_trades():
-    """Polls the SL/TP1/TP2 order IDs (not the entry order, which fills instantly
-    and would otherwise make every trade look 'closed' one loop after opening)."""
-    global daily_trades, tight_loss_streak, tight_cooldown_until
     to_remove = []
     for oid, trade in list(tight_open_trades.items()):
         try:
             symbol = trade["symbol"]
             entry  = trade["entry"]
             side   = trade["side"]
+            mode   = trade.get("mode", "TREND")
 
-            # --- Step 1: TP1 fill -> bank partial PnL + move remaining runner to breakeven (TREND mode only) ---
-            if not trade.get("breakeven_done") and trade.get("tp1_id"):
+            # --- Step 1: TP1 fill (TREND mode only) -> bank partial PnL, move remaining
+            # to breakeven immediately, then hand off to the trailing loop (TP2 removed). ---
+            if mode == "TREND" and not trade.get("breakeven_done") and trade.get("tp1_id"):
                 tp1_status = check_tight_order_status(trade["tp1_id"], symbol)
                 if tp1_status == "FILLED":
                     leg_qty = trade["half_qty"]
                     leg_pnl = (trade["tp1"] - entry) * leg_qty if side == "BUY" else (entry - trade["tp1"]) * leg_qty
                     trade["partial_pnl"] = trade.get("partial_pnl", 0.0) + leg_pnl
-                    cancel_order(symbol, trade["sl_id"])
-                    new_sl_id = place_sl_order(
-                        symbol, trade["close_side"], trade["pos_side"], entry, leg_qty
-                    )
-                    trade["sl_id"] = new_sl_id
-                    trade["breakeven_done"] = True
+                    if trade.get("sl_id"):
+                        cancel_order(symbol, trade["sl_id"])
+                    new_sl_id = place_sl_order(symbol, trade["close_side"], trade["pos_side"], entry, leg_qty)
+                    trade["sl_id"]           = new_sl_id
+                    trade["sl"]              = entry
+                    trade["breakeven_done"]  = True
+                    trade["trailing_active"] = True
+                    trade["trail_price"]     = trade["tp1"]
                     send_journal(
                         "TP1 hit [Tight] - " + symbol + "\nBanked: " + str(round(leg_pnl, 2)) +
-                        " USDT | Remaining SL moved to breakeven (" + str(entry) + ")\nNiti Journal"
+                        " USDT | Remaining moved to breakeven, trailing started\nNiti Journal"
                     )
+                    continue
 
-            # --- Step 2: final exit - either the (possibly breakeven) SL fires, or the last target fires ---
-            target_id    = trade["tp2_id"] if trade.get("tp2_id") else trade["tp1_id"]
-            target_price = trade["tp2"]    if trade.get("tp2_id") else trade["tp1"]
-            final_qty    = trade["half_qty"] if trade.get("breakeven_done") else trade["qty"]
+            # --- Trailing already active: exit is driven by update_tight_trailing() /
+            # close_tight_position(). Only a safety check here in case the exchange-side
+            # breakeven SL fires on its own between trailing-loop ticks. ---
+            if trade.get("trailing_active"):
+                sl_status = check_tight_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
+                if sl_status == "FILLED":
+                    total_pnl = round(trade.get("partial_pnl", 0.0), 2)   # breakeven fill -> ~0 on this leg
+                    trade["pnl"]    = total_pnl
+                    trade["result"] = "BE"
+                    trade["label"]  = "Tight"
+                    daily_trades.append(trade)
+                    to_remove.append(oid)
+                    _update_loss_streak(total_pnl)
+                    journal_closed_trade(trade)
+                continue
 
-            sl_status  = check_tight_order_status(trade["sl_id"], symbol)
+            # --- RANGE mode (or TREND before TP1 fills): single exit on the full qty ---
+            target_id    = trade.get("tp1_id")
+            target_price = trade.get("tp1")
+            final_qty    = trade["qty"]
+
+            sl_status  = check_tight_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
             tgt_status = check_tight_order_status(target_id, symbol) if target_id else ""
 
             final_price = None
             result      = None
             if sl_status == "FILLED":
-                final_price = entry if trade.get("breakeven_done") else trade["sl"]
-                result      = "BE" if trade.get("breakeven_done") else "SL"
+                final_price = trade["sl"]
+                result      = "SL"
+                if target_id:
+                    cancel_order(symbol, target_id)   # cancel dangling TP - previously left resting
             elif tgt_status == "FILLED":
                 final_price = target_price
                 result      = "TP"
+                if trade.get("sl_id"):
+                    cancel_order(symbol, trade["sl_id"])   # cancel dangling SL - previously left resting
 
             if final_price is not None:
                 leg_pnl   = (final_price - entry) * final_qty if side == "BUY" else (entry - final_price) * final_qty
@@ -746,22 +960,8 @@ def track_tight_trades():
                 trade["label"]  = "Tight"
                 daily_trades.append(trade)
                 to_remove.append(oid)
-
-                if total_pnl < 0:
-                    tight_loss_streak += 1
-                else:
-                    tight_loss_streak = 0
-                if tight_loss_streak >= LOSS_STREAK_N:
-                    tight_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
-                    tight_loss_streak = 0
-                    send_journal(f"Tight 2 cooldown triggered - pausing new entries for {COOLDOWN_MINUTES} minutes\nNiti Journal")
-
-                sign = "+" if total_pnl > 0 else ""
-                send_journal(
-                    "Trade Closed [Tight] - " + symbol + "\n------------------------------\n"
-                    "Side: " + side + " | Result: " + result + "\n"
-                    "PnL: " + sign + str(total_pnl) + " USDT\n------------------------------\nNiti Journal"
-                )
+                _update_loss_streak(total_pnl)
+                journal_closed_trade(trade)
         except Exception as e:
             print(f"[TRACK ERROR] {e}")
     for oid in to_remove:
@@ -830,7 +1030,7 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
 
     er_now = efficiency_ratio(closes[:i+1], ER_LOOKBACK)
     if er_now < ER_MIN:
-        return None   # coin-quality filter: too choppy/grinding, skip entirely
+        return None
 
     mode, atr_ratio = update_regime(symbol, highs[:i+1], lows[:i+1], closes[:i+1], atr_vals[:i+1])
 
@@ -869,15 +1069,52 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
     if mode == "TREND":
         long_signal  = (vwap_cross_up and entry > vwap_now and entry > ema50_now
                          and trend_bull and vol_ok and 40 <= rsi_now <= 65
-                         and conf1_bull and conf2_bull and bull_ok)
+                         and conf1_bull and conf2_bull and bull_ok
+                         and adx_now >= ADX_MIN)
         short_signal = (vwap_cross_down and entry < vwap_now and entry < ema50_now
                          and trend_bear and vol_ok and 35 <= rsi_now <= 60
-                         and conf1_bear and conf2_bear and bear_ok)
+                         and conf1_bear and conf2_bear and bear_ok
+                         and adx_now >= ADX_MIN)
         rsi_low, rsi_high = (40, 65) if long_signal else (35, 60)
-    else:  # RANGE mode - fade off the sweep at the boundary
+
+        # --- Multi-timeframe confirmation (TREND mode only) ---
+        if (long_signal or short_signal) and MTF_FILTER_ENABLED:
+            mtf_trend = get_mtf_trend(symbol)
+            if mtf_trend is not None:
+                if long_signal and mtf_trend != "UP":
+                    print(f"[MTF SKIP] {symbol} long blocked - {MTF_INTERVAL} trend is {mtf_trend}")
+                    long_signal = False
+                if short_signal and mtf_trend != "DOWN":
+                    print(f"[MTF SKIP] {symbol} short blocked - {MTF_INTERVAL} trend is {mtf_trend}")
+                    short_signal = False
+
+        # --- Exposure cap (TREND mode only) ---
+        if (long_signal or short_signal) and EXPOSURE_CAP_ENABLED:
+            if long_signal and count_open_direction("BUY") >= MAX_SAME_DIRECTION_TRADES:
+                print(f"[EXPOSURE SKIP] {symbol} long blocked - {MAX_SAME_DIRECTION_TRADES} same-direction cap reached")
+                long_signal = False
+            if short_signal and count_open_direction("SELL") >= MAX_SAME_DIRECTION_TRADES:
+                print(f"[EXPOSURE SKIP] {symbol} short blocked - {MAX_SAME_DIRECTION_TRADES} same-direction cap reached")
+                short_signal = False
+
+        # --- Funding rate check (TREND mode only, only queried if a signal would otherwise fire) ---
+        if (long_signal or short_signal) and FUNDING_FILTER_ENABLED:
+            funding_val = get_funding_rate(symbol)
+            if long_signal and funding_val > FUNDING_RATE_EXTREME_PCT:
+                print(f"[FUNDING SKIP] {symbol} long blocked - funding {funding_val:.3f}% (crowded long)")
+                long_signal = False
+            if short_signal and funding_val < -FUNDING_RATE_EXTREME_PCT:
+                print(f"[FUNDING SKIP] {symbol} short blocked - funding {funding_val:.3f}% (crowded short)")
+                short_signal = False
+    else:  # RANGE mode - fade off the sweep at the boundary (unchanged)
         long_signal  = bull_ok and near_range_low
         short_signal = bear_ok and near_range_high
         rsi_low, rsi_high = 30, 70
+
+    # --- BTC-wide uncertainty check - downsizes (never blocks outright) TREND-mode alt
+    # entries when BTC itself is in an elevated-volatility/uncertain regime. ---
+    btc_ratio = get_btc_regime() if BTC_REGIME_FILTER_ENABLED else 1.0
+    btc_uncertain = BTC_REGIME_FILTER_ENABLED and mode == "TREND" and btc_ratio >= BTC_UNCERTAIN_RATIO
 
     if long_signal:
         sig_id = (symbol, "BUY", int(confirmed[sig]["time"]))
@@ -886,39 +1123,36 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
             risk = entry - sl
             risk_pct = (risk / entry * 100) if entry > 0 else 0
             if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
-                return ratio   # sweep point too close (noise) or too far (blown-out / stale sweep) - skip
+                return ratio
             sweep_depth_pct = abs(bull_pool - bull_pt) / bull_pool * 100 if bull_pool else SWEEP_MIN_PCT
             score  = confidence_score(ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, sweep_depth_pct)
-            amount = amount_for_score(score)
-            if amount is None:
-                return ratio   # confidence too low, skip
+            tier_mult = tier_mult_for_score(score)
+            if tier_mult is None:
+                return ratio
+            if btc_uncertain:
+                tier_mult = round(tier_mult / 2, 2)
 
             if mode == "TREND":
                 tp1 = round(entry + risk * RR_TP1, 6)
-                tp2 = round(entry + risk * RR_TP2, 6)
             else:
                 tp1 = round(entry + risk * RANGE_RR, 6)
-                tp2 = None
             sl = round(sl, 6)
 
             tight_alerted.add(sig_id)
             trade_status = ""
             if tight_auto_trade_enabled:
-                oid = place_tight_order(symbol, "BUY", entry, sl, tp1, tp2, amount, mode)
+                oid = place_tight_order(symbol, "BUY", entry, sl, tp1, tier_mult, mode)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
-            tp_line = "TP1: " + str(tp1) + (" | TP2: " + str(tp2) if tp2 else "")
             send_tg(
                 "TIGHT SIGNAL - BUY - " + symbol + " [" + mode + "]\n------------------------------\n"
-                "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl) + "\n"
-                + tp_line + "\n"
+                "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl) + " | TP1: " + str(tp1) + "\n"
                 "RSI: " + str(round(rsi_now, 1)) + " | Vol: " + str(round(ratio, 1)) + "x | ADX: " + str(round(adx_now, 1)) +
-                " | ER: " + str(round(er_now, 2)) + " | Score: " + str(score) + " | Amount: $" + str(amount) +
+                " | ER: " + str(round(er_now, 2)) + " | Score: " + str(score) + " | SizeMult: " + str(tier_mult) +
+                " | BTCratio: " + str(round(btc_ratio, 2)) +
                 trade_status + "\n------------------------------\nNiti Tight 2"
             )
-            send_journal("New Trade [Tight-" + mode + "] - " + symbol + "\nSide: BUY | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl) + "\n" + tp_line + "\nScore: " + str(score) + " | Amount: $" + str(amount) + "\nNiti Journal")
 
     if short_signal:
         sig_id = (symbol, "SELL", int(confirmed[sig]["time"]))
@@ -927,39 +1161,36 @@ def check_tight(symbol, confirmed, closes, opens, vols, highs, lows,
             risk = sl - entry
             risk_pct = (risk / entry * 100) if entry > 0 else 0
             if risk <= 0 or risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
-                return ratio   # sweep point too close (noise) or too far (blown-out / stale sweep) - skip
+                return ratio
             sweep_depth_pct = abs(bear_pt - bear_pool) / bear_pool * 100 if bear_pool else SWEEP_MIN_PCT
             score  = confidence_score(ratio, adx_now, er_now, rsi_now, rsi_low, rsi_high, sweep_depth_pct)
-            amount = amount_for_score(score)
-            if amount is None:
+            tier_mult = tier_mult_for_score(score)
+            if tier_mult is None:
                 return ratio
+            if btc_uncertain:
+                tier_mult = round(tier_mult / 2, 2)
 
             if mode == "TREND":
                 tp1 = round(entry - risk * RR_TP1, 6)
-                tp2 = round(entry - risk * RR_TP2, 6)
             else:
                 tp1 = round(entry - risk * RANGE_RR, 6)
-                tp2 = None
             sl = round(sl, 6)
 
             tight_alerted.add(sig_id)
             trade_status = ""
             if tight_auto_trade_enabled:
-                oid = place_tight_order(symbol, "SELL", entry, sl, tp1, tp2, amount, mode)
+                oid = place_tight_order(symbol, "SELL", entry, sl, tp1, tier_mult, mode)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
-            tp_line = "TP1: " + str(tp1) + (" | TP2: " + str(tp2) if tp2 else "")
             send_tg(
                 "TIGHT SIGNAL - SELL - " + symbol + " [" + mode + "]\n------------------------------\n"
-                "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl) + "\n"
-                + tp_line + "\n"
+                "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl) + " | TP1: " + str(tp1) + "\n"
                 "RSI: " + str(round(rsi_now, 1)) + " | Vol: " + str(round(ratio, 1)) + "x | ADX: " + str(round(adx_now, 1)) +
-                " | ER: " + str(round(er_now, 2)) + " | Score: " + str(score) + " | Amount: $" + str(amount) +
+                " | ER: " + str(round(er_now, 2)) + " | Score: " + str(score) + " | SizeMult: " + str(tier_mult) +
+                " | BTCratio: " + str(round(btc_ratio, 2)) +
                 trade_status + "\n------------------------------\nNiti Tight 2"
             )
-            send_journal("New Trade [Tight-" + mode + "] - " + symbol + "\nSide: SELL | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl) + "\n" + tp_line + "\nScore: " + str(score) + " | Amount: $" + str(amount) + "\nNiti Journal")
 
     return ratio
 
@@ -1014,34 +1245,29 @@ def check_fast(symbol):
         atr_vals = atr_series(highs, lows, closes, FAST_ATR_LEN)
         atr_now  = atr_vals[i]
 
-        # Extension check (no extra API call): how far has price already run over the
-        # last FAST_EXTENSION_LOOKBACK bars, relative to its own ATR? A move that's
-        # already run many ATRs is closer to exhausted - scale size down, never block
-        # outright (a genuine strong continuation still gets taken, just smaller).
         ext_move  = abs(closes[i] - closes[i - FAST_EXTENSION_LOOKBACK])
         extension = ext_move / atr_now if atr_now > 0 else 0
         is_extended = extension > FAST_EXTENSION_LIMIT
 
-        # Box is computed from the window BEFORE the retest candle (i-1), so the
-        # retest check below isn't comparing a candle against a box that already
-        # includes that same candle's own high/low (which made retest_confirm
-        # impossible to ever trigger).
-        box_end = i - 1 if FAST_RETEST_CONFIRM else i
-        box_high = max(highs[box_end - FAST_CONSOL_LOOKBACK:box_end])
-        box_low  = min(lows[box_end - FAST_CONSOL_LOOKBACK:box_end])
+        # Box computed strictly from the window BEFORE the current candle - no
+        # self-reference, and (per updated design) no retest wait needed either.
+        box_high = max(highs[i - FAST_CONSOL_LOOKBACK:i])
+        box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
 
         avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
         ratio   = vols[i] / avg_vol if avg_vol > 0 else 0
         vol_ok  = ratio >= FAST_VOL_MULT
 
-        bull_breakout = closes[i] > box_high + atr_now * FAST_BREAKOUT_ATR_MULT
-        bear_breakout = closes[i] < box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
+        candle_range = highs[i] - lows[i]
+        bull_close_strength = (closes[i] - lows[i]) / candle_range if candle_range > 0 else 0
+        bear_close_strength = (highs[i] - closes[i]) / candle_range if candle_range > 0 else 0
 
-        if FAST_RETEST_CONFIRM:
-            # require the breakout level to have already been broken one bar earlier
-            # and still holding now (adds ~1 candle of delay, cuts more false breakouts)
-            bull_breakout = bull_breakout and closes[i-1] > box_high
-            bear_breakout = bear_breakout and closes[i-1] < box_low
+        # Same-candle close-position filter, replacing the old 1-candle retest-confirm
+        # delay - no waiting required, just requires a decisive (not wicky) close.
+        bull_breakout = (closes[i] > box_high + atr_now * FAST_BREAKOUT_ATR_MULT
+                         and bull_close_strength >= FAST_CLOSE_POSITION_MIN)
+        bear_breakout = (closes[i] < box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
+                         and bear_close_strength >= FAST_CLOSE_POSITION_MIN)
 
         long_signal  = bull_breakout and vol_ok
         short_signal = bear_breakout and vol_ok
@@ -1062,8 +1288,6 @@ def check_fast(symbol):
         if long_signal and sig_id_long not in fast_alerted:
             fast_alerted.add(sig_id_long)
             lev        = get_fast_leverage(symbol)
-            # Structural SL: below the box floor (the level whose breach invalidates
-            # this breakout), not an arbitrary ATR multiple from entry.
             sl_price   = round(box_low - atr_now * SL_ATR_BUFFER_MULT, 6)
             risk       = entry - sl_price
             if risk <= 0:
@@ -1074,24 +1298,22 @@ def check_fast(symbol):
             print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             trade_status = ""
             if fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price, risk_usdt)
+                oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price, atr_now, risk_usdt)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
             send_tg(
                 "FAST SIGNAL - BUY - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
-                "TP1 (1:2): " + str(tp1_price) + " | Trail: " + str(FAST_TRAIL_PCT) + "% (after " + str(FAST_TRAIL_ACTIVATE_RR) + "R)\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
+                "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
+                "Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bull_close_strength, 2)) +
+                " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
                 trade_status + "\n------------------------------\nNiti Fast Signal"
             )
-            send_journal("New Trade [Fast] - " + symbol + "\nSide: BUY | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
 
         elif short_signal and sig_id_short not in fast_alerted:
             fast_alerted.add(sig_id_short)
             lev        = get_fast_leverage(symbol)
-            # Structural SL: above the box ceiling.
             sl_price   = round(box_high + atr_now * SL_ATR_BUFFER_MULT, 6)
             risk       = sl_price - entry
             if risk <= 0:
@@ -1102,19 +1324,18 @@ def check_fast(symbol):
             print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             trade_status = ""
             if fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price, risk_usdt)
+                oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price, atr_now, risk_usdt)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
             send_tg(
                 "FAST SIGNAL - SELL - " + symbol + "\n------------------------------\n"
                 "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
-                "TP1 (1:2): " + str(tp1_price) + " | Trail: " + str(FAST_TRAIL_PCT) + "% (after " + str(FAST_TRAIL_ACTIVATE_RR) + "R)\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
+                "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
+                "Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bear_close_strength, 2)) +
+                " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
                 trade_status + "\n------------------------------\nNiti Fast Signal"
             )
-            send_journal("New Trade [Fast] - " + symbol + "\nSide: SELL | Entry: " + str(round(entry, 6)) +
-                " | SL: " + str(sl_price) + " | TP1: " + str(tp1_price) + " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) + "\nNiti Journal")
 
     except Exception as e:
         print(f"[FAST {symbol}] error: {e}")
@@ -1172,22 +1393,20 @@ def trailing_loop():
             if fast_open_trades:
                 track_fast_trades()
                 update_fast_trailing()
+            if tight_open_trades:
+                update_tight_trailing()
         except Exception as e:
             print(f"[TRAIL LOOP ERROR] {e}")
         time.sleep(30)
 
 
 def fast_scan_loop():
-    print("Fast Signal loop started - 3m | small/mid-cap universe (majors excluded) | consolidation breakout")
+    print("Fast Signal loop started - 3m | small/mid-cap universe | consolidation breakout (retest removed, close-position filter added)")
     all_symbols = []
     while True:
         try:
             if not all_symbols:
                 all_symbols = get_futures_symbols() or []
-            # No max_n truncation - scan the whole eligible small/mid-cap universe every
-            # cycle so a real gainer never loses out to an arbitrary liquidity-rank cutoff.
-            # Top FAST_EXCLUDE_TOP_N by volume (majors) are dropped since Tight 2 covers
-            # those and they structurally don't produce this kind of breakout.
             liquid = get_liquid_symbols(
                 all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=None, exclude_top_n=FAST_EXCLUDE_TOP_N
             )
@@ -1198,13 +1417,25 @@ def fast_scan_loop():
             print("[FAST SCAN] Done. Sleeping 180s...")
         except Exception as e:
             print(f"[FAST LOOP ERROR] {e}")
-        time.sleep(180)   # aligned to the 3m candle cadence - a new confirmed candle only shows up this often anyway
+        time.sleep(180)
 
 
 def monitor_loop():
-    print("Monitor started - Tight 2 (15m, sweep+regime+dynamic SL) | Fast Signal (3m breakout)")
+    global tight_cooldown_until
+    print("Monitor started - Tight 2 (15m, sweep+regime+dynamic SL+trail, fixed-$ risk, market-regime filters) | Fast Signal (3m breakout)")
     while True:
         try:
+            # Proactive volatility-aware cooldown - checked once per cycle, not per symbol.
+            if BTC_REGIME_FILTER_ENABLED:
+                btc_ratio_now = get_btc_regime()
+                already_cooling = tight_cooldown_until and datetime.now(timezone.utc) < tight_cooldown_until
+                if btc_ratio_now >= VOL_COOLDOWN_ATR_RATIO and not already_cooling:
+                    tight_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
+                    send_journal(
+                        f"Tight 2 volatility cooldown triggered (BTC ATR ratio {btc_ratio_now:.2f}) - "
+                        f"pausing {COOLDOWN_MINUTES} min\nNiti Journal"
+                    )
+
             all_symbols = get_futures_symbols()
             symbols = get_liquid_symbols(all_symbols, min_quote_vol=TIGHT_MIN_QUOTE_VOL, max_n=TIGHT_MAX_SYMBOLS)
             print(f"[TIGHT SCAN] Scanning {len(symbols)}/{len(all_symbols)} liquid pairs (min 24h vol ${TIGHT_MIN_QUOTE_VOL:,.0f}) | Tight={tight_auto_trade_enabled} | Fast={fast_auto_trade_enabled}")
@@ -1227,7 +1458,7 @@ def monitor_loop():
 
 @app.route("/")
 def health():
-    return "Niti Tight 2 (Sweep+Regime+DynamicSL) + Fast Signal (Breakout+AdaptiveTrail)", 200
+    return "Niti Tight 2 (Sweep+Regime+Trail+FixedRisk+RegimeFilters) + Fast Signal (Breakout+ATRTrail+TimeExit)", 200
 
 
 if __name__ == "__main__":

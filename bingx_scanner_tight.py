@@ -66,11 +66,7 @@ TIGHT_MIN_QUOTE_VOL          = float(os.environ.get("TIGHT_MIN_QUOTE_VOL", 1_000
 TIGHT_MAX_SYMBOLS            = int(os.environ.get("TIGHT_MAX_SYMBOLS", 400))
 
 TIGHT_BASELINE_CANDLES       = int(os.environ.get("TIGHT_BASELINE_CANDLES", 4320))   # 3 days of 1m candles
-# NOTE: assumes BingX's kline endpoint allows limit=4320 in a single request - NOT
-# verified against current BingX docs in this conversation. If the API caps the
-# response below this, the baseline will silently be computed over fewer candles
-# (whatever is actually returned) rather than a true 3-day window. Verify before
-# relying on this live, same caveat as cancel_order()/get_funding_rate() elsewhere.
+BINGX_KLINE_MAX_LIMIT        = 1440   # confirmed 2026-07-11 via live API error: "limit: This field must be less than or equal to 1440." Baseline is paginated in chunks of this size.
 TIGHT_BASELINE_REFRESH_SECONDS = int(os.environ.get("TIGHT_BASELINE_REFRESH_SECONDS", 1800))   # re-fetch baseline every 30 min per symbol, not every scan
 
 TIGHT_SPIKE_VOL_MULT         = float(os.environ.get("TIGHT_SPIKE_VOL_MULT", 20.0))   # live in-progress candle vs 3-day baseline
@@ -167,8 +163,11 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0):
         return symbols[:max_n] if max_n else symbols
 
 
-def get_candles(symbol, limit=350, interval="15m"):
-    params = build_signed_params({"symbol": symbol, "interval": interval, "limit": limit})
+def get_candles(symbol, limit=350, interval="15m", end_time=None):
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if end_time is not None:
+        params["endTime"] = int(end_time)
+    params = build_signed_params(params)
     url = BASE_URL + "/openApi/swap/v3/quote/klines"
     r = requests.get(url, params=params,
                      headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
@@ -722,19 +721,42 @@ def check_fast(symbol):
 # ==================== TIGHT ENTRY LOGIC (Stock Niti: spike -> cooldown -> breakout) ====================
 def get_tight_volume_baseline(symbol):
     """Cached 3-day average 1m volume per symbol, refreshed every
-    TIGHT_BASELINE_REFRESH_SECONDS rather than on every scan (expensive call)."""
+    TIGHT_BASELINE_REFRESH_SECONDS rather than on every scan (expensive call).
+
+    Paginated (fixed 2026-07-11): BingX's kline endpoint caps `limit` at 1440 per
+    request (confirmed via a live 109400 error - the original single-call
+    limit=4320 request was failing on every symbol, every cycle, which is why the
+    baseline was always None and Tight never watched anything). This now fetches
+    TIGHT_BASELINE_CANDLES worth of history in <=1440-candle chunks, walking
+    backwards with `endTime`, with a small sleep between chunks to avoid bursting."""
     now = time.time()
     cached = tight_baseline_cache.get(symbol)
     if cached and now - cached["ts"] < TIGHT_BASELINE_REFRESH_SECONDS:
         return cached["baseline"]
     try:
-        candles = get_candles(symbol, limit=TIGHT_BASELINE_CANDLES, interval=TIGHT_TIMEFRAME)
-        if len(candles) < 100:
+        all_vols   = []
+        end_time   = None
+        remaining  = TIGHT_BASELINE_CANDLES
+        first_chunk = True
+        while remaining > 0:
+            chunk_limit = min(remaining, BINGX_KLINE_MAX_LIMIT)
+            candles = get_candles(symbol, limit=chunk_limit, interval=TIGHT_TIMEFRAME, end_time=end_time)
+            if not candles:
+                break
+            # exclude the live in-progress candle - only present in the first
+            # (most recent, end_time=None) chunk
+            chunk = candles[:-1] if first_chunk else candles
+            all_vols.extend(v(c) for c in chunk)
+            end_time = int(candles[0]["time"]) - 1
+            remaining -= len(candles)
+            first_chunk = False
+            if len(candles) < chunk_limit:
+                break   # exchange returned fewer than asked - no more history available
+            time.sleep(0.3)
+        if len(all_vols) < 100:
             return cached["baseline"] if cached else None
-        vols = [v(c) for c in candles[:-1]]   # exclude live in-progress candle from baseline
-        baseline = sum(vols) / len(vols) if vols else None
-        if baseline:
-            tight_baseline_cache[symbol] = {"baseline": baseline, "ts": now}
+        baseline = sum(all_vols) / len(all_vols)
+        tight_baseline_cache[symbol] = {"baseline": baseline, "ts": now}
         return baseline
     except Exception as e:
         print(f"[TIGHT BASELINE ERROR] {symbol}: {e}")
@@ -1115,6 +1137,7 @@ def tight_scan_loop():
             tight_diagnostic_check()
             for sym in symbols:
                 check_tight_symbol(sym)
+                time.sleep(0.15)
             send_daily_summary()
             print("[TIGHT SCAN] Done.")
         except Exception as e:

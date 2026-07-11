@@ -25,7 +25,7 @@ FAST_VOL_MULT           = 3.0
 FAST_VOL_LB             = 20
 FAST_ATR_LEN            = 14
 FAST_SL_ATR_MULT        = 1.2   # NOTE: dead/unused - actual SL uses SL_ATR_BUFFER_MULT below. Kept only for reference.
-FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 1.5))
+FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 20.0))
 FAST_EXCLUDE_TOP_N       = 75
 FAST_EXTENSION_LOOKBACK  = 20
 FAST_EXTENSION_LIMIT     = 4.0
@@ -79,7 +79,7 @@ TIGHT_RR_TP                  = float(os.environ.get("TIGHT_RR_TP", 4.0))
 TIGHT_BE_TRIGGER_R           = float(os.environ.get("TIGHT_BE_TRIGGER_R", 2.0))         # move SL to breakeven at this R, full size kept
 TIGHT_MAX_COOLDOWN_WAIT_SECONDS = int(os.environ.get("TIGHT_MAX_COOLDOWN_WAIT_SECONDS", 3600))   # give up watching after 60 min with no breakout
 TIGHT_MAX_CONCURRENT_TRADES  = int(os.environ.get("TIGHT_MAX_CONCURRENT_TRADES", 4))
-TIGHT_RISK_USDT              = float(os.environ.get("TIGHT_RISK_USDT", 5.0))
+TIGHT_RISK_USDT              = float(os.environ.get("TIGHT_RISK_USDT", 20.0))
 TIGHT_LEVERAGE               = int(os.environ.get("TIGHT_LEVERAGE", 20))   # fixed, per Faisal's instruction (2026-07-11)
 TIGHT_ATR_LEN                = 14
 
@@ -346,13 +346,11 @@ def place_market_order(symbol, side, qty, pos_side):
 
 
 def place_sl_order(symbol, close_side, pos_side, sl_price, qty):
-    """NOTE: reduceOnly - verify param name/behavior against current BingX hedge-mode
-    docs before relying on it live, same caveat as cancel_order()."""
     url = BASE_URL + "/openApi/swap/v2/trade/order"
     params = build_signed_params({
         "symbol": symbol, "side": close_side, "positionSide": pos_side,
         "type": "STOP_MARKET", "stopPrice": round(sl_price, 6), "quantity": qty,
-        "reduceOnly": "true",
+        "workingType": "MARK_PRICE",
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     print(f"[SL] {symbol}: {r}")
@@ -360,12 +358,11 @@ def place_sl_order(symbol, close_side, pos_side, sl_price, qty):
 
 
 def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
-    """NOTE: reduceOnly - see place_sl_order() comment above."""
     url = BASE_URL + "/openApi/swap/v2/trade/order"
     params = build_signed_params({
         "symbol": symbol, "side": close_side, "positionSide": pos_side,
         "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp_price, 6), "quantity": qty,
-        "reduceOnly": "true",
+        "workingType": "MARK_PRICE",
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     return r.get("data", {}).get("order", {}).get("orderId", "N/A")
@@ -1206,7 +1203,7 @@ def health():
 # Position size = risk / SL-distance, so margins were tiny ($1.4-1.6) when SL
 # was wide. $5 risk => ~3.3x bigger positions. "extended (half size)" trades
 # will now risk $2.5. Overridden by the FAST_RISK_USDT env var if set on Render.
-FAST_RISK_USDT = float(os.environ.get("FAST_RISK_USDT", 5.0))
+FAST_RISK_USDT = float(os.environ.get("FAST_RISK_USDT", 20.0))
 
 TIGHT_SPIKE_CONFIRMED_LOOKBACK = int(os.environ.get("TIGHT_SPIKE_CONFIRMED_LOOKBACK", 3))
 TIGHT_SCAN_SYMBOL_GAP          = float(os.environ.get("TIGHT_SCAN_SYMBOL_GAP", 0.1))
@@ -1318,11 +1315,7 @@ def check_tight_symbol(symbol):
                     "cooldown_highs": [], "cooldown_lows": [],
                     "last_processed_time": int(spike_candle["time"]),
                 }
-                send_tg(
-                    "TIGHT SPIKE - " + symbol + " [" + direction + "]\n"
-                    "Vol: " + str(round(spike_ratio, 1)) + "x 3-day baseline\n"
-                    "Watching for cooldown + re-entry...\nNiti Tight"
-                )
+                print(f"[TIGHT SPIKE] {symbol} [{direction}] {round(spike_ratio,1)}x - watching")
             return True
 
         if time.time() - state["spike_ts"] > TIGHT_MAX_COOLDOWN_WAIT_SECONDS:
@@ -1457,7 +1450,7 @@ def tight_scan_loop():
 
 
 Thread(target=tight_baseline_loop, daemon=True).start()
-# ==================== END COMBINED PATCH ====================
+# ==================== END TIGHT 2 SPEED FIX ====================
 
 if __name__ == "__main__":
     Thread(target=tight_scan_loop,          daemon=True).start()

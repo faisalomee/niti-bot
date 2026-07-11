@@ -106,6 +106,34 @@ tight_baseline_cache = {}   # symbol -> {"baseline": val, "ts": ...}
 
 mtf_cache = {}
 
+# ---- API backoff (added 2026-07-11) ----
+# BingX's rate-limit penalty for repeated bad/over-limit requests is self-renewing:
+# each additional request made *while still blocked* pushes the "retry after" time
+# further out. Continuing to scan during a block was preventing the block from
+# ever clearing on its own. This makes the bot go fully quiet on market-data calls
+# for API_BACKOFF_SECONDS as soon as a rate-limit response is detected, instead of
+# keep hammering the endpoint and extending its own penalty.
+API_BACKOFF_SECONDS = int(os.environ.get("API_BACKOFF_SECONDS", 1200))   # 20 min
+_api_backoff_until  = 0.0
+_api_backoff_logged = 0.0
+
+
+def api_backoff_active():
+    return time.time() < _api_backoff_until
+
+
+def trigger_api_backoff(reason=""):
+    global _api_backoff_until
+    _api_backoff_until = time.time() + API_BACKOFF_SECONDS
+    print(f"[API BACKOFF] pausing all market-data scanning for {API_BACKOFF_SECONDS}s - {reason}")
+
+
+def _looks_like_rate_limit(resp):
+    if not isinstance(resp, dict):
+        return False
+    msg = str(resp.get("msg", "")).lower()
+    return resp.get("code") == 109429 or "over" in msg or "too many" in msg or "too frequent" in msg
+
 
 # ==================== CORE API HELPERS ====================
 def build_signed_params(params: dict) -> dict:
@@ -164,6 +192,14 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0):
 
 
 def get_candles(symbol, limit=350, interval="15m", end_time=None):
+    global _api_backoff_logged
+    if api_backoff_active():
+        now = time.time()
+        if now - _api_backoff_logged > 60:   # don't spam the log every single call while backed off
+            remaining = int(_api_backoff_until - now)
+            print(f"[API BACKOFF] still active - skipping candle requests for {remaining}s more")
+            _api_backoff_logged = now
+        return []
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     if end_time is not None:
         params["endTime"] = int(end_time)
@@ -179,7 +215,10 @@ def get_candles(symbol, limit=350, interval="15m", end_time=None):
     # genuine API-side problem shows up in the Render logs instead of just quietly
     # starving both strategies of data.
     if not isinstance(candles, list):
-        print(f"[CANDLES ERROR] {symbol} {interval} limit={limit} - non-list response: {str(r)[:300]}")
+        if _looks_like_rate_limit(r):
+            trigger_api_backoff(f"{symbol} {interval}: {str(r)[:200]}")
+        else:
+            print(f"[CANDLES ERROR] {symbol} {interval} limit={limit} - non-list response: {str(r)[:300]}")
         return []
     if len(candles) < min(limit, 50):
         print(f"[CANDLES SHORT] {symbol} {interval} requested={limit} got={len(candles)} - raw: {str(r)[:300]}")
@@ -1031,8 +1070,11 @@ def handle_telegram_commands():
                 elif text == "/status":
                     t = "ON" if tight_auto_trade_enabled else "OFF"
                     f = "ON" if fast_auto_trade_enabled  else "OFF"
+                    backoff = ""
+                    if api_backoff_active():
+                        backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
                     send_tg("Tight: " + t + " | Watching: " + str(len(tight_watch)) + " | Open: " + str(len(tight_open_trades)) +
-                            "\nFast Signal: " + f + " | Open: " + str(len(fast_open_trades)))
+                            "\nFast Signal: " + f + " | Open: " + str(len(fast_open_trades)) + backoff)
                 elif text == "/fast_start":
                     fast_auto_trade_enabled = True
                     send_tg("Fast Signal Auto-trade ON.")

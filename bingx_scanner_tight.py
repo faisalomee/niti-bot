@@ -173,8 +173,17 @@ def get_candles(symbol, limit=350, interval="15m"):
     r = requests.get(url, params=params,
                      headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     candles = r.get("data", [])
+    # ---- Diagnostic logging (added 2026-07-11) ----
+    # get_candles() used to fail silently: any non-list/empty "data" (rate-limit
+    # response, error payload, API cap on `limit`, etc.) just became [] with zero
+    # visibility. This logs the raw response whenever the result looks off, so a
+    # genuine API-side problem shows up in the Render logs instead of just quietly
+    # starving both strategies of data.
     if not isinstance(candles, list):
+        print(f"[CANDLES ERROR] {symbol} {interval} limit={limit} - non-list response: {str(r)[:300]}")
         return []
+    if len(candles) < min(limit, 50):
+        print(f"[CANDLES SHORT] {symbol} {interval} requested={limit} got={len(candles)} - raw: {str(r)[:300]}")
     candles.sort(key=lambda x: x["time"])
     return candles
 
@@ -1029,6 +1038,30 @@ def trailing_loop():
         time.sleep(30)
 
 
+def fast_diagnostic_check():
+    """Prints a sample calculation for a known-liquid coin every cycle, so we can see
+    in the logs whether the data pipeline (candles -> ratios) is actually alive,
+    independent of whether a real signal happens to fire."""
+    try:
+        candles = get_candles("BTC-USDT", limit=100, interval=FAST_TIMEFRAME)
+        if len(candles) < 60:
+            print(f"[FAST DIAG] BTC-USDT - only got {len(candles)} candles (need ~60+)")
+            return
+        confirmed = candles[:-1]
+        closes = [cl(c) for c in confirmed]
+        highs  = [h(c) for c in confirmed]
+        lows   = [l(c) for c in confirmed]
+        vols   = [v(c) for c in confirmed]
+        i = len(confirmed) - 1
+        avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
+        ratio = vols[i] / avg_vol if avg_vol > 0 else 0
+        box_high = max(highs[i - FAST_CONSOL_LOOKBACK:i])
+        box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
+        print(f"[FAST DIAG] BTC-USDT close={closes[i]} vol_ratio={ratio:.2f}x box=({box_low},{box_high}) candles={len(candles)}")
+    except Exception as e:
+        print(f"[FAST DIAG ERROR] {e}")
+
+
 def fast_scan_loop():
     print("Fast Signal loop started - 3m | consolidation breakout | MTF filter + reworked time-exit (2026-07-11)")
     all_symbols = []
@@ -1040,6 +1073,7 @@ def fast_scan_loop():
                 all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=None, exclude_top_n=FAST_EXCLUDE_TOP_N
             )
             print(f"[FAST SCAN] Scanning {len(liquid)} small/mid-cap liquid pairs for breakouts...")
+            fast_diagnostic_check()
             for sym in liquid:
                 check_fast(sym)
                 time.sleep(0.15)
@@ -1047,6 +1081,26 @@ def fast_scan_loop():
         except Exception as e:
             print(f"[FAST LOOP ERROR] {e}")
         time.sleep(180)
+
+
+def tight_diagnostic_check():
+    """Prints BTC-USDT's live volume ratio vs its 3-day baseline every cycle, so we
+    can see in the logs whether the baseline fetch (limit=TIGHT_BASELINE_CANDLES)
+    and the live-candle ratio calculation are actually working, independent of
+    whether a real 20x spike happens to occur."""
+    try:
+        baseline = get_tight_volume_baseline("BTC-USDT")
+        if not baseline:
+            print("[TIGHT DIAG] BTC-USDT - baseline is None/empty, see CANDLES ERROR/SHORT logs above")
+            return
+        candles = get_candles("BTC-USDT", limit=5, interval=TIGHT_TIMEFRAME)
+        if len(candles) < 2:
+            print(f"[TIGHT DIAG] BTC-USDT - only got {len(candles)} recent candles")
+            return
+        live_ratio = v(candles[-1]) / baseline
+        print(f"[TIGHT DIAG] BTC-USDT baseline_vol={baseline:.2f} live_vol={v(candles[-1]):.2f} ratio={live_ratio:.2f}x (need {TIGHT_SPIKE_VOL_MULT}x)")
+    except Exception as e:
+        print(f"[TIGHT DIAG ERROR] {e}")
 
 
 def tight_scan_loop():
@@ -1058,6 +1112,7 @@ def tight_scan_loop():
                 all_symbols = get_futures_symbols() or []
             symbols = get_liquid_symbols(all_symbols, min_quote_vol=TIGHT_MIN_QUOTE_VOL, max_n=TIGHT_MAX_SYMBOLS)
             print(f"[TIGHT SCAN] Scanning {len(symbols)}/{len(all_symbols)} liquid pairs | Watching={len(tight_watch)} | Open={len(tight_open_trades)} | Auto={tight_auto_trade_enabled}")
+            tight_diagnostic_check()
             for sym in symbols:
                 check_tight_symbol(sym)
             send_daily_summary()

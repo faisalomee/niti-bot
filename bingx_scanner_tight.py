@@ -809,7 +809,10 @@ def place_tight_order(symbol, side, entry, sl, tp):
         risk_dist = abs(entry - sl)
         if risk_dist <= 0:
             return None
-        qty = round(TIGHT_RISK_USDT / risk_dist, precision)
+        # Fixed notional sizing: qty = (risk_usdt * leverage) / entry
+        # Replaces risk/SL-distance formula which produced huge qty when SL was tight,
+        # requiring hundreds of dollars of margin on a $5 risk trade.
+        qty = round((TIGHT_RISK_USDT * TIGHT_LEVERAGE) / entry, precision)
         if qty <= 0:
             return None
         pos_side   = "LONG" if side == "BUY" else "SHORT"

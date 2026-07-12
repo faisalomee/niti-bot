@@ -342,7 +342,10 @@ def place_market_order(symbol, side, qty, pos_side):
         "positionSide": pos_side, "type": "MARKET", "quantity": qty,
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-    return r.get("data", {}).get("order", {}).get("orderId", "N/A")
+    oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
+    if oid == "N/A":
+        print(f"[ORDER FAIL] {symbol} {side} qty={qty} positionSide={pos_side} - BingX: {r}")
+    return oid
 
 
 def place_sl_order(symbol, close_side, pos_side, sl_price, qty):

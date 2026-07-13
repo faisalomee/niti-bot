@@ -81,6 +81,7 @@ TIGHT_MAX_COOLDOWN_WAIT_SECONDS = int(os.environ.get("TIGHT_MAX_COOLDOWN_WAIT_SE
 TIGHT_MAX_CONCURRENT_TRADES  = int(os.environ.get("TIGHT_MAX_CONCURRENT_TRADES", 4))
 TIGHT_RISK_USDT              = float(os.environ.get("TIGHT_RISK_USDT", 20.0))
 TIGHT_LEVERAGE               = int(os.environ.get("TIGHT_LEVERAGE", 20))   # fixed, per Faisal's instruction (2026-07-11)
+TIGHT_MAX_MARGIN_USDT        = float(os.environ.get("TIGHT_MAX_MARGIN_USDT", 50.0))   # safety ceiling on margin per trade when SL is very tight
 TIGHT_ATR_LEN                = 14
 
 TIGHT_SCAN_INTERVAL_SECONDS  = int(os.environ.get("TIGHT_SCAN_INTERVAL_SECONDS", 30))
@@ -809,12 +810,15 @@ def place_tight_order(symbol, side, entry, sl, tp):
         risk_dist = abs(entry - sl)
         if risk_dist <= 0:
             return None
-        # Fixed notional sizing: qty = (risk_usdt * leverage) / entry
-        # Replaces risk/SL-distance formula which produced huge qty when SL was tight,
-        # requiring hundreds of dollars of margin on a $5 risk trade.
-        qty = round((TIGHT_RISK_USDT * TIGHT_LEVERAGE) / entry, precision)
+        # Risk-based sizing: qty is set so that hitting SL always loses ~TIGHT_RISK_USDT,
+        # regardless of how tight or wide the SL distance is for this particular setup.
+        risk_qty       = TIGHT_RISK_USDT / risk_dist
+        margin_cap_qty = (TIGHT_MAX_MARGIN_USDT * TIGHT_LEVERAGE) / entry
+        qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
+        if risk_qty > margin_cap_qty:
+            print(f"[TIGHT SIZE CAP] {symbol} SL too tight for full risk qty, margin-capped at ${TIGHT_MAX_MARGIN_USDT}")
         pos_side   = "LONG" if side == "BUY" else "SHORT"
         close_side = "SELL" if side == "BUY" else "BUY"
         order_id = place_market_order(symbol, side, qty, pos_side)

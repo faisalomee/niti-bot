@@ -16,7 +16,8 @@ FAST_TRADE_AMOUNT = float(os.environ.get("FAST_TRADE_AMOUNT", 20))
 BASE_URL = "https://open-api.bingx.com"
 
 # ==================== FAST SIGNAL CONFIG ====================
-FAST_TIMEFRAME          = "3m"
+FAST_TIMEFRAME          = os.environ.get("FAST_TIMEFRAME", "1m")   # changed from 3m (2026-07-14) - cuts breakout-detection lag ~3min->~1min per Faisal's scalping goal
+FAST_SCAN_INTERVAL_SECONDS = int(os.environ.get("FAST_SCAN_INTERVAL_SECONDS", 60))   # lowered from hardcoded 180s (2026-07-14) to match 1m timeframe - otherwise the lag fix above is pointless
 FAST_MIN_QUOTE_VOL      = float(os.environ.get("FAST_MIN_QUOTE_VOL", 2_000_000))
 FAST_MAX_SYMBOLS        = 150
 FAST_CONSOL_LOOKBACK    = 20
@@ -29,6 +30,7 @@ FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 20.0))
 FAST_EXCLUDE_TOP_N       = 75
 FAST_EXTENSION_LOOKBACK  = 20
 FAST_EXTENSION_LIMIT     = 4.0
+FAST_EXTENSION_HARD_SKIP = float(os.environ.get("FAST_EXTENSION_HARD_SKIP", 7.0))   # added 2026-07-14: beyond this many x ATR, skip the trade entirely (too late/exhausted a move), not just half-size
 FAST_EXTENSION_MULT      = 0.5
 FAST_MARGIN_CAP_MULT     = 5.0
 FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 0.8))
@@ -683,6 +685,9 @@ def check_fast(symbol):
         ext_move  = abs(closes[i] - closes[i - FAST_EXTENSION_LOOKBACK])
         extension = ext_move / atr_now if atr_now > 0 else 0
         is_extended = extension > FAST_EXTENSION_LIMIT
+        if extension > FAST_EXTENSION_HARD_SKIP:
+            print(f"[FAST SKIP] {symbol} extension={extension:.1f}x ATR exceeds hard-skip limit ({FAST_EXTENSION_HARD_SKIP}x) - move too exhausted, no trade")
+            return
 
         box_high = max(highs[i - FAST_CONSOL_LOOKBACK:i])
         box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
@@ -1244,10 +1249,10 @@ def fast_scan_loop():
             for sym in liquid:
                 check_fast(sym)
                 time.sleep(0.15)
-            print("[FAST SCAN] Done. Sleeping 180s...")
+            print(f"[FAST SCAN] Done. Sleeping {FAST_SCAN_INTERVAL_SECONDS}s...")
         except Exception as e:
             print(f"[FAST LOOP ERROR] {e}")
-        time.sleep(180)
+        time.sleep(FAST_SCAN_INTERVAL_SECONDS)
 
 
 def tight_diagnostic_check():

@@ -33,6 +33,7 @@ FAST_EXTENSION_MULT      = 0.5
 FAST_MARGIN_CAP_MULT     = 5.0
 FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 0.8))
 FAST_TRAIL_ACTIVATE_RR  = 1.0
+FAST_MAX_CONCURRENT_TRADES = int(os.environ.get("FAST_MAX_CONCURRENT_TRADES", 3))   # added 2026-07-14 - Fast Signal had NO cap before, contributed to margin exhaustion
 FAST_CLOSE_POSITION_MIN = float(os.environ.get("FAST_CLOSE_POSITION_MIN", 0.6))   # loosened from 0.7 (2026-07-11)
 FAST_TRAIL_ATR_MULT     = float(os.environ.get("FAST_TRAIL_ATR_MULT", 1.5))
 FAST_TRAIL_PCT_FALLBACK = float(os.environ.get("FAST_TRAIL_PCT_FALLBACK", 3.0))
@@ -78,10 +79,10 @@ TIGHT_SL_ATR_BUFFER_MULT     = float(os.environ.get("TIGHT_SL_ATR_BUFFER_MULT", 
 TIGHT_RR_TP                  = float(os.environ.get("TIGHT_RR_TP", 4.0))
 TIGHT_BE_TRIGGER_R           = float(os.environ.get("TIGHT_BE_TRIGGER_R", 2.0))         # move SL to breakeven at this R, full size kept
 TIGHT_MAX_COOLDOWN_WAIT_SECONDS = int(os.environ.get("TIGHT_MAX_COOLDOWN_WAIT_SECONDS", 3600))   # give up watching after 60 min with no breakout
-TIGHT_MAX_CONCURRENT_TRADES  = int(os.environ.get("TIGHT_MAX_CONCURRENT_TRADES", 4))
-TIGHT_RISK_USDT              = float(os.environ.get("TIGHT_RISK_USDT", 20.0))
+TIGHT_MAX_CONCURRENT_TRADES  = int(os.environ.get("TIGHT_MAX_CONCURRENT_TRADES", 3))   # lowered from 4 (2026-07-14) - margin exhaustion across Tight+Fast
+TIGHT_RISK_USDT              = float(os.environ.get("TIGHT_RISK_USDT", 5.0))   # lowered from 20.0 (2026-07-14) per Faisal's decision
 TIGHT_LEVERAGE               = int(os.environ.get("TIGHT_LEVERAGE", 20))   # fixed, per Faisal's instruction (2026-07-11)
-TIGHT_MAX_MARGIN_USDT        = float(os.environ.get("TIGHT_MAX_MARGIN_USDT", 50.0))   # safety ceiling on margin per trade when SL is very tight
+TIGHT_MAX_MARGIN_USDT        = float(os.environ.get("TIGHT_MAX_MARGIN_USDT", 40.0))   # lowered from 50.0 (2026-07-14)
 TIGHT_ATR_LEN                = 14
 
 TIGHT_SCAN_INTERVAL_SECONDS  = int(os.environ.get("TIGHT_SCAN_INTERVAL_SECONDS", 30))
@@ -395,6 +396,19 @@ def check_order_status(order_id, symbol):
         return ""
 
 
+def get_fill_price(order_id, symbol, fallback=0.0):
+    """Actual average fill price for an order, for accurate PnL - falls back to the
+    nominal signal-time price if the exchange hasn't got it yet or the call fails."""
+    try:
+        params = build_signed_params({"symbol": symbol, "orderId": order_id})
+        url = BASE_URL + "/openApi/swap/v2/trade/order"
+        r = requests.get(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        avg = float(r.get("data", {}).get("order", {}).get("avgPrice", 0) or 0)
+        return avg if avg > 0 else fallback
+    except Exception:
+        return fallback
+
+
 def close_fast_position(symbol, reason=""):
     if symbol not in fast_open_trades:
         return
@@ -403,17 +417,21 @@ def close_fast_position(symbol, reason=""):
         pos_side   = "LONG"  if trade["side"] == "BUY" else "SHORT"
         close_side = "SELL"  if trade["side"] == "BUY" else "BUY"
         remaining  = trade.get("remaining_qty", 0)
+        exit_price = get_current_price(symbol)
         if remaining > 0 and fast_auto_trade_enabled:
-            place_market_order(symbol, close_side, remaining, pos_side)
+            close_oid = place_market_order(symbol, close_side, remaining, pos_side)
+            if close_oid and close_oid != "N/A":
+                time.sleep(0.5)
+                exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
         if trade.get("sl_id"):
             cancel_order(symbol, trade["sl_id"])
         if not trade.get("tp1_filled") and trade.get("tp1_id"):
             cancel_order(symbol, trade["tp1_id"])
-        current = get_current_price(symbol)
+        entry_ref = trade.get("entry_fill", trade["entry"])
         if trade["side"] == "BUY":
-            leg_pnl = (current - trade["entry"]) * remaining
+            leg_pnl = (exit_price - entry_ref) * remaining
         else:
-            leg_pnl = (trade["entry"] - current) * remaining
+            leg_pnl = (entry_ref - exit_price) * remaining
         total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
         trade["pnl"]    = total_pnl
         trade["result"] = reason
@@ -435,20 +453,23 @@ def close_tight_position(oid, reason=""):
         symbol     = trade["symbol"]
         pos_side   = trade["pos_side"]
         close_side = trade["close_side"]
-        qty        = trade.get("qty", 0)
-        entry      = trade["entry"]
+        qty        = trade.get("remaining_qty", trade.get("total_qty", 0))
+        entry_ref  = trade.get("entry_fill", trade["entry"])
+        exit_price = get_current_price(symbol)
         if qty > 0 and tight_auto_trade_enabled:
-            place_market_order(symbol, close_side, qty, pos_side)
+            close_oid = place_market_order(symbol, close_side, qty, pos_side)
+            if close_oid and close_oid != "N/A":
+                time.sleep(0.5)
+                exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
         if trade.get("sl_id"):
             cancel_order(symbol, trade["sl_id"])
         if trade.get("tp_id"):
             cancel_order(symbol, trade["tp_id"])
-        current = get_current_price(symbol)
         if trade["side"] == "BUY":
-            leg_pnl = (current - entry) * qty
+            leg_pnl = (exit_price - entry_ref) * qty
         else:
-            leg_pnl = (entry - current) * qty
-        trade["pnl"]    = round(leg_pnl, 2)
+            leg_pnl = (entry_ref - exit_price) * qty
+        trade["pnl"]    = round(trade.get("tp1_pnl", 0) + leg_pnl, 2)
         trade["result"] = reason
         trade["label"]  = "Tight"
         daily_trades.append(trade)
@@ -481,10 +502,11 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usd
         print(f"[FAST ORDER] {symbol} {side} lev={lev}x qty={total_qty} risk=${risk_usdt}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
+            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
             sl_id  = place_sl_order(symbol, close_side, pos_side, sl_price, total_qty)
             tp1_id = place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
             fast_open_trades[symbol] = {
-                "symbol": symbol, "side": side, "entry": entry,
+                "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
                 "sl": sl_price, "sl_id": sl_id, "tp1": tp1_price, "tp1_id": tp1_id, "lev": lev,
                 "sl_pct": sl_pct, "close_side": close_side, "pos_side": pos_side,
                 "total_qty": total_qty, "remaining_qty": total_qty, "tp1_filled": False, "partial_pnl": 0.0,
@@ -509,8 +531,11 @@ def track_fast_trades():
             if not trade.get("tp1_filled") and trade.get("tp1_id"):
                 status = check_order_status(trade["tp1_id"], symbol)
                 if status == "FILLED":
-                    half_qty = round(trade["total_qty"] / 2, symbol_precision.get(symbol, 4))
-                    leg_pnl  = (trade["tp1"] - trade["entry"]) * half_qty if trade["side"] == "BUY" else (trade["entry"] - trade["tp1"]) * half_qty
+                    half_qty  = round(trade["total_qty"] / 2, symbol_precision.get(symbol, 4))
+                    entry_ref = trade.get("entry_fill", trade["entry"])
+                    tp1_fill  = get_fill_price(trade["tp1_id"], symbol, fallback=trade["tp1"])
+                    trade["tp1_fill"] = tp1_fill
+                    leg_pnl   = (tp1_fill - entry_ref) * half_qty if trade["side"] == "BUY" else (entry_ref - tp1_fill) * half_qty
                     trade["partial_pnl"]   = trade.get("partial_pnl", 0.0) + leg_pnl
                     trade["remaining_qty"] = trade["total_qty"] - half_qty
                     trade["tp1_filled"]    = True
@@ -528,10 +553,12 @@ def track_fast_trades():
                 if not trade.get("tp1_filled") and trade.get("tp1_id"):
                     cancel_order(symbol, trade["tp1_id"])
                 remaining = trade.get("remaining_qty", 0)
+                entry_ref = trade.get("entry_fill", trade["entry"])
+                sl_fill   = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
                 if trade["side"] == "BUY":
-                    leg_pnl = (trade["sl"] - trade["entry"]) * remaining
+                    leg_pnl = (sl_fill - entry_ref) * remaining
                 else:
-                    leg_pnl = (trade["entry"] - trade["sl"]) * remaining
+                    leg_pnl = (entry_ref - sl_fill) * remaining
                 total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
                 trade["pnl"]    = total_pnl
                 trade["result"] = "BE" if trade.get("tp1_filled") else "SL"
@@ -714,7 +741,9 @@ def check_fast(symbol):
             ext_tag    = "extended (half size)" if is_extended else "fresh move"
             print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             trade_status = ""
-            if fast_auto_trade_enabled:
+            if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
+                trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
+            elif fast_auto_trade_enabled:
                 oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price, atr_now, risk_usdt)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
@@ -740,7 +769,9 @@ def check_fast(symbol):
             ext_tag    = "extended (half size)" if is_extended else "fresh move"
             print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             trade_status = ""
-            if fast_auto_trade_enabled:
+            if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
+                trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
+            elif fast_auto_trade_enabled:
                 oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price, atr_now, risk_usdt)
                 trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
             else:
@@ -814,24 +845,39 @@ def place_tight_order(symbol, side, entry, sl, tp):
         # regardless of how tight or wide the SL distance is for this particular setup.
         risk_qty       = TIGHT_RISK_USDT / risk_dist
         margin_cap_qty = (TIGHT_MAX_MARGIN_USDT * TIGHT_LEVERAGE) / entry
-        qty = round(min(risk_qty, margin_cap_qty), precision)
-        if qty <= 0:
+        total_qty = round(min(risk_qty, margin_cap_qty), precision)
+        if total_qty <= 0:
             return None
         if risk_qty > margin_cap_qty:
             print(f"[TIGHT SIZE CAP] {symbol} SL too tight for full risk qty, margin-capped at ${TIGHT_MAX_MARGIN_USDT}")
         pos_side   = "LONG" if side == "BUY" else "SHORT"
         close_side = "SELL" if side == "BUY" else "BUY"
-        order_id = place_market_order(symbol, side, qty, pos_side)
-        print(f"[TIGHT ORDER] {symbol} {side} qty={qty} risk=${TIGHT_RISK_USDT}: {order_id}")
+
+        # TP1 at TIGHT_BE_TRIGGER_R (2R): take half off, lock in real profit instead of
+        # only moving to breakeven. Remaining half keeps running toward the 4R final TP,
+        # protected by a trailing SL instead of sitting flat at breakeven.
+        half_qty = round(total_qty / 2, precision)
+        if side == "BUY":
+            tp1_price = round(entry + risk_dist * TIGHT_BE_TRIGGER_R, precision)
+        else:
+            tp1_price = round(entry - risk_dist * TIGHT_BE_TRIGGER_R, precision)
+
+        order_id = place_market_order(symbol, side, total_qty, pos_side)
+        print(f"[TIGHT ORDER] {symbol} {side} qty={total_qty} risk=${TIGHT_RISK_USDT}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
-            sl_id = place_sl_order(symbol, close_side, pos_side, sl, qty)
-            tp_id = place_tp_order(symbol, close_side, pos_side, tp, qty)
+            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
+            sl_id  = place_sl_order(symbol, close_side, pos_side, sl, total_qty)
+            tp1_id = place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
+            tp_id  = place_tp_order(symbol, close_side, pos_side, tp, total_qty - half_qty)
             tight_open_trades[str(order_id)] = {
-                "symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp": tp,
-                "qty": qty, "sl_id": sl_id, "tp_id": tp_id,
+                "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill, "sl": sl, "tp": tp,
+                "total_qty": total_qty, "half_qty": half_qty, "remaining_qty": total_qty - half_qty,
+                "tp1": tp1_price, "tp1_id": tp1_id, "tp1_filled": False,
+                "sl_id": sl_id, "tp_id": tp_id,
                 "close_side": close_side, "pos_side": pos_side,
                 "risk_dist": risk_dist, "be_done": False,
+                "trail_price": None,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
@@ -963,40 +1009,76 @@ def check_tight_symbol(symbol):
         print(f"[TIGHT {symbol}] error: {e}")
 
 
+TIGHT_TRAIL_R_MULT = float(os.environ.get("TIGHT_TRAIL_R_MULT", 1.0))  # trailing SL stays this many R behind the best price, once TP1 is taken
+
 def track_tight_trades():
     for oid in list(tight_open_trades.keys()):
         trade = tight_open_trades.get(oid)
         if not trade:
             continue
         try:
-            symbol = trade["symbol"]
+            symbol    = trade["symbol"]
+            risk_dist = trade.get("risk_dist", 0)
 
-            # ---- Move SL to breakeven at TIGHT_BE_TRIGGER_R, full size kept ----
-            if not trade.get("be_done"):
+            # ---- TP1 (half) filled at 2R: book real profit, move remaining half to
+            # breakeven, then start trailing its SL toward the final 4R target ----
+            if not trade.get("tp1_filled") and trade.get("tp1_id"):
+                status = check_order_status(trade["tp1_id"], symbol)
+                if status == "FILLED":
+                    trade["tp1_filled"] = True
+                    entry_ref = trade.get("entry_fill", trade["entry"])
+                    tp1_fill  = get_fill_price(trade["tp1_id"], symbol, fallback=trade["tp1"])
+                    trade["tp1_fill"] = tp1_fill
+                    leg_pnl = (tp1_fill - entry_ref) * trade["half_qty"] if trade["side"] == "BUY" else (entry_ref - tp1_fill) * trade["half_qty"]
+                    trade["tp1_pnl"] = round(leg_pnl, 2)
+                    if trade.get("sl_id"):
+                        cancel_order(symbol, trade["sl_id"])
+                    new_sl_id = place_sl_order(symbol, trade["close_side"], trade["pos_side"], trade["entry"], trade["remaining_qty"])
+                    trade["sl_id"]      = new_sl_id
+                    trade["sl"]         = trade["entry"]
+                    trade["be_done"]    = True
+                    trade["trail_price"] = trade["entry"]
+                    print(f"[TIGHT TP1] {symbol} - half closed at {tp1_fill}, remaining {trade['remaining_qty']} moved to BE")
+
+            # ---- Trail the remaining half's SL once TP1 is banked ----
+            if trade.get("tp1_filled") and risk_dist > 0:
                 current = get_current_price(symbol)
-                risk_dist = trade.get("risk_dist", 0)
-                if current > 0 and risk_dist > 0:
+                if current > 0:
+                    trail_dist = risk_dist * TIGHT_TRAIL_R_MULT
                     if trade["side"] == "BUY":
-                        favorable_r = (current - trade["entry"]) / risk_dist
+                        if current > trade["trail_price"]:
+                            trade["trail_price"] = current
+                            new_sl = round(trade["trail_price"] - trail_dist, symbol_precision.get(symbol, 4))
+                            if new_sl > trade["sl"]:
+                                if trade.get("sl_id"):
+                                    cancel_order(symbol, trade["sl_id"])
+                                trade["sl_id"] = place_sl_order(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
+                                trade["sl"] = new_sl
                     else:
-                        favorable_r = (trade["entry"] - current) / risk_dist
-                    if favorable_r >= TIGHT_BE_TRIGGER_R:
-                        if trade.get("sl_id"):
-                            cancel_order(symbol, trade["sl_id"])
-                        new_sl_id = place_sl_order(symbol, trade["close_side"], trade["pos_side"], trade["entry"], trade["qty"])
-                        trade["sl_id"]   = new_sl_id
-                        trade["sl"]      = trade["entry"]
-                        trade["be_done"] = True
-                        print(f"[TIGHT BE] {symbol} - SL moved to breakeven at {favorable_r:.2f}R")
+                        if current < trade["trail_price"]:
+                            trade["trail_price"] = current
+                            new_sl = round(trade["trail_price"] + trail_dist, symbol_precision.get(symbol, 4))
+                            if new_sl < trade["sl"]:
+                                if trade.get("sl_id"):
+                                    cancel_order(symbol, trade["sl_id"])
+                                trade["sl_id"] = place_sl_order(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
+                                trade["sl"] = new_sl
 
             sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
             if sl_status == "FILLED":
                 if trade.get("tp_id"):
                     cancel_order(symbol, trade["tp_id"])
-                result = "BE" if trade.get("be_done") else "SL"
-                final_price = trade["sl"]
-                leg_pnl = (final_price - trade["entry"]) * trade["qty"] if trade["side"] == "BUY" else (trade["entry"] - final_price) * trade["qty"]
-                trade["pnl"]    = round(leg_pnl, 2)
+                entry_ref = trade.get("entry_fill", trade["entry"])
+                sl_fill   = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
+                if trade.get("tp1_filled"):
+                    result   = "Trail" if trade["sl"] != trade["entry"] else "BE"
+                    rem_qty  = trade["remaining_qty"]
+                    leg_pnl  = (sl_fill - entry_ref) * rem_qty if trade["side"] == "BUY" else (entry_ref - sl_fill) * rem_qty
+                    trade["pnl"] = round(trade.get("tp1_pnl", 0) + leg_pnl, 2)
+                else:
+                    result = "SL"
+                    leg_pnl = (sl_fill - entry_ref) * trade["total_qty"] if trade["side"] == "BUY" else (entry_ref - sl_fill) * trade["total_qty"]
+                    trade["pnl"] = round(leg_pnl, 2)
                 trade["result"] = result
                 trade["label"]  = "Tight"
                 daily_trades.append(trade)
@@ -1008,9 +1090,11 @@ def track_tight_trades():
             if tp_status == "FILLED":
                 if trade.get("sl_id"):
                     cancel_order(symbol, trade["sl_id"])
-                final_price = trade["tp"]
-                leg_pnl = (final_price - trade["entry"]) * trade["qty"] if trade["side"] == "BUY" else (trade["entry"] - final_price) * trade["qty"]
-                trade["pnl"]    = round(leg_pnl, 2)
+                entry_ref = trade.get("entry_fill", trade["entry"])
+                tp_fill   = get_fill_price(trade["tp_id"], symbol, fallback=trade["tp"])
+                rem_qty = trade["remaining_qty"] if trade.get("tp1_filled") else trade["total_qty"]
+                leg_pnl = (tp_fill - entry_ref) * rem_qty if trade["side"] == "BUY" else (entry_ref - tp_fill) * rem_qty
+                trade["pnl"]    = round(trade.get("tp1_pnl", 0) + leg_pnl, 2)
                 trade["result"] = "TP"
                 trade["label"]  = "Tight"
                 daily_trades.append(trade)
@@ -1054,6 +1138,18 @@ def send_daily_summary():
 def handle_telegram_commands():
     global tight_auto_trade_enabled, fast_auto_trade_enabled
     offset = None
+    # On startup, discard any backlog of old pending updates (e.g. a /start sent
+    # before a previous crash/redeploy) so they don't get silently replayed and
+    # flip auto-trade ON without a fresh command from Faisal.
+    try:
+        flush = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params={"timeout": 0}, timeout=10).json()
+        pending = flush.get("result", [])
+        if pending:
+            offset = pending[-1]["update_id"] + 1
+            requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=10)
+            print(f"[TG CMD] Flushed {len(pending)} stale pending update(s) on startup")
+    except Exception as e:
+        print(f"[TG CMD] startup flush error: {e}")
     while True:
         try:
             url    = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"

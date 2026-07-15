@@ -16,14 +16,15 @@ FAST_TRADE_AMOUNT = float(os.environ.get("FAST_TRADE_AMOUNT", 20))
 BASE_URL = "https://open-api.bingx.com"
 
 # ==================== FAST SIGNAL CONFIG ====================
-FAST_TIMEFRAME          = os.environ.get("FAST_TIMEFRAME", "1m")   # changed from 3m (2026-07-14) - cuts breakout-detection lag ~3min->~1min per Faisal's scalping goal
-FAST_SCAN_INTERVAL_SECONDS = int(os.environ.get("FAST_SCAN_INTERVAL_SECONDS", 60))   # lowered from hardcoded 180s (2026-07-14) to match 1m timeframe - otherwise the lag fix above is pointless
+FAST_TIMEFRAME          = os.environ.get("FAST_TIMEFRAME", "15m")  # changed 1m->15m (2026-07-16) - VBCB redesign: 1m was pure noise-chasing (mostly TimeExits); 15m matches the consolidation-breakout setups Faisal actually wants
+FAST_SCAN_INTERVAL_SECONDS = int(os.environ.get("FAST_SCAN_INTERVAL_SECONDS", 180))  # back to 180s (2026-07-16) - 15m candles, 60s scanning is wasted API calls
 FAST_MIN_QUOTE_VOL      = float(os.environ.get("FAST_MIN_QUOTE_VOL", 2_000_000))
 FAST_MAX_SYMBOLS        = 150
 FAST_CONSOL_LOOKBACK    = 20
 FAST_BREAKOUT_ATR_MULT  = float(os.environ.get("FAST_BREAKOUT_ATR_MULT", 0.2))   # loosened from 0.3 (2026-07-11) - catch moves earlier
-FAST_VOL_MULT           = 3.0
+FAST_VOL_MULT           = float(os.environ.get("FAST_VOL_MULT", 2.0))   # VBCB (2026-07-16): breakout vol >= 2x avg of last 20 candles (was hardcoded 3.0 on 1m)
 FAST_VOL_LB             = 20
+FAST_BOX_MAX_ATR_MULT   = float(os.environ.get("FAST_BOX_MAX_ATR_MULT", 3.0))   # VBCB core filter (2026-07-16): 20-candle box height must be <= 3x ATR to count as real consolidation - kills the late-entry/chasing problem (e.g. RAVE bought at +17% top)
 FAST_ATR_LEN            = 14
 FAST_SL_ATR_MULT        = 1.2   # NOTE: dead/unused - actual SL uses SL_ATR_BUFFER_MULT below. Kept only for reference.
 FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 20.0))
@@ -33,7 +34,7 @@ FAST_EXTENSION_LIMIT     = 4.0
 FAST_EXTENSION_HARD_SKIP = float(os.environ.get("FAST_EXTENSION_HARD_SKIP", 7.0))   # added 2026-07-14: beyond this many x ATR, skip the trade entirely (too late/exhausted a move), not just half-size
 FAST_EXTENSION_MULT      = 0.5
 FAST_MARGIN_CAP_MULT     = 5.0
-FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 0.8))
+FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 2.0))   # raised 0.8->2.0 (2026-07-16): 0.8R half-qty TP1 banked ~$2 vs -$5 full SL -> needed ~70% WR just to break even. 2R half banks full risk amount.
 FAST_TRAIL_ACTIVATE_RR  = 1.0
 FAST_MAX_CONCURRENT_TRADES = int(os.environ.get("FAST_MAX_CONCURRENT_TRADES", 3))   # added 2026-07-14 - Fast Signal had NO cap before, contributed to margin exhaustion
 FAST_CLOSE_POSITION_MIN = float(os.environ.get("FAST_CLOSE_POSITION_MIN", 0.6))   # loosened from 0.7 (2026-07-11)
@@ -48,10 +49,10 @@ SL_ATR_BUFFER_MULT = 0.3   # shared SL buffer, used by both Fast and Tight
 # never time-exited (trailing handles it); only flat/losing trades and trades whose
 # profit has stalled (stagnant) get timed out. A long backup cap protects against
 # a trade getting stuck open due to a bug/glitch.
-FAST_PROGRESS_CHECK_SECONDS   = int(os.environ.get("FAST_PROGRESS_CHECK_SECONDS", 900))    # 15 min between checks
+FAST_PROGRESS_CHECK_SECONDS   = int(os.environ.get("FAST_PROGRESS_CHECK_SECONDS", 1800))   # 30 min between checks (2026-07-16: was 15min - too twitchy for 15m timeframe)
 FAST_STAGNATION_CHECKS        = int(os.environ.get("FAST_STAGNATION_CHECKS", 3))           # consecutive non-improving checks (~45 min) before locking profit
 FAST_STAGNATION_MIN_R_INCREASE = float(os.environ.get("FAST_STAGNATION_MIN_R_INCREASE", 0.1))
-FAST_SAFETY_CAP_SECONDS       = int(os.environ.get("FAST_SAFETY_CAP_SECONDS", 12600))      # 3.5h - backup net only, should basically never trigger in normal operation
+FAST_SAFETY_CAP_SECONDS       = int(os.environ.get("FAST_SAFETY_CAP_SECONDS", 21600))      # 6h backup net (2026-07-16: was 3.5h - 15m swings need more room)
 
 # ---- MTF trend filter (added to Fast Signal 2026-07-11, reusing the Tight-era helper) ----
 # Direction-only check against the already-closed 1h candle - no extra waiting,
@@ -538,7 +539,7 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usd
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
             print(f"[FAST MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f} - skipping")
-            return None
+            return "MARGIN_SKIP"
 
         order_id = place_market_order(symbol, side, total_qty, pos_side)
         print(f"[FAST ORDER] {symbol} {side} lev={lev}x qty={total_qty} risk=${risk_usdt}: {order_id}")
@@ -774,6 +775,14 @@ def check_fast(symbol):
         if not long_signal and not short_signal:
             return
 
+        # ---- VBCB consolidation filter (added 2026-07-16) ----
+        # A breakout only counts if it breaks out of a genuinely TIGHT range.
+        # Wide box = price was trending, "breakout" is just chasing an extended move.
+        box_height = box_high - box_low
+        if atr_now > 0 and box_height > atr_now * FAST_BOX_MAX_ATR_MULT:
+            print(f"[FAST SKIP] {symbol} box={box_height/atr_now:.1f}x ATR too wide (max {FAST_BOX_MAX_ATR_MULT}x) - not a consolidation, breakout would be chasing")
+            return
+
         # ---- MTF trend filter (added 2026-07-11) - direction-only, no timing delay ----
         if MTF_FILTER_ENABLED and (long_signal or short_signal):
             mtf_trend = get_mtf_trend(symbol)
@@ -813,7 +822,12 @@ def check_fast(symbol):
                 trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
             elif fast_auto_trade_enabled:
                 oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price, atr_now, risk_usdt)
-                trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
+                if oid == "MARGIN_SKIP":
+                    trade_status = "\nSkipped - insufficient margin"
+                elif oid and oid != "N/A":
+                    trade_status = "\nOrder: " + str(oid)
+                else:
+                    trade_status = "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
             send_tg(
@@ -841,7 +855,12 @@ def check_fast(symbol):
                 trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
             elif fast_auto_trade_enabled:
                 oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price, atr_now, risk_usdt)
-                trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
+                if oid == "MARGIN_SKIP":
+                    trade_status = "\nSkipped - insufficient margin"
+                elif oid and oid != "N/A":
+                    trade_status = "\nOrder: " + str(oid)
+                else:
+                    trade_status = "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
             send_tg(
@@ -927,7 +946,7 @@ def place_tight_order(symbol, side, entry, sl, tp):
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
             print(f"[TIGHT MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f} - skipping")
-            return None
+            return "MARGIN_SKIP"
 
         half_qty = round(total_qty / 2, precision)
 
@@ -1088,7 +1107,12 @@ def check_tight_symbol(symbol):
             trade_status = ""
             if tight_auto_trade_enabled:
                 oid = place_tight_order(symbol, side, entry, sl, tp)
-                trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
+                if oid == "MARGIN_SKIP":
+                    trade_status = "\nSkipped - insufficient margin"
+                elif oid and oid != "N/A":
+                    trade_status = "\nOrder: " + str(oid)
+                else:
+                    trade_status = "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
             send_tg(
@@ -1592,7 +1616,12 @@ def check_tight_symbol(symbol):
             trade_status = ""
             if tight_auto_trade_enabled:
                 oid = place_tight_order(symbol, side, entry, sl, tp)
-                trade_status = "\nOrder: " + str(oid) if oid and oid != "N/A" else "\nOrder failed"
+                if oid == "MARGIN_SKIP":
+                    trade_status = "\nSkipped - insufficient margin"
+                elif oid and oid != "N/A":
+                    trade_status = "\nOrder: " + str(oid)
+                else:
+                    trade_status = "\nOrder failed"
             else:
                 trade_status = "\nAuto-trade OFF"
             send_tg(

@@ -411,6 +411,37 @@ def get_fill_price(order_id, symbol, fallback=0.0):
         return fallback
 
 
+def get_available_margin():
+    """Available USDT margin from BingX. Returns None if the call fails -
+    callers must treat None as 'unknown, proceed' so a flaky balance endpoint
+    can never freeze all trading."""
+    try:
+        params = build_signed_params({})
+        url = BASE_URL + "/openApi/swap/v2/user/balance"
+        r = requests.get(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        bal = r.get("data", {}).get("balance", {})
+        if isinstance(bal, list):
+            bal = next((b for b in bal if b.get("asset") == "USDT"), bal[0] if bal else {})
+        avail = float(bal.get("availableMargin", 0) or 0)
+        return avail if avail > 0 else None
+    except Exception:
+        return None
+
+
+def place_sl_guarded(symbol, close_side, pos_side, sl_price, qty):
+    """Place an SL order with one retry. Returns sl_id, or None if BOTH attempts
+    failed - caller MUST then emergency-close the position rather than leave it
+    naked (root cause suspected in the CRV-USDT TimeExit-instead-of-SL incident)."""
+    sl_id = place_sl_order(symbol, close_side, pos_side, sl_price, qty)
+    if sl_id and sl_id != "N/A":
+        return sl_id
+    time.sleep(1)
+    sl_id = place_sl_order(symbol, close_side, pos_side, sl_price, qty)
+    if sl_id and sl_id != "N/A":
+        return sl_id
+    return None
+
+
 def close_fast_position(symbol, reason=""):
     if symbol not in fast_open_trades:
         return
@@ -500,21 +531,49 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usd
         pos_side   = "LONG"  if side == "BUY" else "SHORT"
         close_side = "SELL"  if side == "BUY" else "BUY"
         sl_pct = abs(entry - sl_price) / entry * 100
+
+        # Pre-trade margin check: skip cleanly instead of firing an order BingX will
+        # reject with 101204. None (endpoint failure) = unknown -> proceed.
+        required_margin = total_qty * entry / lev
+        avail = get_available_margin()
+        if avail is not None and avail < required_margin * 1.05:
+            print(f"[FAST MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f} - skipping")
+            return None
+
         order_id = place_market_order(symbol, side, total_qty, pos_side)
         print(f"[FAST ORDER] {symbol} {side} lev={lev}x qty={total_qty} risk=${risk_usdt}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
             entry_fill = get_fill_price(order_id, symbol, fallback=entry)
-            sl_id  = place_sl_order(symbol, close_side, pos_side, sl_price, total_qty)
+
+            # Recompute risk distance and TP1 from the REAL fill price so the stated
+            # R-multiples are real (see 2026-07-15 finding: nominal-entry levels made
+            # TP1/Trail profits tiny). SL stays structural (unchanged).
+            risk_dist = abs(entry_fill - sl_price)
+            if risk_dist <= 0:
+                risk_dist = abs(entry - sl_price)
+            if side == "BUY":
+                tp1_price = round(entry_fill + risk_dist * FAST_TP1_RR, precision)
+            else:
+                tp1_price = round(entry_fill - risk_dist * FAST_TP1_RR, precision)
+
+            # SL first, guarded: if it can't be placed even on retry, close the
+            # position immediately instead of leaving it naked.
+            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl_price, total_qty)
+            if sl_id is None:
+                print(f"[FAST SL GUARD] {symbol} SL placement failed twice - emergency closing position")
+                place_market_order(symbol, close_side, total_qty, pos_side)
+                send_tg(f"⚠️ FAST {symbol}: SL placement failed - position emergency-closed for safety")
+                return None
             tp1_id = place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
             fast_open_trades[symbol] = {
                 "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
                 "sl": sl_price, "sl_id": sl_id, "tp1": tp1_price, "tp1_id": tp1_id, "lev": lev,
                 "sl_pct": sl_pct, "close_side": close_side, "pos_side": pos_side,
                 "total_qty": total_qty, "remaining_qty": total_qty, "tp1_filled": False, "partial_pnl": 0.0,
-                "trail_price": entry, "activated": False, "order_id": order_id,
+                "trail_price": entry_fill, "activated": False, "order_id": order_id,
                 "atr_at_entry": atr_now, "opened_ts": time.time(),
-                "risk_dist": risk_dist,
+                "risk_dist": risk_dist, "be_price": None,
                 "next_check_ts": time.time() + FAST_PROGRESS_CHECK_SECONDS,
                 "best_favorable_r": 0.0, "stagnation_count": 0,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
@@ -544,11 +603,13 @@ def track_fast_trades():
 
                     if trade.get("sl_id"):
                         cancel_order(symbol, trade["sl_id"])
+                    # True breakeven = the REAL fill price, not the nominal signal price
                     new_sl_id = place_sl_order(
-                        symbol, trade["close_side"], trade["pos_side"], trade["entry"], trade["remaining_qty"]
+                        symbol, trade["close_side"], trade["pos_side"], entry_ref, trade["remaining_qty"]
                     )
-                    trade["sl_id"] = new_sl_id
-                    trade["sl"]    = trade["entry"]
+                    trade["sl_id"]    = new_sl_id
+                    trade["sl"]       = entry_ref
+                    trade["be_price"] = entry_ref
 
             sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
             if sl_status == "FILLED":
@@ -588,10 +649,11 @@ def track_fast_trades():
                 current = get_current_price(symbol)
                 risk_dist = trade.get("risk_dist", 0)
                 if current > 0 and risk_dist > 0:
+                    entry_ref = trade.get("entry_fill", trade["entry"])
                     if trade["side"] == "BUY":
-                        favorable_r = (current - trade["entry"]) / risk_dist
+                        favorable_r = (current - entry_ref) / risk_dist
                     else:
-                        favorable_r = (trade["entry"] - current) / risk_dist
+                        favorable_r = (entry_ref - current) / risk_dist
 
                     if favorable_r > 0:
                         best_r = trade.get("best_favorable_r", 0.0)
@@ -627,15 +689,16 @@ def update_fast_trailing():
             if current <= 0:
                 continue
             side = trade["side"]
+            entry_ref = trade.get("entry_fill", trade["entry"])
             activate_pct = (FAST_TRAIL_ACTIVATE_RR * trade.get("sl_pct", 1.5)) / 100
             atr_ref    = trade.get("atr_at_entry", 0)
-            trail_dist = atr_ref * FAST_TRAIL_ATR_MULT if atr_ref > 0 else trade["entry"] * (FAST_TRAIL_PCT_FALLBACK / 100)
+            trail_dist = atr_ref * FAST_TRAIL_ATR_MULT if atr_ref > 0 else entry_ref * (FAST_TRAIL_PCT_FALLBACK / 100)
 
             if not trade.get("activated"):
-                if side == "BUY" and current >= trade["entry"] * (1 + activate_pct):
+                if side == "BUY" and current >= entry_ref * (1 + activate_pct):
                     fast_open_trades[symbol]["activated"]   = True
                     fast_open_trades[symbol]["trail_price"] = current
-                elif side == "SELL" and current <= trade["entry"] * (1 - activate_pct):
+                elif side == "SELL" and current <= entry_ref * (1 - activate_pct):
                     fast_open_trades[symbol]["activated"]   = True
                     fast_open_trades[symbol]["trail_price"] = current
                 continue
@@ -858,21 +921,45 @@ def place_tight_order(symbol, side, entry, sl, tp):
         pos_side   = "LONG" if side == "BUY" else "SHORT"
         close_side = "SELL" if side == "BUY" else "BUY"
 
-        # TP1 at TIGHT_BE_TRIGGER_R (2R): take half off, lock in real profit instead of
-        # only moving to breakeven. Remaining half keeps running toward the 4R final TP,
-        # protected by a trailing SL instead of sitting flat at breakeven.
+        # Pre-trade margin check: skip cleanly instead of firing an order BingX will
+        # reject with 101204. None (endpoint failure) = unknown -> proceed.
+        required_margin = total_qty * entry / TIGHT_LEVERAGE
+        avail = get_available_margin()
+        if avail is not None and avail < required_margin * 1.05:
+            print(f"[TIGHT MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f} - skipping")
+            return None
+
         half_qty = round(total_qty / 2, precision)
-        if side == "BUY":
-            tp1_price = round(entry + risk_dist * TIGHT_BE_TRIGGER_R, precision)
-        else:
-            tp1_price = round(entry - risk_dist * TIGHT_BE_TRIGGER_R, precision)
 
         order_id = place_market_order(symbol, side, total_qty, pos_side)
         print(f"[TIGHT ORDER] {symbol} {side} qty={total_qty} risk=${TIGHT_RISK_USDT}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
             entry_fill = get_fill_price(order_id, symbol, fallback=entry)
-            sl_id  = place_sl_order(symbol, close_side, pos_side, sl, total_qty)
+
+            # Recompute risk distance and BOTH take-profit levels from the REAL fill
+            # price, not the nominal signal price. Otherwise slippage compresses the
+            # actual R-multiples: "TP1 at 2R" measured from a worse real entry can be
+            # only ~0.5-1R away in reality (confirmed 2026-07-15: Trail wins of
+            # +$0.68-$2 against -$5-6 SLs). SL itself stays structural (unchanged).
+            risk_dist = abs(entry_fill - sl)
+            if risk_dist <= 0:
+                risk_dist = abs(entry - sl)
+            if side == "BUY":
+                tp1_price = round(entry_fill + risk_dist * TIGHT_BE_TRIGGER_R, precision)
+                tp        = round(entry_fill + risk_dist * TIGHT_RR_TP, precision)
+            else:
+                tp1_price = round(entry_fill - risk_dist * TIGHT_BE_TRIGGER_R, precision)
+                tp        = round(entry_fill - risk_dist * TIGHT_RR_TP, precision)
+
+            # SL first, guarded: if it can't be placed even on retry, close the
+            # position immediately instead of leaving it naked.
+            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl, total_qty)
+            if sl_id is None:
+                print(f"[TIGHT SL GUARD] {symbol} SL placement failed twice - emergency closing position")
+                place_market_order(symbol, close_side, total_qty, pos_side)
+                send_tg(f"⚠️ TIGHT {symbol}: SL placement failed - position emergency-closed for safety")
+                return None
             tp1_id = place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
             tp_id  = place_tp_order(symbol, close_side, pos_side, tp, total_qty - half_qty)
             tight_open_trades[str(order_id)] = {
@@ -882,7 +969,7 @@ def place_tight_order(symbol, side, entry, sl, tp):
                 "sl_id": sl_id, "tp_id": tp_id,
                 "close_side": close_side, "pos_side": pos_side,
                 "risk_dist": risk_dist, "be_done": False,
-                "trail_price": None,
+                "trail_price": None, "be_price": None,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
@@ -1038,12 +1125,14 @@ def track_tight_trades():
                     trade["tp1_pnl"] = round(leg_pnl, 2)
                     if trade.get("sl_id"):
                         cancel_order(symbol, trade["sl_id"])
-                    new_sl_id = place_sl_order(symbol, trade["close_side"], trade["pos_side"], trade["entry"], trade["remaining_qty"])
+                    # True breakeven = the REAL fill price, not the nominal signal price
+                    new_sl_id = place_sl_order(symbol, trade["close_side"], trade["pos_side"], entry_ref, trade["remaining_qty"])
                     trade["sl_id"]      = new_sl_id
-                    trade["sl"]         = trade["entry"]
+                    trade["sl"]         = entry_ref
+                    trade["be_price"]   = entry_ref
                     trade["be_done"]    = True
-                    trade["trail_price"] = trade["entry"]
-                    print(f"[TIGHT TP1] {symbol} - half closed at {tp1_fill}, remaining {trade['remaining_qty']} moved to BE")
+                    trade["trail_price"] = entry_ref
+                    print(f"[TIGHT TP1] {symbol} - half closed at {tp1_fill}, remaining {trade['remaining_qty']} moved to BE ({entry_ref})")
 
             # ---- Trail the remaining half's SL once TP1 is banked ----
             if trade.get("tp1_filled") and risk_dist > 0:
@@ -1076,7 +1165,7 @@ def track_tight_trades():
                 entry_ref = trade.get("entry_fill", trade["entry"])
                 sl_fill   = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
                 if trade.get("tp1_filled"):
-                    result   = "Trail" if trade["sl"] != trade["entry"] else "BE"
+                    result   = "Trail" if trade["sl"] != trade.get("be_price", trade["entry"]) else "BE"
                     rem_qty  = trade["remaining_qty"]
                     leg_pnl  = (sl_fill - entry_ref) * rem_qty if trade["side"] == "BUY" else (entry_ref - sl_fill) * rem_qty
                     trade["pnl"] = round(trade.get("tp1_pnl", 0) + leg_pnl, 2)
@@ -1235,7 +1324,7 @@ def fast_diagnostic_check():
 
 
 def fast_scan_loop():
-    print("Fast Signal loop started - 3m | consolidation breakout | MTF filter + reworked time-exit (2026-07-11)")
+    print(f"Fast Signal loop started - {FAST_TIMEFRAME} | consolidation breakout | MTF filter + reworked time-exit (2026-07-11)")
     all_symbols = []
     while True:
         try:

@@ -24,6 +24,9 @@ FAST_CONSOL_LOOKBACK    = 20
 FAST_BREAKOUT_ATR_MULT  = float(os.environ.get("FAST_BREAKOUT_ATR_MULT", 0.2))   # loosened from 0.3 (2026-07-11) - catch moves earlier
 FAST_VOL_MULT           = float(os.environ.get("FAST_VOL_MULT", 2.0))   # VBCB (2026-07-16): breakout vol >= 2x avg of last 20 candles (was hardcoded 3.0 on 1m)
 FAST_VOL_LB             = 20
+FAST_TRIGGER_TIMEFRAME  = os.environ.get("FAST_TRIGGER_TIMEFRAME", "5m")   # hybrid entry (2026-07-16): box/ATR from 15m, breakout trigger from 5m close - cuts entry lag ~10min without giving up close-confirmation
+EXCLUDE_XSTOCKS_TIGHT   = os.environ.get("EXCLUDE_XSTOCKS_TIGHT", "true").lower() == "true"   # 2026-07-16: NCSK tokenized stocks gap around equity sessions, thin books - poison for crypto breakout logic (SOXL/SKHYNIX SLs on Jul 16)
+EXCLUDE_XSTOCKS_FAST    = os.environ.get("EXCLUDE_XSTOCKS_FAST", "false").lower() == "true"
 FAST_BOX_MAX_ATR_MULT   = float(os.environ.get("FAST_BOX_MAX_ATR_MULT", 3.0))   # VBCB core filter (2026-07-16): 20-candle box height must be <= 3x ATR to count as real consolidation - kills the late-entry/chasing problem (e.g. RAVE bought at +17% top)
 FAST_ATR_LEN            = 14
 FAST_SL_ATR_MULT        = 1.2   # NOTE: dead/unused - actual SL uses SL_ATR_BUFFER_MULT below. Kept only for reference.
@@ -373,7 +376,29 @@ def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
         "workingType": "MARK_PRICE",
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
-    return r.get("data", {}).get("order", {}).get("orderId", "N/A")
+    oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
+    if oid == "N/A":
+        # Log the FULL response - this failure used to be swallowed silently, which is
+        # how positions ended up live with no TP on the exchange (US-USDT 2026-07-16:
+        # price blew past 2R and nothing filled, no BE move, profit round-tripped).
+        print(f"[TP FAIL] {symbol} {close_side} qty={qty} stop={tp_price} - BingX: {r}")
+    return oid
+
+
+def place_tp_guarded(symbol, close_side, pos_side, tp_price, qty, label=""):
+    """Place a TP order with one retry (mirrors place_sl_guarded). Returns tp_id,
+    or "N/A" if BOTH attempts failed - caller keeps the position (SL still protects
+    it) but the user MUST be alerted so they can set the TP manually."""
+    tp_id = place_tp_order(symbol, close_side, pos_side, tp_price, qty)
+    if tp_id and tp_id != "N/A":
+        return tp_id
+    time.sleep(1)
+    tp_id = place_tp_order(symbol, close_side, pos_side, tp_price, qty)
+    if tp_id and tp_id != "N/A":
+        print(f"[TP RETRY OK] {symbol} {label} placed on 2nd attempt")
+        return tp_id
+    send_tg(f"⚠️ {symbol}: {label} TP order FAILED twice (target {tp_price}) - position is SL-protected but has NO take-profit on the exchange. Set it manually NOW.")
+    return "N/A"
 
 
 def cancel_order(symbol, order_id):
@@ -566,7 +591,7 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usd
                 place_market_order(symbol, close_side, total_qty, pos_side)
                 send_tg(f"⚠️ FAST {symbol}: SL placement failed - position emergency-closed for safety")
                 return None
-            tp1_id = place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
+            tp1_id = place_tp_guarded(symbol, close_side, pos_side, tp1_price, half_qty, label="TP1")
             fast_open_trades[symbol] = {
                 "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
                 "sl": sl_price, "sl_id": sl_id, "tp1": tp1_price, "tp1_id": tp1_id, "lev": lev,
@@ -739,10 +764,6 @@ def check_fast(symbol):
         if i < min_needed:
             return
 
-        entry = closes[i]
-        if entry < MIN_PRICE:
-            return
-
         atr_vals = atr_series(highs, lows, closes, FAST_ATR_LEN)
         atr_now  = atr_vals[i]
 
@@ -756,17 +777,36 @@ def check_fast(symbol):
         box_high = max(highs[i - FAST_CONSOL_LOOKBACK:i])
         box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
 
-        avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
-        ratio   = vols[i] / avg_vol if avg_vol > 0 else 0
+        # ---- Hybrid entry (2026-07-16): box/ATR/extension from 15m, trigger from 5m close ----
+        # Waiting for the 15m close cost up to 15min of entry lag; a 5m close still
+        # confirms the breakout but fires ~10min sooner.
+        # Cheap gate first: only fetch 5m candles when the LIVE 15m candle has actually
+        # touched a box edge - avoids doubling API load across the whole universe.
+        live15 = candles[-1]
+        if h(live15) <= box_high and l(live15) >= box_low:
+            return
+
+        c5 = get_candles(symbol, limit=FAST_VOL_LB + 5, interval=FAST_TRIGGER_TIMEFRAME)
+        if len(c5) < FAST_VOL_LB + 2:
+            return
+        conf5 = c5[:-1]           # closed 5m candles only
+        trig  = conf5[-1]         # trigger = last CLOSED 5m candle
+        entry = cl(trig)
+        if entry < MIN_PRICE:
+            return
+
+        vols5   = [v(c) for c in conf5[:-1]][-FAST_VOL_LB:]
+        avg_vol = sum(vols5) / len(vols5) if vols5 else 0
+        ratio   = v(trig) / avg_vol if avg_vol > 0 else 0
         vol_ok  = ratio >= FAST_VOL_MULT
 
-        candle_range = highs[i] - lows[i]
-        bull_close_strength = (closes[i] - lows[i]) / candle_range if candle_range > 0 else 0
-        bear_close_strength = (highs[i] - closes[i]) / candle_range if candle_range > 0 else 0
+        candle_range = h(trig) - l(trig)
+        bull_close_strength = (cl(trig) - l(trig)) / candle_range if candle_range > 0 else 0
+        bear_close_strength = (h(trig) - cl(trig)) / candle_range if candle_range > 0 else 0
 
-        bull_breakout = (closes[i] > box_high + atr_now * FAST_BREAKOUT_ATR_MULT
+        bull_breakout = (cl(trig) > box_high + atr_now * FAST_BREAKOUT_ATR_MULT
                          and bull_close_strength >= FAST_CLOSE_POSITION_MIN)
-        bear_breakout = (closes[i] < box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
+        bear_breakout = (cl(trig) < box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
                          and bear_close_strength >= FAST_CLOSE_POSITION_MIN)
 
         long_signal  = bull_breakout and vol_ok
@@ -803,8 +843,8 @@ def check_fast(symbol):
                 close_fast_position(symbol, "Opposite")
             return
 
-        sig_id_long  = (symbol, "BUY",  int(confirmed[i]["time"]))
-        sig_id_short = (symbol, "SELL", int(confirmed[i]["time"]))
+        sig_id_long  = (symbol, "BUY",  int(trig["time"]))
+        sig_id_short = (symbol, "SELL", int(trig["time"]))
 
         if long_signal and sig_id_long not in fast_alerted:
             fast_alerted.add(sig_id_long)
@@ -940,6 +980,8 @@ def place_tight_order(symbol, side, entry, sl, tp):
         pos_side   = "LONG" if side == "BUY" else "SHORT"
         close_side = "SELL" if side == "BUY" else "BUY"
 
+        half_qty = round(total_qty / 2, precision)
+
         # Pre-trade margin check: skip cleanly instead of firing an order BingX will
         # reject with 101204. None (endpoint failure) = unknown -> proceed.
         required_margin = total_qty * entry / TIGHT_LEVERAGE
@@ -947,8 +989,6 @@ def place_tight_order(symbol, side, entry, sl, tp):
         if avail is not None and avail < required_margin * 1.05:
             print(f"[TIGHT MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f} - skipping")
             return "MARGIN_SKIP"
-
-        half_qty = round(total_qty / 2, precision)
 
         order_id = place_market_order(symbol, side, total_qty, pos_side)
         print(f"[TIGHT ORDER] {symbol} {side} qty={total_qty} risk=${TIGHT_RISK_USDT}: {order_id}")
@@ -979,8 +1019,8 @@ def place_tight_order(symbol, side, entry, sl, tp):
                 place_market_order(symbol, close_side, total_qty, pos_side)
                 send_tg(f"⚠️ TIGHT {symbol}: SL placement failed - position emergency-closed for safety")
                 return None
-            tp1_id = place_tp_order(symbol, close_side, pos_side, tp1_price, half_qty)
-            tp_id  = place_tp_order(symbol, close_side, pos_side, tp, total_qty - half_qty)
+            tp1_id = place_tp_guarded(symbol, close_side, pos_side, tp1_price, half_qty, label="TP1")
+            tp_id  = place_tp_guarded(symbol, close_side, pos_side, tp, total_qty - half_qty, label="TP-final")
             tight_open_trades[str(order_id)] = {
                 "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill, "sl": sl, "tp": tp,
                 "total_qty": total_qty, "half_qty": half_qty, "remaining_qty": total_qty - half_qty,
@@ -1357,6 +1397,8 @@ def fast_scan_loop():
             liquid = get_liquid_symbols(
                 all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=None, exclude_top_n=FAST_EXCLUDE_TOP_N
             )
+            if EXCLUDE_XSTOCKS_FAST:
+                liquid = [s for s in liquid if not s.startswith("NCSK")]
             print(f"[FAST SCAN] Scanning {len(liquid)} small/mid-cap liquid pairs for breakouts...")
             fast_diagnostic_check()
             for sym in liquid:
@@ -1663,6 +1705,8 @@ def tight_scan_loop():
             if not all_symbols:
                 all_symbols = get_futures_symbols() or []
             symbols = get_liquid_symbols(all_symbols, min_quote_vol=TIGHT_MIN_QUOTE_VOL, max_n=TIGHT_MAX_SYMBOLS)
+            if EXCLUDE_XSTOCKS_TIGHT:
+                symbols = [s for s in symbols if not s.startswith("NCSK")]
             tight_symbols_current = symbols
             covered = sum(1 for s in symbols if s in tight_baseline_cache)
             print(f"[TIGHT SCAN] Scanning {len(symbols)}/{len(all_symbols)} liquid pairs | Baseline={covered}/{len(symbols)} | Watching={len(tight_watch)} | Open={len(tight_open_trades)} | Auto={tight_auto_trade_enabled}")

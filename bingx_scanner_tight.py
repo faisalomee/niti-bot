@@ -35,7 +35,7 @@ EXCLUDE_XSTOCKS_FAST    = os.environ.get("EXCLUDE_XSTOCKS_FAST", "false").lower(
 FAST_BOX_MAX_ATR_MULT   = float(os.environ.get("FAST_BOX_MAX_ATR_MULT", 3.0))   # VBCB core filter (2026-07-16): 20-candle box height must be <= 3x ATR to count as real consolidation - kills the late-entry/chasing problem (e.g. RAVE bought at +17% top)
 FAST_ATR_LEN            = 14
 FAST_SL_ATR_MULT        = 1.2   # NOTE: dead/unused - actual SL uses SL_ATR_BUFFER_MULT below. Kept only for reference.
-FAST_RISK_USDT          = float(os.environ.get("FAST_RISK_USDT", 20.0))
+FAST_RISK_USDT          = 2.0   # hardcoded for $100 account (2026-07-18) - env override removed so stale Render vars cannot silently change sizing. Scaling plan: $150->3, $250->4, $350->5
 FAST_EXCLUDE_TOP_N       = 75
 FAST_EXTENSION_LOOKBACK  = 20
 FAST_EXTENSION_LIMIT     = 4.0
@@ -44,7 +44,7 @@ FAST_EXTENSION_MULT      = 0.5
 FAST_MARGIN_CAP_MULT     = float(os.environ.get("FAST_MARGIN_CAP_MULT", 5.0))   # env-overridable (2026-07-17) - margin cap = FAST_TRADE_AMOUNT x this
 FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 2.0))   # raised 0.8->2.0 (2026-07-16): 0.8R half-qty TP1 banked ~$2 vs -$5 full SL -> needed ~70% WR just to break even. 2R half banks full risk amount.
 FAST_TRAIL_ACTIVATE_RR  = 1.0
-FAST_MAX_CONCURRENT_TRADES = int(os.environ.get("FAST_MAX_CONCURRENT_TRADES", 3))   # added 2026-07-14 - Fast Signal had NO cap before, contributed to margin exhaustion
+FAST_MAX_CONCURRENT_TRADES = 2   # hardcoded for $100 account (2026-07-18); raise to 3 at $350+
 FAST_CLOSE_POSITION_MIN = float(os.environ.get("FAST_CLOSE_POSITION_MIN", 0.6))   # loosened from 0.7 (2026-07-11)
 FAST_TRAIL_ATR_MULT     = float(os.environ.get("FAST_TRAIL_ATR_MULT", 1.5))
 FAST_TRAIL_PCT_FALLBACK = float(os.environ.get("FAST_TRAIL_PCT_FALLBACK", 3.0))
@@ -92,10 +92,10 @@ TIGHT_SL_ATR_BUFFER_MULT     = float(os.environ.get("TIGHT_SL_ATR_BUFFER_MULT", 
 TIGHT_RR_TP                  = float(os.environ.get("TIGHT_RR_TP", 4.0))
 TIGHT_BE_TRIGGER_R           = float(os.environ.get("TIGHT_BE_TRIGGER_R", 2.0))         # move SL to breakeven at this R, full size kept
 TIGHT_MAX_COOLDOWN_WAIT_SECONDS = int(os.environ.get("TIGHT_MAX_COOLDOWN_WAIT_SECONDS", 3600))   # give up watching after 60 min with no breakout
-TIGHT_MAX_CONCURRENT_TRADES  = int(os.environ.get("TIGHT_MAX_CONCURRENT_TRADES", 3))   # lowered from 4 (2026-07-14) - margin exhaustion across Tight+Fast
-TIGHT_RISK_USDT              = float(os.environ.get("TIGHT_RISK_USDT", 5.0))   # lowered from 20.0 (2026-07-14) per Faisal's decision
+TIGHT_MAX_CONCURRENT_TRADES  = 2   # hardcoded for $100 account (2026-07-18); raise to 3 at $350+
+TIGHT_RISK_USDT              = 2.0   # hardcoded for $100 account (2026-07-18). Scaling plan: $150->3, $250->4, $350->5
 TIGHT_LEVERAGE               = int(os.environ.get("TIGHT_LEVERAGE", 20))   # fixed, per Faisal's instruction (2026-07-11)
-TIGHT_MAX_MARGIN_USDT        = float(os.environ.get("TIGHT_MAX_MARGIN_USDT", 40.0))   # lowered from 50.0 (2026-07-14)
+TIGHT_MAX_MARGIN_USDT        = 25.0   # hardcoded for $100 account (2026-07-18)
 TIGHT_ATR_LEN                = 14
 
 TIGHT_SCAN_INTERVAL_SECONDS  = int(os.environ.get("TIGHT_SCAN_INTERVAL_SECONDS", 30))
@@ -1389,7 +1389,7 @@ def health():
 # Position size = risk / SL-distance, so margins were tiny ($1.4-1.6) when SL
 # was wide. $5 risk => ~3.3x bigger positions. "extended (half size)" trades
 # will now risk $2.5. Overridden by the FAST_RISK_USDT env var if set on Render.
-FAST_RISK_USDT = float(os.environ.get("FAST_RISK_USDT", 20.0))
+# (2026-07-18: removed a stray late FAST_RISK_USDT redefinition that silently overrode the top config)
 
 TIGHT_SPIKE_CONFIRMED_LOOKBACK = int(os.environ.get("TIGHT_SPIKE_CONFIRMED_LOOKBACK", 3))
 TIGHT_SCAN_SYMBOL_GAP          = float(os.environ.get("TIGHT_SCAN_SYMBOL_GAP", 0.1))

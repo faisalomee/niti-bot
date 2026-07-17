@@ -41,7 +41,7 @@ FAST_EXTENSION_LOOKBACK  = 20
 FAST_EXTENSION_LIMIT     = 4.0
 FAST_EXTENSION_HARD_SKIP = float(os.environ.get("FAST_EXTENSION_HARD_SKIP", 7.0))   # added 2026-07-14: beyond this many x ATR, skip the trade entirely (too late/exhausted a move), not just half-size
 FAST_EXTENSION_MULT      = 0.5
-FAST_MARGIN_CAP_MULT     = 5.0
+FAST_MARGIN_CAP_MULT     = float(os.environ.get("FAST_MARGIN_CAP_MULT", 5.0))   # env-overridable (2026-07-17) - margin cap = FAST_TRADE_AMOUNT x this
 FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 2.0))   # raised 0.8->2.0 (2026-07-16): 0.8R half-qty TP1 banked ~$2 vs -$5 full SL -> needed ~70% WR just to break even. 2R half banks full risk amount.
 FAST_TRAIL_ACTIVATE_RR  = 1.0
 FAST_MAX_CONCURRENT_TRADES = int(os.environ.get("FAST_MAX_CONCURRENT_TRADES", 3))   # added 2026-07-14 - Fast Signal had NO cap before, contributed to margin exhaustion
@@ -67,6 +67,8 @@ FAST_SAFETY_CAP_SECONDS       = int(os.environ.get("FAST_SAFETY_CAP_SECONDS", 21
 # checked at the same instant as the breakout candle itself.
 MTF_FILTER_ENABLED = os.environ.get("MTF_FILTER_ENABLED", "true").lower() == "true"
 MTF_INTERVAL        = os.environ.get("MTF_INTERVAL", "1h")
+BTC_FILTER_ENABLED  = os.environ.get("BTC_FILTER_ENABLED", "true").lower() == "true"   # 2026-07-17: alts follow BTC - block Tight breakouts against clear BTC direction
+BTC_FILTER_CANDLES  = int(os.environ.get("BTC_FILTER_CANDLES", 4))                     # how many closed 15m BTC candles define "clear" direction
 EMA200_LEN          = 200
 
 MIN_PRICE = 0.001
@@ -248,6 +250,36 @@ def get_candles(symbol, limit=350, interval="15m", end_time=None):
 
 
 _price_cache = {}   # symbol -> (price, fetched_at)
+
+btc_direction_cache = {"dir": None, "ts": 0}
+
+def get_btc_direction():
+    """BTC market direction for the Tight filter, cached 5 min (one BTC fetch per
+    scan cycle at most - zero extra per-symbol API load).
+    Returns "UP" / "DOWN" only when BOTH agree:
+      - last BTC_FILTER_CANDLES closed 15m candles moved net in that direction, AND
+      - price is on that side of the 1h EMA200 (reuses get_mtf_trend on BTC-USDT).
+    Anything mixed returns None = no opinion, both trade sides allowed - otherwise
+    the filter would choke signal flow entirely in sideways markets."""
+    now = time.time()
+    if btc_direction_cache["ts"] and now - btc_direction_cache["ts"] < 300:
+        return btc_direction_cache["dir"]
+    direction = None
+    try:
+        candles = get_candles("BTC-USDT", limit=BTC_FILTER_CANDLES + 3, interval="15m")
+        if len(candles) >= BTC_FILTER_CANDLES + 1:
+            recent = candles[:-1][-BTC_FILTER_CANDLES:]   # closed candles only
+            net = cl(recent[-1]) - o(recent[0])
+            mom = "UP" if net > 0 else "DOWN"
+            mtf = get_mtf_trend("BTC-USDT")
+            if mtf is not None and mtf == mom:
+                direction = mom
+    except Exception as e:
+        print(f"[BTC FILTER] error: {e}")
+    btc_direction_cache["dir"] = direction
+    btc_direction_cache["ts"]  = now
+    return direction
+
 
 def get_current_price(symbol):
     hit = _price_cache.get(symbol)
@@ -600,9 +632,9 @@ def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usd
             if risk_dist <= 0:
                 risk_dist = abs(entry - sl_price)
             if side == "BUY":
-                tp1_price = round(entry_fill + risk_dist * FAST_TP1_RR, precision)
+                tp1_price = round(entry_fill + risk_dist * FAST_TP1_RR, 6)   # price precision, NOT qty precision (2026-07-17: qty-precision rounding turned STX TP into 0.0 -> silent reject)
             else:
-                tp1_price = round(entry_fill - risk_dist * FAST_TP1_RR, precision)
+                tp1_price = round(entry_fill - risk_dist * FAST_TP1_RR, 6)
 
             # SL first, guarded: if it can't be placed even on retry, close the
             # position immediately instead of leaving it naked.
@@ -1041,11 +1073,11 @@ def place_tight_order(symbol, side, entry, sl, tp):
             if risk_dist <= 0:
                 risk_dist = abs(entry - sl)
             if side == "BUY":
-                tp1_price = round(entry_fill + risk_dist * TIGHT_BE_TRIGGER_R, precision)
-                tp        = round(entry_fill + risk_dist * TIGHT_RR_TP, precision)
+                tp1_price = round(entry_fill + risk_dist * TIGHT_BE_TRIGGER_R, 6)   # price precision, NOT qty precision (2026-07-17)
+                tp        = round(entry_fill + risk_dist * TIGHT_RR_TP, 6)
             else:
-                tp1_price = round(entry_fill - risk_dist * TIGHT_BE_TRIGGER_R, precision)
-                tp        = round(entry_fill - risk_dist * TIGHT_RR_TP, precision)
+                tp1_price = round(entry_fill - risk_dist * TIGHT_BE_TRIGGER_R, 6)
+                tp        = round(entry_fill - risk_dist * TIGHT_RR_TP, 6)
 
             # SL first, guarded: if it can't be placed even on retry, close the
             # position immediately instead of leaving it naked.
@@ -1322,7 +1354,7 @@ def fast_scan_loop():
                 all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=None, exclude_top_n=FAST_EXCLUDE_TOP_N
             )
             if EXCLUDE_XSTOCKS_FAST:
-                liquid = [s for s in liquid if not s.startswith("NCSK")]
+                liquid = [s for s in liquid if not s.startswith("NCS")]
             print(f"[FAST SCAN] Scanning {len(liquid)} small/mid-cap liquid pairs for breakouts...")
             fast_diagnostic_check()
             for sym in liquid:
@@ -1536,6 +1568,16 @@ def check_tight_symbol(symbol):
             entry   = cl(live_candle)   # market order fills at current price
             atr_now = state["atr_now"]
 
+            # ---- BTC direction filter (2026-07-17): alts follow BTC. Block breakouts
+            # against a CLEAR BTC direction; sideways BTC = no opinion, both sides ok ----
+            if BTC_FILTER_ENABLED:
+                btc_dir = get_btc_direction()
+                if btc_dir is not None:
+                    if (side == "BUY" and btc_dir == "DOWN") or (side == "SELL" and btc_dir == "UP"):
+                        print(f"[TIGHT BTC SKIP] {symbol} {side} blocked - BTC direction is {btc_dir}")
+                        tight_watch.pop(symbol, None)
+                        return True
+
             # ---- MTF trend filter (2026-07-17): Fast has had this since Jul 11, Tight
             # never did - counter-trend 1m breakouts were free SL donations ----
             if MTF_FILTER_ENABLED:
@@ -1621,7 +1663,9 @@ def tight_scan_loop():
                 all_symbols = get_futures_symbols() or []
             symbols = get_liquid_symbols(all_symbols, min_quote_vol=TIGHT_MIN_QUOTE_VOL, max_n=TIGHT_MAX_SYMBOLS)
             if EXCLUDE_XSTOCKS_TIGHT:
-                symbols = [s for s in symbols if not s.startswith("NCSK")]
+                # "NCS" not "NCSK" (2026-07-17): the family prefix is NCS - NCSI-NIKKEI
+                # slipped through the K-only filter and donated -$2.59 on Jul 17
+                symbols = [s for s in symbols if not s.startswith("NCS")]
             tight_symbols_current = symbols
             covered = sum(1 for s in symbols if s in tight_baseline_cache)
             print(f"[TIGHT SCAN] Scanning {len(symbols)}/{len(all_symbols)} liquid pairs | Baseline={covered}/{len(symbols)} | Watching={len(tight_watch)} | Open={len(tight_open_trades)} | Auto={tight_auto_trade_enabled}")

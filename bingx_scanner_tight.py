@@ -62,6 +62,18 @@ FAST_STAGNATION_CHECKS        = int(os.environ.get("FAST_STAGNATION_CHECKS", 3))
 FAST_STAGNATION_MIN_R_INCREASE = float(os.environ.get("FAST_STAGNATION_MIN_R_INCREASE", 0.1))
 FAST_SAFETY_CAP_SECONDS       = int(os.environ.get("FAST_SAFETY_CAP_SECONDS", 21600))      # 6h backup net (2026-07-16: was 3.5h - 15m swings need more room)
 
+# ---- Retest limit entry (2026-07-19) ----
+# Every VBCB signal since the 2026-07-16 redesign would have lost (Faisal verified
+# manually, auto-trade was off): entering at the breakout close means buying the very
+# top of the extension (close-strength 0.9 = candle closed at its extreme). The
+# immediate pullback then eats the tight structural SL at 10x lev, even when the
+# breakout direction later plays out. Fix: NO entry at signal time. The signal only
+# arms a pending retest - price must pull back to the retest level (box edge or
+# trigger-candle midpoint, whichever is nearer the breakout side) and the entry
+# happens THERE. No pullback within the window = no trade. Price through the SL
+# before the retest fills = breakout failed, no trade (that loss is now avoided).
+FAST_RETEST_EXPIRY_SECONDS = int(os.environ.get("FAST_RETEST_EXPIRY_SECONDS", 1800))   # 30 min = two 15m candles
+
 # ---- MTF trend filter (added to Fast Signal 2026-07-11, reusing the Tight-era helper) ----
 # Direction-only check against the already-closed 1h candle - no extra waiting,
 # checked at the same instant as the breakout candle itself.
@@ -91,6 +103,7 @@ TIGHT_REENTRY_VOL_MULT       = float(os.environ.get("TIGHT_REENTRY_VOL_MULT", 5.
 TIGHT_SL_ATR_BUFFER_MULT     = float(os.environ.get("TIGHT_SL_ATR_BUFFER_MULT", 0.3))
 TIGHT_RR_TP                  = float(os.environ.get("TIGHT_RR_TP", 4.0))
 TIGHT_BE_TRIGGER_R           = float(os.environ.get("TIGHT_BE_TRIGGER_R", 2.0))         # move SL to breakeven at this R, full size kept
+TIGHT_TRAIL_R_MULT           = float(os.environ.get("TIGHT_TRAIL_R_MULT", 1.0))         # BUGFIX 2026-07-19: was used in track_tight_trades but NEVER DEFINED - every post-TP1 trailing pass died with a silent NameError ([TIGHT TRACK ERROR] in logs), so Tight trailing never actually ran. 1.0 = trail SL one R behind best price.
 TIGHT_MAX_COOLDOWN_WAIT_SECONDS = int(os.environ.get("TIGHT_MAX_COOLDOWN_WAIT_SECONDS", 3600))   # give up watching after 60 min with no breakout
 TIGHT_MAX_CONCURRENT_TRADES  = 2   # hardcoded for $100 account (2026-07-18); raise to 3 at $350+
 TIGHT_RISK_USDT              = 2.0   # hardcoded for $100 account (2026-07-18). Scaling plan: $150->3, $250->4, $350->5
@@ -112,6 +125,7 @@ symbol_precision   = {}
 symbol_max_lev     = {}
 tight_open_trades  = {}
 fast_open_trades   = {}
+fast_pending_retests = {}   # symbol -> armed retest waiting for pullback fill, see check_fast_pending()
 fast_alerted       = set()
 daily_trades       = []
 last_summary_date  = None
@@ -911,73 +925,84 @@ def check_fast(symbol):
                 close_fast_position(symbol, "Opposite")
             return
 
+        # An armed retest killed by an opposite-direction signal is a failed breakout -
+        # exactly the trade we no longer want. Same-direction re-signal: keep the
+        # original (its retest level came from the FIRST breakout, which is the one
+        # that defines the structure).
+        if symbol in fast_pending_retests:
+            pending_side = fast_pending_retests[symbol]["side"]
+            if (pending_side == "BUY" and short_signal) or (pending_side == "SELL" and long_signal):
+                del fast_pending_retests[symbol]
+                print(f"[FAST PENDING CANCEL - OPPOSITE] {symbol}")
+                send_tg("FAST RETEST CANCELLED - " + symbol + "\nOpposite signal fired before the " + pending_side + " retest filled - breakout failed, no entry")
+            return
+
         sig_id_long  = (symbol, "BUY",  int(trig["time"]))
         sig_id_short = (symbol, "SELL", int(trig["time"]))
 
+        # ---- Retest limit entry (2026-07-19): the signal no longer enters. It ARMS
+        # a pending retest; check_fast_pending() (trailing loop, 30s) does the entry
+        # when price pulls back to the retest level. Retest level = the deeper of the
+        # box edge and the trigger-candle midpoint, so a barely-broken-out candle
+        # retests the box edge while a big extension candle only needs to give back
+        # half its range - both realistic pullback targets, both a materially better
+        # price than the breakout close we used to buy.
         if long_signal and sig_id_long not in fast_alerted:
             fast_alerted.add(sig_id_long)
             lev        = get_fast_leverage(symbol)
             sl_price   = round(box_low - atr_now * SL_ATR_BUFFER_MULT, 6)
-            risk       = entry - sl_price
+            trig_mid   = (h(trig) + l(trig)) / 2
+            retest     = round(max(box_high, trig_mid), 6)
+            risk       = retest - sl_price
             if risk <= 0:
                 return
-            tp1_price  = round(entry + risk * FAST_TP1_RR, 6)
+            tp1_price  = round(retest + risk * FAST_TP1_RR, 6)
             risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
             ext_tag    = "extended (half size)" if is_extended else "fresh move"
-            print(f"[FAST] {symbol} BUY | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
-            trade_status = ""
-            if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
-                trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
-            elif fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "BUY", entry, sl_price, tp1_price, atr_now, risk_usdt)
-                if oid == "MARGIN_SKIP":
-                    trade_status = "\nSkipped - insufficient margin"
-                elif oid and oid != "N/A":
-                    trade_status = "\nOrder: " + str(oid)
-                else:
-                    trade_status = "\nOrder failed"
-            else:
-                trade_status = "\nAuto-trade OFF"
+            fast_pending_retests[symbol] = {
+                "side": "BUY", "retest": retest, "sl": sl_price, "atr": atr_now,
+                "risk_usdt": risk_usdt, "lev": lev, "ratio": ratio,
+                "close_strength": bull_close_strength, "ext_tag": ext_tag,
+                "armed_ts": time.time(), "expiry_ts": time.time() + FAST_RETEST_EXPIRY_SECONDS,
+            }
+            print(f"[FAST ARMED] {symbol} BUY retest={retest} | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             send_tg(
                 "FAST SIGNAL - BUY - " + symbol + "\n------------------------------\n"
-                "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
+                "Retest entry: " + str(retest) + " (waiting for pullback) | SL: " + str(sl_price) + "\n"
                 "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bull_close_strength, 2)) +
+                "Breakout close: " + str(round(entry, 6)) + " | Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bull_close_strength, 2)) +
                 " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
-                trade_status + "\n------------------------------\nNiti Fast Signal"
+                "\nExpires in " + str(FAST_RETEST_EXPIRY_SECONDS // 60) + "min if no pullback"
+                "\n------------------------------\nNiti Fast Signal"
             )
 
         elif short_signal and sig_id_short not in fast_alerted:
             fast_alerted.add(sig_id_short)
             lev        = get_fast_leverage(symbol)
             sl_price   = round(box_high + atr_now * SL_ATR_BUFFER_MULT, 6)
-            risk       = sl_price - entry
+            trig_mid   = (h(trig) + l(trig)) / 2
+            retest     = round(min(box_low, trig_mid), 6)
+            risk       = sl_price - retest
             if risk <= 0:
                 return
-            tp1_price  = round(entry - risk * FAST_TP1_RR, 6)
+            tp1_price  = round(retest - risk * FAST_TP1_RR, 6)
             risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
             ext_tag    = "extended (half size)" if is_extended else "fresh move"
-            print(f"[FAST] {symbol} SELL | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
-            trade_status = ""
-            if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
-                trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
-            elif fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, "SELL", entry, sl_price, tp1_price, atr_now, risk_usdt)
-                if oid == "MARGIN_SKIP":
-                    trade_status = "\nSkipped - insufficient margin"
-                elif oid and oid != "N/A":
-                    trade_status = "\nOrder: " + str(oid)
-                else:
-                    trade_status = "\nOrder failed"
-            else:
-                trade_status = "\nAuto-trade OFF"
+            fast_pending_retests[symbol] = {
+                "side": "SELL", "retest": retest, "sl": sl_price, "atr": atr_now,
+                "risk_usdt": risk_usdt, "lev": lev, "ratio": ratio,
+                "close_strength": bear_close_strength, "ext_tag": ext_tag,
+                "armed_ts": time.time(), "expiry_ts": time.time() + FAST_RETEST_EXPIRY_SECONDS,
+            }
+            print(f"[FAST ARMED] {symbol} SELL retest={retest} | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
             send_tg(
                 "FAST SIGNAL - SELL - " + symbol + "\n------------------------------\n"
-                "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl_price) + "\n"
+                "Retest entry: " + str(retest) + " (waiting for pullback) | SL: " + str(sl_price) + "\n"
                 "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
-                "Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bear_close_strength, 2)) +
+                "Breakout close: " + str(round(entry, 6)) + " | Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bear_close_strength, 2)) +
                 " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
-                trade_status + "\n------------------------------\nNiti Fast Signal"
+                "\nExpires in " + str(FAST_RETEST_EXPIRY_SECONDS // 60) + "min if no pullback"
+                "\n------------------------------\nNiti Fast Signal"
             )
 
     except Exception as e:
@@ -1291,7 +1316,8 @@ def handle_telegram_commands():
                     if api_backoff_active():
                         backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
                     send_tg("Tight: " + t + " | Watching: " + str(len(tight_watch)) + " | Open: " + str(len(tight_open_trades)) +
-                            "\nFast Signal: " + f + " | Open: " + str(len(fast_open_trades)) + backoff)
+                            "\nFast Signal: " + f + " | Open: " + str(len(fast_open_trades)) +
+                            " | Pending retests: " + str(len(fast_pending_retests)) + backoff)
                 elif text == "/fast_start":
                     fast_auto_trade_enabled = True
                     send_tg("Fast Signal Auto-trade ON.")
@@ -1300,15 +1326,108 @@ def handle_telegram_commands():
                     send_tg("Fast Signal Auto-trade OFF.")
                 elif text == "/fast_status":
                     f = "ON" if fast_auto_trade_enabled else "OFF"
-                    send_tg("Fast Signal: " + f)
+                    pend = ""
+                    for s, p in list(fast_pending_retests.items()):
+                        mins_left = max(0, int((p["expiry_ts"] - time.time()) / 60))
+                        pend += "\n" + s + " " + p["side"] + " retest " + str(p["retest"]) + " (" + str(mins_left) + "min left)"
+                    send_tg("Fast Signal: " + f + " | Open: " + str(len(fast_open_trades)) +
+                            " | Pending retests: " + str(len(fast_pending_retests)) + pend)
         except Exception as e:
             print(f"[TG CMD] error: {e}")
         time.sleep(1)
 
 
+def check_fast_pending():
+    """Retest fill monitor (2026-07-19). Polls price every trailing-loop pass (30s)
+    for each armed retest. Implementation choice: monitor + market-order-on-touch,
+    NOT a real exchange limit order. Reasons: (a) cancel_order is still unverified
+    against the live BingX API (see its docstring) - an uncancellable stale limit
+    order is worse than 30s of fill granularity on a 15m strategy, (b) qty/leverage
+    get computed at FILL time by place_fast_order exactly as before, no new sizing
+    path. Known trade-off: a pullback that wicks through the retest and bounces
+    entirely inside one 30s gap is missed. Acceptable at this timeframe.
+
+    Outcomes per armed retest:
+      1. price reaches SL zone first  -> breakout failed, NO entry (the old losing
+         trade, now skipped - this branch firing a lot is the fix working)
+      2. price pulls back to retest   -> enter there (better price, smaller SL
+         distance, real pullback absorbed before entry)
+      3. neither within expiry window -> skip trade
+    """
+    now_ts = time.time()
+    for symbol in list(fast_pending_retests.keys()):
+        try:
+            p        = fast_pending_retests[symbol]
+            side     = p["side"]
+            retest   = p["retest"]
+            sl_price = p["sl"]
+
+            if now_ts >= p["expiry_ts"]:
+                del fast_pending_retests[symbol]
+                print(f"[FAST PENDING EXPIRED] {symbol} {side} no pullback to {retest}")
+                send_tg("FAST RETEST EXPIRED - " + side + " - " + symbol +
+                        "\nNo pullback to " + str(retest) + " within " + str(FAST_RETEST_EXPIRY_SECONDS // 60) + "min - trade skipped")
+                continue
+
+            px = get_current_price(symbol)
+            if px <= 0:
+                continue
+
+            invalidated = (px <= sl_price) if side == "BUY" else (px >= sl_price)
+            if invalidated:
+                del fast_pending_retests[symbol]
+                print(f"[FAST PENDING INVALIDATED] {symbol} {side} price {px} through SL {sl_price} before fill")
+                send_tg("FAST RETEST INVALIDATED - " + side + " - " + symbol +
+                        "\nPrice hit the SL zone (" + str(sl_price) + ") before the retest at " + str(retest) +
+                        " filled - failed breakout, no entry taken (this would have been a full loss under the old entry)")
+                continue
+
+            touched = (px <= retest) if side == "BUY" else (px >= retest)
+            if not touched:
+                continue
+
+            del fast_pending_retests[symbol]
+            if symbol in fast_open_trades:
+                continue
+            risk_dist = abs(retest - sl_price)
+            if risk_dist <= 0:
+                continue
+            if side == "BUY":
+                tp1_price = round(retest + risk_dist * FAST_TP1_RR, 6)
+            else:
+                tp1_price = round(retest - risk_dist * FAST_TP1_RR, 6)
+
+            print(f"[FAST RETEST FILL] {symbol} {side} @ {px} (retest {retest})")
+            trade_status = ""
+            if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
+                trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
+            elif fast_auto_trade_enabled:
+                oid = place_fast_order(symbol, side, retest, sl_price, tp1_price, p["atr"], p["risk_usdt"])
+                if oid == "MARGIN_SKIP":
+                    trade_status = "\nSkipped - insufficient margin"
+                elif oid and oid != "N/A":
+                    trade_status = "\nOrder: " + str(oid)
+                else:
+                    trade_status = "\nOrder failed"
+            else:
+                trade_status = "\nAuto-trade OFF"
+            send_tg(
+                "FAST RETEST FILLED - " + side + " - " + symbol + "\n------------------------------\n"
+                "Entry: " + str(retest) + " (pullback fill @ " + str(round(px, 6)) + ") | SL: " + str(sl_price) + "\n"
+                "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
+                "Breakout vol: " + str(round(p["ratio"], 1)) + "x | Close-strength: " + str(round(p["close_strength"], 2)) +
+                " | Lev: " + str(p["lev"]) + "x | " + p["ext_tag"] + " | Risk: $" + str(p["risk_usdt"]) +
+                trade_status + "\n------------------------------\nNiti Fast Signal"
+            )
+        except Exception as e:
+            print(f"[FAST PENDING {symbol}] error: {e}")
+
+
 def trailing_loop():
     while True:
         try:
+            if fast_pending_retests:
+                check_fast_pending()
             if fast_open_trades:
                 track_fast_trades()
                 update_fast_trailing()
@@ -1353,7 +1472,11 @@ def fast_scan_loop():
             liquid = get_liquid_symbols(
                 all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=None, exclude_top_n=FAST_EXCLUDE_TOP_N
             )
-            if EXCLUDE_XSTOCKS_FAST:
+            # NCS tokenized stocks are ALWAYS excluded on weekends (UTC Sat/Sun): the
+            # underlying stock market is closed, books go dead, and stale/thin prints
+            # fake "breakouts" - both Jul 19 NCSKSKHYP2USD SELL signals were weekend
+            # ghosts. Weekday inclusion still controlled by EXCLUDE_XSTOCKS_FAST env.
+            if EXCLUDE_XSTOCKS_FAST or datetime.now(timezone.utc).weekday() >= 5:
                 liquid = [s for s in liquid if not s.startswith("NCS")]
             print(f"[FAST SCAN] Scanning {len(liquid)} small/mid-cap liquid pairs for breakouts...")
             fast_diagnostic_check()

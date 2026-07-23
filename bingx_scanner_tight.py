@@ -211,30 +211,54 @@ def get_futures_symbols():
     return symbols
 
 
-def _ticker_gain_pct(t):
-    """Today's % move from a BingX ticker entry. The exact field name is not
-    guaranteed across API versions, so try the documented one first, then a couple
-    of known aliases, then fall back to computing it from open/last. Returns None
-    when nothing usable is present - callers must treat None as 'no gain data'."""
+def _ticker_gain_raw(t):
+    """Today's move from a BingX ticker entry, as (value, is_definitely_percent).
+
+    The value is returned RAW - this function deliberately does NOT decide whether
+    the exchange means 30.0 or 0.30 for "+30%". That call cannot be made safely from
+    a single row (0.5 is a plausible +0.5% AND a plausible +50%), and guessing per
+    row is exactly what broke on 2026-07-23. _resolve_gain_scale() decides once, from
+    the whole dataset. The open/last fallback IS a true percent by construction, so
+    it is flagged as such and exempted from scaling.
+    """
     for key in ("priceChangePercent", "priceChangePercentage", "changePercent"):
         raw = t.get(key)
         if raw not in (None, ""):
             try:
-                # Taken literally - NO scale guessing. An earlier version multiplied
-                # values below 1 by 100 on the theory they might be fractions, which
-                # turned a genuine +0.5% coin into a +50% "top gainer". Confirm the
-                # real units once from the [TICKER FIELDS] log line below.
-                return float(str(raw).replace("%", ""))
+                return (float(str(raw).replace("%", "")), False)
             except Exception:
                 pass
     try:
         op = float(t.get("openPrice", 0) or 0)
         last = float(t.get("lastPrice", 0) or t.get("close", 0) or 0)
         if op > 0 and last > 0:
-            return (last - op) / op * 100
+            return ((last - op) / op * 100.0, True)
     except Exception:
         pass
     return None
+
+
+def _resolve_gain_scale(entries):
+    """Decide the multiplier for unknown-unit values, ONCE, from the full ticker set.
+
+    Logic: across several hundred crypto perpetuals, on any given day at least one
+    coin moves more than 2%. So if the largest absolute value in the whole dataset is
+    still below 2, the field cannot be expressed in percent - it must be a fraction
+    (0.30 = +30%) and needs x100. This is what the 2026-07-23 bug got wrong: an
+    8.0 percent floor was compared against fraction values that can never reach it,
+    so the Fast universe was empty on every single pass for 24h ("Scanning 0 pairs").
+    """
+    unknown = [abs(v) for v, is_pct in entries if not is_pct]
+    if not unknown:
+        return 1.0
+    peak = max(unknown)
+    if peak < 2.0:
+        print(f"[GAINER UNITS] largest raw daily move across the ticker set = {peak:.4f} "
+              f"-> field is FRACTIONAL, scaling by 100")
+        return 100.0
+    print(f"[GAINER UNITS] largest raw daily move across the ticker set = {peak:.2f} "
+          f"-> field is already PERCENT, no scaling")
+    return 1.0
 
 
 _gain_field_logged = False
@@ -264,7 +288,7 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
             except Exception:
                 qvol = 0
             if qvol >= min_quote_vol:
-                liquid.append((sym, qvol, _ticker_gain_pct(t)))
+                liquid.append((sym, qvol, _ticker_gain_raw(t)))
         liquid.sort(key=lambda x: x[1], reverse=True)
         if exclude_top_n > 0:
             liquid = liquid[exclude_top_n:]
@@ -275,31 +299,52 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
                 # Render logs instead of trusted blindly
                 print(f"[TICKER FIELDS] sample entry keys: {sorted(tickers[0].keys())}")
                 _gain_field_logged = True
-            with_gain = [x for x in liquid if x[2] is not None]
-            if with_gain:
-                total = len(with_gain)
+
+            raw_pairs = [x for x in liquid if x[2] is not None]
+            if raw_pairs:
+                # Decide the unit ONCE from the whole ticker set, then normalise
+                # everything to real percent before any comparison happens.
+                scale = _resolve_gain_scale([x[2] for x in raw_pairs])
+                scored = [(s, q, (val if is_pct else val * scale))
+                          for s, q, (val, is_pct) in raw_pairs]
+                scored.sort(key=lambda x: x[2], reverse=True)
+                total = len(scored)
+
+                top5 = ", ".join(f"{s}({g:+.1f}%)" for s, _q, g in scored[:5])
+                print(f"[GAINER TOP] {total} coins with gain data | biggest movers: {top5}")
+
+                banded = scored
                 if gain_min is not None:
-                    with_gain = [x for x in with_gain if x[2] >= gain_min]
+                    banded = [x for x in banded if x[2] >= gain_min]
                 if gain_max is not None:
-                    too_hot = [x for x in with_gain if x[2] > gain_max]
-                    with_gain = [x for x in with_gain if x[2] <= gain_max]
+                    too_hot = [x for x in banded if x[2] > gain_max]
+                    banded = [x for x in banded if x[2] <= gain_max]
                     if too_hot:
-                        names = ", ".join(f"{s}({g:.0f}%)" for s, _q, g in
-                                          sorted(too_hot, key=lambda x: -x[2])[:5])
+                        names = ", ".join(f"{s}({g:.0f}%)" for s, _q, g in too_hot[:5])
                         print(f"[GAINER BAND] {len(too_hot)} coin(s) above +{gain_max}% skipped as late-stage: {names}")
-                with_gain.sort(key=lambda x: x[2], reverse=True)
-                liquid = with_gain[:rank_by_gain]
-                if not liquid:
-                    print(f"[GAINER BAND] nothing in the +{gain_min}% to +{gain_max}% band right now ({total} coins had gain data) - Fast will idle this pass")
+
+                if banded:
+                    liquid = banded[:rank_by_gain]
+                else:
+                    # NEVER go silently empty (the 2026-07-24 failure: 24h of
+                    # "Scanning 0 pairs" with no explanation). Gain data exists, so
+                    # the band is simply out of step with today's market - ignore it
+                    # for this pass, take the top movers anyway, and say so loudly.
+                    liquid = scored[:rank_by_gain]
+                    print(f"[GAINER BAND] NOTHING in the +{gain_min}%..+{gain_max}% band "
+                          f"(of {total} coins with gain data) - band ignored this pass, "
+                          f"scanning the top {len(liquid)} movers instead. If this repeats, "
+                          f"widen FAST_GAINER_MIN_PCT / FAST_GAINER_MAX_PCT.")
             else:
                 # No usable gain field -> keep the old volume ordering rather than
                 # silently returning nothing. Loud, because it means the gainer
                 # focus is NOT active.
                 print("[GAINER RANK] no usable price-change field in ticker payload - falling back to volume ordering (check [TICKER FIELDS] above)")
+                liquid = [(s, q, None) for s, q, _g in liquid]
 
         if max_n is not None:
             liquid = liquid[:max_n]
-        return [s for s, _q, _g in liquid]
+        return [x[0] for x in liquid]
     except Exception as e:
         print(f"[LIQUID SYMBOLS ERROR] {e}")
         return symbols[:max_n] if max_n else symbols

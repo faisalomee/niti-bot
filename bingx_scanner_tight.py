@@ -1154,54 +1154,92 @@ def track_tight_trades():
                     trade["tp1_fill"] = tp1_fill
                     leg_pnl = (tp1_fill - entry_ref) * trade["half_qty"] if trade["side"] == "BUY" else (entry_ref - tp1_fill) * trade["half_qty"]
                     trade["tp1_pnl"] = round(leg_pnl, 2)
+                    # ---- Post-TP1 stop placement (BUGFIX 2026-07-23) ----
+                    # OLD behaviour: SL -> breakeven, and trail_price seeded at ENTRY.
+                    # The trail only advanced on a NEW high above trail_price, and the
+                    # 30s poll almost always detects the TP1 fill AFTER price has already
+                    # slipped back below 2R. Result: the back half's stop got parked a few
+                    # ticks above BE and never ratcheted again, so essentially every Tight
+                    # winner banked TP1 only (~+1R on half = ~$2) and handed the rest back.
+                    # That, not the signal quality, is why wins were capped near $2 while
+                    # losses ran a full -1R.
+                    # NEW behaviour: anchor the trail at the KNOWN TP1 fill (a genuine 2R)
+                    # instead of at entry, and lock the back half at +1R whenever price is
+                    # still on the right side of that level. If price has already reversed
+                    # below +1R by the time we poll, fall back to plain breakeven exactly
+                    # as before - the fix never places a stop on the wrong side of market.
+                    lock_price = round(
+                        entry_ref + risk_dist * TIGHT_TRAIL_R_MULT if trade["side"] == "BUY"
+                        else entry_ref - risk_dist * TIGHT_TRAIL_R_MULT, 6
+                    )
+                    current_now = get_current_price(symbol)
+                    lock_ok = current_now > 0 and (
+                        (trade["side"] == "BUY"  and current_now > lock_price) or
+                        (trade["side"] == "SELL" and current_now < lock_price)
+                    )
+                    protect_price = lock_price if lock_ok else entry_ref
                     # Guarded re-placement, new-first order (2026-07-17) - see Fast BE note
-                    new_sl_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], entry_ref, trade["remaining_qty"])
+                    new_sl_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], protect_price, trade["remaining_qty"])
                     if new_sl_id:
                         if trade.get("sl_id"):
                             cancel_order(symbol, trade["sl_id"])
                         trade["sl_id"]      = new_sl_id
-                        trade["sl"]         = entry_ref
+                        trade["sl"]         = protect_price
                         trade["be_price"]   = entry_ref
                     else:
-                        print(f"[TIGHT BE FAIL] {symbol} BE SL re-placement failed twice - keeping original SL {trade['sl']}")
+                        print(f"[TIGHT BE FAIL] {symbol} protective SL re-placement failed twice - keeping original SL {trade['sl']}")
                         if not trade.get("sl_move_alerted"):
                             trade["sl_move_alerted"] = True
-                            send_tg(f"⚠️ TIGHT {symbol}: could not move SL to breakeven ({entry_ref}) - original SL {trade['sl']} still active. Consider moving it manually.")
+                            send_tg(f"⚠️ TIGHT {symbol}: could not move SL to {protect_price} - original SL {trade['sl']} still active. Consider moving it manually.")
                     trade["be_done"]    = True
-                    trade["trail_price"] = entry_ref
-                    print(f"[TIGHT TP1] {symbol} - half closed at {tp1_fill}, remaining {trade['remaining_qty']} moved to BE ({entry_ref})")
+                    # Anchor the trail at the real 2R fill, NOT at entry (this is the fix).
+                    trade["trail_price"] = tp1_fill
+                    lock_tag = f"locked +{TIGHT_TRAIL_R_MULT}R ({protect_price})" if lock_ok else f"BE ({entry_ref}) - price already back below +{TIGHT_TRAIL_R_MULT}R"
+                    print(f"[TIGHT TP1] {symbol} - half closed at {tp1_fill}, remaining {trade['remaining_qty']} -> {lock_tag}, trail anchored at {tp1_fill}")
 
             # ---- Trail the remaining half's SL once TP1 is banked ----
             if trade.get("tp1_filled") and risk_dist > 0:
                 current = get_current_price(symbol)
                 if current > 0:
+                    # BUGFIX 2026-07-23 (part 2): the new_sl computation used to sit INSIDE
+                    # the "new extreme" branch, so once the extreme stopped advancing the
+                    # stop stopped ratcheting even when it was still behind where it should
+                    # be. It is now recomputed on every pass from the current trail anchor.
+                    # Also: rounding used symbol_precision (QUANTITY precision) on a PRICE -
+                    # the same class of bug fixed for TP on 2026-07-17. On a sub-cent coin
+                    # that rounds the stop to 0.0 and BingX silently rejects it, which is
+                    # how back halves ended up running with no working trail at all.
                     trail_dist = risk_dist * TIGHT_TRAIL_R_MULT
                     if trade["side"] == "BUY":
                         if current > trade["trail_price"]:
                             trade["trail_price"] = current
-                            new_sl = round(trade["trail_price"] - trail_dist, symbol_precision.get(symbol, 4))
-                            if new_sl > trade["sl"]:
-                                new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
-                                if new_id:
-                                    if trade.get("sl_id"):
-                                        cancel_order(symbol, trade["sl_id"])
-                                    trade["sl_id"] = new_id
-                                    trade["sl"] = new_sl
-                                else:
-                                    print(f"[TIGHT TRAIL FAIL] {symbol} trail SL re-placement failed - keeping SL {trade['sl']}")
+                        new_sl = round(trade["trail_price"] - trail_dist, 6)
+                        # only ratchet UP, and never place a sell-stop above market
+                        if new_sl > trade["sl"] and new_sl < current:
+                            new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
+                            if new_id:
+                                if trade.get("sl_id"):
+                                    cancel_order(symbol, trade["sl_id"])
+                                trade["sl_id"] = new_id
+                                trade["sl"] = new_sl
+                                print(f"[TIGHT TRAIL] {symbol} peak {trade['trail_price']} -> SL {new_sl}")
+                            else:
+                                print(f"[TIGHT TRAIL FAIL] {symbol} trail SL re-placement failed - keeping SL {trade['sl']}")
                     else:
                         if current < trade["trail_price"]:
                             trade["trail_price"] = current
-                            new_sl = round(trade["trail_price"] + trail_dist, symbol_precision.get(symbol, 4))
-                            if new_sl < trade["sl"]:
-                                new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
-                                if new_id:
-                                    if trade.get("sl_id"):
-                                        cancel_order(symbol, trade["sl_id"])
-                                    trade["sl_id"] = new_id
-                                    trade["sl"] = new_sl
-                                else:
-                                    print(f"[TIGHT TRAIL FAIL] {symbol} trail SL re-placement failed - keeping SL {trade['sl']}")
+                        new_sl = round(trade["trail_price"] + trail_dist, 6)
+                        # only ratchet DOWN, and never place a buy-stop below market
+                        if new_sl < trade["sl"] and new_sl > current:
+                            new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
+                            if new_id:
+                                if trade.get("sl_id"):
+                                    cancel_order(symbol, trade["sl_id"])
+                                trade["sl_id"] = new_id
+                                trade["sl"] = new_sl
+                                print(f"[TIGHT TRAIL] {symbol} peak {trade['trail_price']} -> SL {new_sl}")
+                            else:
+                                print(f"[TIGHT TRAIL FAIL] {symbol} trail SL re-placement failed - keeping SL {trade['sl']}")
 
             sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
             if sl_status == "FILLED":

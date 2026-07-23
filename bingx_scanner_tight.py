@@ -19,7 +19,9 @@ BASE_URL = "https://open-api.bingx.com"
 FAST_TIMEFRAME          = os.environ.get("FAST_TIMEFRAME", "15m")  # changed 1m->15m (2026-07-16) - VBCB redesign: 1m was pure noise-chasing (mostly TimeExits); 15m matches the consolidation-breakout setups Faisal actually wants
 FAST_SCAN_INTERVAL_SECONDS = int(os.environ.get("FAST_SCAN_INTERVAL_SECONDS", 180))  # back to 180s (2026-07-16) - 15m candles, 60s scanning is wasted API calls
 FAST_MIN_QUOTE_VOL      = float(os.environ.get("FAST_MIN_QUOTE_VOL", 2_000_000))
-FAST_MAX_SYMBOLS        = 150
+FAST_MAX_SYMBOLS        = int(os.environ.get("FAST_MAX_SYMBOLS", 150))   # BUGFIX 2026-07-23: this was defined but NEVER PASSED to get_liquid_symbols (max_n=None), so Fast was silently scanning every liquid pair above the volume floor - 300-500 symbols, not 150. A full pass took minutes and was a prime suspect for the Jul 16 rate-limit backoff. Now actually applied as a hard ceiling.
+FAST_GAINER_TOP_N       = int(os.environ.get("FAST_GAINER_TOP_N", 40))   # 2026-07-23: Fast exists to scalp SMALL-CAP DAILY GAINERS, but nothing in the code ever ranked by today's move - after dropping the top FAST_EXCLUDE_TOP_N by volume it just scanned every remaining small cap equally, most of them dead. Now: exclude big caps by volume (unchanged), THEN keep only the top N by 24h % gain. Set 0 to disable ranking and fall back to the old volume ordering.
+FAST_RETEST_ENABLED     = os.environ.get("FAST_RETEST_ENABLED", "false").lower() == "true"   # 2026-07-23: master switch for the Jul 19 retest-limit entry. false = enter at the breakout close (original behaviour, restored on purpose). Rationale: a coin running +100-200% in a day does NOT pull back, so the retest arm-and-wait was structurally filtering out exactly the explosive moves Fast is built to catch - they expired unfilled. Known cost, accepted by Faisal 2026-07-23: more failed breakouts WILL be taken and SL hits will rise; the bet is that the runners it now catches pay for them. Flip to true to A/B the old behaviour without a rewrite.
 FAST_CONSOL_LOOKBACK    = 20
 FAST_BREAKOUT_ATR_MULT  = float(os.environ.get("FAST_BREAKOUT_ATR_MULT", 0.2))   # loosened from 0.3 (2026-07-11) - catch moves earlier
 FAST_VOL_MULT           = float(os.environ.get("FAST_VOL_MULT", 2.0))   # VBCB (2026-07-16): breakout vol >= 2x avg of last 20 candles (was hardcoded 3.0 on 1m)
@@ -198,7 +200,40 @@ def get_futures_symbols():
     return symbols
 
 
-def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0):
+def _ticker_gain_pct(t):
+    """Today's % move from a BingX ticker entry. The exact field name is not
+    guaranteed across API versions, so try the documented one first, then a couple
+    of known aliases, then fall back to computing it from open/last. Returns None
+    when nothing usable is present - callers must treat None as 'no gain data'."""
+    for key in ("priceChangePercent", "priceChangePercentage", "changePercent"):
+        raw = t.get(key)
+        if raw not in (None, ""):
+            try:
+                # Taken literally - NO scale guessing. An earlier version multiplied
+                # values below 1 by 100 on the theory they might be fractions, which
+                # turned a genuine +0.5% coin into a +50% "top gainer". Confirm the
+                # real units once from the [TICKER FIELDS] log line below.
+                return float(str(raw).replace("%", ""))
+            except Exception:
+                pass
+    try:
+        op = float(t.get("openPrice", 0) or 0)
+        last = float(t.get("lastPrice", 0) or t.get("close", 0) or 0)
+        if op > 0 and last > 0:
+            return (last - op) / op * 100
+    except Exception:
+        pass
+    return None
+
+
+_gain_field_logged = False
+
+
+def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0, rank_by_gain=0):
+    """rank_by_gain (added 2026-07-23, default 0 = OFF): when > 0, the surviving
+    symbols are re-sorted by today's % gain and cut to that many. Tight and Tight 3
+    do not pass it, so their universe selection is byte-for-byte unchanged."""
+    global _gain_field_logged
     try:
         url = BASE_URL + "/openApi/swap/v2/quote/ticker"
         r = requests.get(url, timeout=10).json()
@@ -216,13 +251,30 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0):
             except Exception:
                 qvol = 0
             if qvol >= min_quote_vol:
-                liquid.append((sym, qvol))
+                liquid.append((sym, qvol, _ticker_gain_pct(t)))
         liquid.sort(key=lambda x: x[1], reverse=True)
         if exclude_top_n > 0:
             liquid = liquid[exclude_top_n:]
+
+        if rank_by_gain > 0:
+            if not _gain_field_logged and tickers:
+                # one-time dump so the real field names can be confirmed from the
+                # Render logs instead of trusted blindly
+                print(f"[TICKER FIELDS] sample entry keys: {sorted(tickers[0].keys())}")
+                _gain_field_logged = True
+            with_gain = [x for x in liquid if x[2] is not None]
+            if with_gain:
+                with_gain.sort(key=lambda x: x[2], reverse=True)
+                liquid = with_gain[:rank_by_gain]
+            else:
+                # No usable gain field -> keep the old volume ordering rather than
+                # silently returning nothing. Loud, because it means the gainer
+                # focus is NOT active.
+                print("[GAINER RANK] no usable price-change field in ticker payload - falling back to volume ordering (check [TICKER FIELDS] above)")
+
         if max_n is not None:
             liquid = liquid[:max_n]
-        return [s for s, _ in liquid]
+        return [s for s, _q, _g in liquid]
     except Exception as e:
         print(f"[LIQUID SYMBOLS ERROR] {e}")
         return symbols[:max_n] if max_n else symbols
@@ -821,6 +873,45 @@ def update_fast_trailing():
             print(f"[TRAIL ERROR] {symbol}: {e}")
 
 
+def fast_enter_now(symbol, side, entry, sl_price, atr_now, risk_usdt, lev,
+                   ratio, close_strength, ext_tag, extension):
+    """Immediate entry at the breakout close - used when FAST_RETEST_ENABLED is off
+    (2026-07-23). Mirrors the concurrency / auto-trade / margin handling in
+    check_fast_pending() so both entry paths behave identically once an order is
+    actually placed; the only difference is WHERE the entry price comes from."""
+    risk = abs(entry - sl_price)
+    if risk <= 0:
+        return
+    if side == "BUY":
+        tp1_price = round(entry + risk * FAST_TP1_RR, 6)
+    else:
+        tp1_price = round(entry - risk * FAST_TP1_RR, 6)
+
+    trade_status = ""
+    if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
+        trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
+    elif fast_auto_trade_enabled:
+        oid = place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usdt)
+        if oid == "MARGIN_SKIP":
+            trade_status = "\nSkipped - insufficient margin"
+        elif oid and oid != "N/A":
+            trade_status = "\nOrder: " + str(oid)
+        else:
+            trade_status = "\nOrder failed"
+    else:
+        trade_status = "\nAuto-trade OFF"
+
+    print(f"[FAST ENTRY] {symbol} {side} @ {entry} SL {sl_price} | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR{trade_status}")
+    send_tg(
+        "FAST ENTRY - " + side + " - " + symbol + "\n------------------------------\n"
+        "Entry: " + str(round(entry, 6)) + " (breakout close, no retest wait) | SL: " + str(sl_price) + "\n"
+        "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
+        "Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(close_strength, 2)) +
+        " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
+        trade_status + "\n------------------------------\nNiti Fast Signal"
+    )
+
+
 # ==================== FAST SIGNAL ENTRY LOGIC ====================
 def check_fast(symbol):
     try:
@@ -951,14 +1042,18 @@ def check_fast(symbol):
             fast_alerted.add(sig_id_long)
             lev        = get_fast_leverage(symbol)
             sl_price   = round(box_low - atr_now * SL_ATR_BUFFER_MULT, 6)
+            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
+            ext_tag    = "extended (half size)" if is_extended else "fresh move"
+            if not FAST_RETEST_ENABLED:
+                fast_enter_now(symbol, "BUY", entry, sl_price, atr_now, risk_usdt,
+                               lev, ratio, bull_close_strength, ext_tag, extension)
+                return
             trig_mid   = (h(trig) + l(trig)) / 2
             retest     = round(max(box_high, trig_mid), 6)
             risk       = retest - sl_price
             if risk <= 0:
                 return
             tp1_price  = round(retest + risk * FAST_TP1_RR, 6)
-            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
-            ext_tag    = "extended (half size)" if is_extended else "fresh move"
             fast_pending_retests[symbol] = {
                 "side": "BUY", "retest": retest, "sl": sl_price, "atr": atr_now,
                 "risk_usdt": risk_usdt, "lev": lev, "ratio": ratio,
@@ -980,14 +1075,18 @@ def check_fast(symbol):
             fast_alerted.add(sig_id_short)
             lev        = get_fast_leverage(symbol)
             sl_price   = round(box_high + atr_now * SL_ATR_BUFFER_MULT, 6)
+            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
+            ext_tag    = "extended (half size)" if is_extended else "fresh move"
+            if not FAST_RETEST_ENABLED:
+                fast_enter_now(symbol, "SELL", entry, sl_price, atr_now, risk_usdt,
+                               lev, ratio, bear_close_strength, ext_tag, extension)
+                return
             trig_mid   = (h(trig) + l(trig)) / 2
             retest     = round(min(box_low, trig_mid), 6)
             risk       = sl_price - retest
             if risk <= 0:
                 return
             tp1_price  = round(retest - risk * FAST_TP1_RR, 6)
-            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
-            ext_tag    = "extended (half size)" if is_extended else "fresh move"
             fast_pending_retests[symbol] = {
                 "side": "SELL", "retest": retest, "sl": sl_price, "atr": atr_now,
                 "risk_usdt": risk_usdt, "lev": lev, "ratio": ratio,
@@ -1528,7 +1627,8 @@ def fast_scan_loop():
             if not all_symbols:
                 all_symbols = get_futures_symbols() or []
             liquid = get_liquid_symbols(
-                all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=None, exclude_top_n=FAST_EXCLUDE_TOP_N
+                all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX_SYMBOLS,
+                exclude_top_n=FAST_EXCLUDE_TOP_N, rank_by_gain=FAST_GAINER_TOP_N
             )
             # NCS tokenized stocks are ALWAYS excluded on weekends (UTC Sat/Sun): the
             # underlying stock market is closed, books go dead, and stale/thin prints
@@ -1536,7 +1636,9 @@ def fast_scan_loop():
             # ghosts. Weekday inclusion still controlled by EXCLUDE_XSTOCKS_FAST env.
             if EXCLUDE_XSTOCKS_FAST or datetime.now(timezone.utc).weekday() >= 5:
                 liquid = [s for s in liquid if not s.startswith("NCS")]
-            print(f"[FAST SCAN] Scanning {len(liquid)} small/mid-cap liquid pairs for breakouts...")
+            mode = "retest-wait" if FAST_RETEST_ENABLED else "immediate breakout entry"
+            rank = f"top {FAST_GAINER_TOP_N} daily gainers" if FAST_GAINER_TOP_N > 0 else "volume-ordered"
+            print(f"[FAST SCAN] Scanning {len(liquid)} pairs ({rank}, big caps excluded) | entry mode: {mode}")
             fast_diagnostic_check()
             for sym in liquid:
                 check_fast(sym)

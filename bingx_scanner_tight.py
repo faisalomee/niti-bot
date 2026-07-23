@@ -21,6 +21,17 @@ FAST_SCAN_INTERVAL_SECONDS = int(os.environ.get("FAST_SCAN_INTERVAL_SECONDS", 18
 FAST_MIN_QUOTE_VOL      = float(os.environ.get("FAST_MIN_QUOTE_VOL", 2_000_000))
 FAST_MAX_SYMBOLS        = int(os.environ.get("FAST_MAX_SYMBOLS", 150))   # BUGFIX 2026-07-23: this was defined but NEVER PASSED to get_liquid_symbols (max_n=None), so Fast was silently scanning every liquid pair above the volume floor - 300-500 symbols, not 150. A full pass took minutes and was a prime suspect for the Jul 16 rate-limit backoff. Now actually applied as a hard ceiling.
 FAST_GAINER_TOP_N       = int(os.environ.get("FAST_GAINER_TOP_N", 40))   # 2026-07-23: Fast exists to scalp SMALL-CAP DAILY GAINERS, but nothing in the code ever ranked by today's move - after dropping the top FAST_EXCLUDE_TOP_N by volume it just scanned every remaining small cap equally, most of them dead. Now: exclude big caps by volume (unchanged), THEN keep only the top N by 24h % gain. Set 0 to disable ranking and fall back to the old volume ordering.
+# ---- Gainer band (2026-07-23) ----
+# Ranking purely by 24h gain selects coins whose move is, by definition, already
+# behind them - and the existing anti-chasing guards (box <= 3x ATR, extension <=
+# 7x ATR) only look at the last 20 x 15m candles (~5h), so they cannot tell a coin
+# that is +180% on the day from one that just started moving. The band adds the
+# missing day-scale view: a floor so dead coins don't fill the list, and a ceiling
+# so coins whose run is mostly spent are dropped before they can be bought at the
+# top. Both numbers are ESTIMATES - a coin stopped out at 70% can still go to 400%,
+# and one at 30% can collapse. Tune from the journal, don't trust the defaults.
+FAST_GAINER_MIN_PCT     = float(os.environ.get("FAST_GAINER_MIN_PCT", 8.0))
+FAST_GAINER_MAX_PCT     = float(os.environ.get("FAST_GAINER_MAX_PCT", 70.0))
 FAST_RETEST_ENABLED     = os.environ.get("FAST_RETEST_ENABLED", "false").lower() == "true"   # 2026-07-23: master switch for the Jul 19 retest-limit entry. false = enter at the breakout close (original behaviour, restored on purpose). Rationale: a coin running +100-200% in a day does NOT pull back, so the retest arm-and-wait was structurally filtering out exactly the explosive moves Fast is built to catch - they expired unfilled. Known cost, accepted by Faisal 2026-07-23: more failed breakouts WILL be taken and SL hits will rise; the bet is that the runners it now catches pay for them. Flip to true to A/B the old behaviour without a rewrite.
 FAST_CONSOL_LOOKBACK    = 20
 FAST_BREAKOUT_ATR_MULT  = float(os.environ.get("FAST_BREAKOUT_ATR_MULT", 0.2))   # loosened from 0.3 (2026-07-11) - catch moves earlier
@@ -229,10 +240,12 @@ def _ticker_gain_pct(t):
 _gain_field_logged = False
 
 
-def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0, rank_by_gain=0):
+def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
+                       rank_by_gain=0, gain_min=None, gain_max=None):
     """rank_by_gain (added 2026-07-23, default 0 = OFF): when > 0, the surviving
-    symbols are re-sorted by today's % gain and cut to that many. Tight and Tight 3
-    do not pass it, so their universe selection is byte-for-byte unchanged."""
+    symbols are filtered to the [gain_min, gain_max] daily-move band and then
+    re-sorted by today's % gain and cut to that many. Tight and Tight 3 do not pass
+    any of these, so their universe selection is byte-for-byte unchanged."""
     global _gain_field_logged
     try:
         url = BASE_URL + "/openApi/swap/v2/quote/ticker"
@@ -264,8 +277,20 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0, rank
                 _gain_field_logged = True
             with_gain = [x for x in liquid if x[2] is not None]
             if with_gain:
+                total = len(with_gain)
+                if gain_min is not None:
+                    with_gain = [x for x in with_gain if x[2] >= gain_min]
+                if gain_max is not None:
+                    too_hot = [x for x in with_gain if x[2] > gain_max]
+                    with_gain = [x for x in with_gain if x[2] <= gain_max]
+                    if too_hot:
+                        names = ", ".join(f"{s}({g:.0f}%)" for s, _q, g in
+                                          sorted(too_hot, key=lambda x: -x[2])[:5])
+                        print(f"[GAINER BAND] {len(too_hot)} coin(s) above +{gain_max}% skipped as late-stage: {names}")
                 with_gain.sort(key=lambda x: x[2], reverse=True)
                 liquid = with_gain[:rank_by_gain]
+                if not liquid:
+                    print(f"[GAINER BAND] nothing in the +{gain_min}% to +{gain_max}% band right now ({total} coins had gain data) - Fast will idle this pass")
             else:
                 # No usable gain field -> keep the old volume ordering rather than
                 # silently returning nothing. Loud, because it means the gainer
@@ -1628,7 +1653,8 @@ def fast_scan_loop():
                 all_symbols = get_futures_symbols() or []
             liquid = get_liquid_symbols(
                 all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX_SYMBOLS,
-                exclude_top_n=FAST_EXCLUDE_TOP_N, rank_by_gain=FAST_GAINER_TOP_N
+                exclude_top_n=FAST_EXCLUDE_TOP_N, rank_by_gain=FAST_GAINER_TOP_N,
+                gain_min=FAST_GAINER_MIN_PCT, gain_max=FAST_GAINER_MAX_PCT
             )
             # NCS tokenized stocks are ALWAYS excluded on weekends (UTC Sat/Sun): the
             # underlying stock market is closed, books go dead, and stale/thin prints
@@ -1637,7 +1663,8 @@ def fast_scan_loop():
             if EXCLUDE_XSTOCKS_FAST or datetime.now(timezone.utc).weekday() >= 5:
                 liquid = [s for s in liquid if not s.startswith("NCS")]
             mode = "retest-wait" if FAST_RETEST_ENABLED else "immediate breakout entry"
-            rank = f"top {FAST_GAINER_TOP_N} daily gainers" if FAST_GAINER_TOP_N > 0 else "volume-ordered"
+            rank = (f"top {FAST_GAINER_TOP_N} gainers in +{FAST_GAINER_MIN_PCT}%..+{FAST_GAINER_MAX_PCT}% band"
+                    if FAST_GAINER_TOP_N > 0 else "volume-ordered")
             print(f"[FAST SCAN] Scanning {len(liquid)} pairs ({rank}, big caps excluded) | entry mode: {mode}")
             fast_diagnostic_check()
             for sym in liquid:

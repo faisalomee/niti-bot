@@ -454,7 +454,11 @@ def v(c):  return float(c["volume"])
 def send_tg(msg, chat_id=None):
     cid = chat_id or TG_CHAT_ID
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": cid, "text": msg, "parse_mode": "HTML"}, timeout=10)
+    # NOTE: no parse_mode. With parse_mode="HTML" a bare "<" in the text (e.g. the RSI
+    # message "RSI(14) < 20") is read as a broken HTML tag and Telegram rejects the
+    # ENTIRE sendMessage - which is why RSI entries fired silently while the order had
+    # already been placed. Plain text needs no escaping.
+    requests.post(url, json={"chat_id": cid, "text": msg}, timeout=10)
 
 
 def send_journal(msg):
@@ -604,6 +608,134 @@ def get_available_margin():
         return avail if avail > 0 else None
     except Exception:
         return None
+
+
+def get_open_positions():
+    """All non-zero open positions from BingX. Returns a list of
+    {symbol, pos_side, amt(>0), avg}. Empty list on failure (never raises)."""
+    try:
+        params = build_signed_params({})
+        url = BASE_URL + "/openApi/swap/v2/user/positions"
+        r = requests.get(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        out = []
+        for p in r.get("data", []) or []:
+            try:
+                amt = abs(float(p.get("positionAmt", 0) or 0))
+            except Exception:
+                amt = 0
+            if amt <= 0:
+                continue
+            out.append({
+                "symbol":   p.get("symbol", ""),
+                "pos_side": (p.get("positionSide", "") or "").upper(),
+                "amt":      amt,
+                "avg":      float(p.get("avgPrice", 0) or 0),
+            })
+        return out
+    except Exception as e:
+        print(f"[POSITIONS ERROR] {e}")
+        return []
+
+
+def get_open_orders_for(symbol):
+    """Open orders for one symbol, split into the first STOP_MARKET and the first
+    TAKE_PROFIT_MARKET found -> (sl_id, sl_price, tp_id, tp_price). Any may be None."""
+    sl_id = sl_price = tp_id = tp_price = None
+    try:
+        params = build_signed_params({"symbol": symbol})
+        url = BASE_URL + "/openApi/swap/v2/trade/openOrders"
+        r = requests.get(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        orders = r.get("data", {}).get("orders", []) or []
+        for od in orders:
+            otype = str(od.get("type", "")).upper()
+            oid   = od.get("orderId")
+            try:
+                stop = float(od.get("stopPrice", 0) or 0)
+            except Exception:
+                stop = 0
+            if otype == "STOP_MARKET" and sl_id is None:
+                sl_id, sl_price = oid, stop
+            elif otype == "TAKE_PROFIT_MARKET" and tp_id is None:
+                tp_id, tp_price = oid, stop
+    except Exception as e:
+        print(f"[OPEN ORDERS ERROR] {symbol}: {e}")
+    return sl_id, sl_price, tp_id, tp_price
+
+
+def adopt_positions_on_start():
+    """Run ONCE at startup. All engine state is in-memory, so a Render restart/redeploy
+    forgets every open position: the bot then re-opens past the concurrency cap and
+    ORPHANS the old positions (their BE/trail management never runs again). This
+    re-adopts what is actually open on BingX so the caps hold and management resumes.
+
+    Only LONG positions are adopted (CF and RSI are always long; T3 longs too). A LONG
+    that already has a TAKE_PROFIT order on the exchange is a Crash Fade bracket (SL+3R
+    TP both live on BingX regardless of restart) -> tracked by track_cf_trades. A LONG
+    with no TP is a trail-managed position (RSI / T3-long) -> tracked by track_rsi_trades
+    (BE at 1R, then trail). If a position has no SL at all, a protective SL is placed and
+    the user is alerted. SHORT positions keep their exchange SL and are only reported."""
+    try:
+        positions = get_open_positions()
+    except Exception as e:
+        print(f"[ADOPT ERROR] {e}")
+        return
+    if not positions:
+        print("[ADOPT] no open positions on BingX to re-adopt")
+        return
+    tracked = {t["symbol"] for t in cf_open_trades.values()} | {t["symbol"] for t in rsi_open_trades.values()}
+    adopted_cf = adopted_rsi = shorts = 0
+    lines = []
+    for p in positions:
+        sym, amt, avg = p["symbol"], p["amt"], p["avg"]
+        if p["pos_side"] != "LONG":
+            shorts += 1
+            lines.append(sym + " SHORT (kept on its exchange SL, not adopted)")
+            continue
+        if sym in tracked or avg <= 0:
+            continue
+        sl_id, sl_price, tp_id, tp_price = get_open_orders_for(sym)
+        # Ensure the position is protected. If no SL exists, place a conservative one.
+        if sl_id is None:
+            fallback_sl = round(avg * (1 - 0.05), 6)   # 5% protective stop until proper management takes over
+            sl_id = place_sl_guarded(sym, "SELL", "LONG", fallback_sl, amt)
+            sl_price = fallback_sl
+            if sl_id is None:
+                send_tg("ADOPT WARNING - " + sym + " LONG has NO stop-loss on the exchange and one could not be placed. Set an SL manually NOW.")
+            else:
+                send_tg("ADOPT - " + sym + " LONG had no SL - placed a protective 5% stop at " + str(fallback_sl) + " until trailing takes over.")
+        now = time.time()
+        if tp_id is not None:
+            # Crash Fade bracket (SL + 3R TP already live) -> let track_cf_trades watch it.
+            cf_open_trades[sym] = {
+                "symbol": sym, "side": "BUY", "entry": avg, "entry_fill": avg,
+                "sl": sl_price if sl_price else round(avg * 0.95, 6), "sl_id": sl_id,
+                "tp": tp_price, "tp_id": tp_id, "close_side": "SELL", "pos_side": "LONG",
+                "total_qty": amt, "remaining_qty": amt,
+                "risk_dist": abs(avg - (sl_price or avg * 0.95)),
+                "atr_at_entry": 0.0, "opened_ts": now,
+                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+            }
+            adopted_cf += 1
+            lines.append(sym + " LONG -> Crash Fade (SL+TP bracket)")
+        else:
+            # Trail-managed (RSI / T3-long): no exchange TP, exit is bot-driven.
+            risk_dist = abs(avg - sl_price) if sl_price else avg * 0.05
+            rsi_open_trades["adopt-" + sym] = {
+                "symbol": sym, "side": "BUY", "entry": avg, "entry_fill": avg,
+                "sl": sl_price if sl_price else round(avg * 0.95, 6), "sl_id": sl_id,
+                "close_side": "SELL", "pos_side": "LONG",
+                "total_qty": amt, "remaining_qty": amt,
+                "risk_dist": risk_dist if risk_dist > 0 else avg * 0.05,
+                "atr_at_entry": 0.0, "opened_ts": now,
+                "peak_r": 0.0, "be_done": False, "stop_r": None,
+                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+            }
+            adopted_rsi += 1
+            lines.append(sym + " LONG -> trail-managed (BE@1R then trail)")
+    print(f"[ADOPT] re-adopted {adopted_cf} CF + {adopted_rsi} trail-managed, {shorts} short(s) left on their SL")
+    if lines:
+        send_tg("STARTUP RE-ADOPT\n------------------------------\n" + "\n".join(lines) +
+                "\n------------------------------\nConcurrency caps and trailing now account for these.")
 
 
 def place_sl_guarded(symbol, close_side, pos_side, sl_price, qty):
@@ -1858,6 +1990,14 @@ def health():
 
 
 if __name__ == "__main__":
+    # Re-adopt anything already open on BingX BEFORE the engines start, so a restart
+    # can't breach the concurrency caps or orphan a trail-managed position.
+    try:
+        get_futures_symbols()          # populate symbol_precision / max_lev first
+        adopt_positions_on_start()
+    except Exception as e:
+        print(f"[STARTUP ADOPT ERROR] {e}")
+
     Thread(target=cf_scan_loop,             daemon=True).start()
     Thread(target=rsi_scan_loop,            daemon=True).start()
     Thread(target=trailing_loop,            daemon=True).start()

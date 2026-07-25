@@ -1,4 +1,20 @@
-import os, time, hmac, hashlib, requests
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  body{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1117;color:#c9d1d9}
+  .bar{position:sticky;top:0;display:flex;align-items:center;gap:12px;padding:10px 14px;background:#161b22;border-bottom:1px solid #30363d}
+  .bar b{font-family:system-ui,sans-serif;font-size:14px}
+  .bar span{font-family:system-ui,sans-serif;color:#8b949e;font-size:12px}
+  button{margin-left:auto;background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
+  button:hover{background:#2ea043}
+  button.done{background:#1f6feb}
+  textarea{width:100%;height:78vh;box-sizing:border-box;border:0;padding:14px;background:#0d1117;color:#c9d1d9;font-size:12px;line-height:1.5;white-space:pre;overflow:auto;resize:vertical}
+</style></head><body>
+<div class="bar">
+  <b>bingx_scanner_tight.py</b>
+  <span>Crash Fade + RSI Reversion + Tight 3 &middot; 1867 lines</span>
+  <button id="c">Copy all</button>
+</div>
+<textarea id="t" readonly spellcheck="false">import os, time, hmac, hashlib, requests
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone, timedelta
@@ -15,150 +31,113 @@ FAST_TRADE_AMOUNT = float(os.environ.get("FAST_TRADE_AMOUNT", 20))
 
 BASE_URL = "https://open-api.bingx.com"
 
-# ==================== FAST SIGNAL CONFIG ====================
-FAST_TIMEFRAME          = os.environ.get("FAST_TIMEFRAME", "15m")  # changed 1m->15m (2026-07-16) - VBCB redesign: 1m was pure noise-chasing (mostly TimeExits); 15m matches the consolidation-breakout setups Faisal actually wants
-FAST_SCAN_INTERVAL_SECONDS = int(os.environ.get("FAST_SCAN_INTERVAL_SECONDS", 180))  # back to 180s (2026-07-16) - 15m candles, 60s scanning is wasted API calls
-FAST_MIN_QUOTE_VOL      = float(os.environ.get("FAST_MIN_QUOTE_VOL", 2_000_000))
-FAST_MAX_SYMBOLS        = int(os.environ.get("FAST_MAX_SYMBOLS", 150))   # BUGFIX 2026-07-23: this was defined but NEVER PASSED to get_liquid_symbols (max_n=None), so Fast was silently scanning every liquid pair above the volume floor - 300-500 symbols, not 150. A full pass took minutes and was a prime suspect for the Jul 16 rate-limit backoff. Now actually applied as a hard ceiling.
-FAST_GAINER_TOP_N       = int(os.environ.get("FAST_GAINER_TOP_N", 40))   # 2026-07-23: Fast exists to scalp SMALL-CAP DAILY GAINERS, but nothing in the code ever ranked by today's move - after dropping the top FAST_EXCLUDE_TOP_N by volume it just scanned every remaining small cap equally, most of them dead. Now: exclude big caps by volume (unchanged), THEN keep only the top N by 24h % gain. Set 0 to disable ranking and fall back to the old volume ordering.
-# ---- Gainer band (2026-07-23) ----
-# Ranking purely by 24h gain selects coins whose move is, by definition, already
-# behind them - and the existing anti-chasing guards (box <= 3x ATR, extension <=
-# 7x ATR) only look at the last 20 x 15m candles (~5h), so they cannot tell a coin
-# that is +180% on the day from one that just started moving. The band adds the
-# missing day-scale view: a floor so dead coins don't fill the list, and a ceiling
-# so coins whose run is mostly spent are dropped before they can be bought at the
-# top. Both numbers are ESTIMATES - a coin stopped out at 70% can still go to 400%,
-# and one at 30% can collapse. Tune from the journal, don't trust the defaults.
-FAST_GAINER_MIN_PCT     = float(os.environ.get("FAST_GAINER_MIN_PCT", 8.0))
-FAST_GAINER_MAX_PCT     = float(os.environ.get("FAST_GAINER_MAX_PCT", 70.0))
-FAST_RETEST_ENABLED     = os.environ.get("FAST_RETEST_ENABLED", "false").lower() == "true"   # 2026-07-23: master switch for the Jul 19 retest-limit entry. false = enter at the breakout close (original behaviour, restored on purpose). Rationale: a coin running +100-200% in a day does NOT pull back, so the retest arm-and-wait was structurally filtering out exactly the explosive moves Fast is built to catch - they expired unfilled. Known cost, accepted by Faisal 2026-07-23: more failed breakouts WILL be taken and SL hits will rise; the bet is that the runners it now catches pay for them. Flip to true to A/B the old behaviour without a rewrite.
-FAST_CONSOL_LOOKBACK    = 20
-FAST_BREAKOUT_ATR_MULT  = float(os.environ.get("FAST_BREAKOUT_ATR_MULT", 0.2))   # loosened from 0.3 (2026-07-11) - catch moves earlier
-FAST_VOL_MULT           = float(os.environ.get("FAST_VOL_MULT", 2.0))   # VBCB (2026-07-16): breakout vol >= 2x avg of last 20 candles (was hardcoded 3.0 on 1m)
-FAST_VOL_LB             = 20
-FAST_TRIGGER_TIMEFRAME  = os.environ.get("FAST_TRIGGER_TIMEFRAME", "5m")
-PRICE_CACHE_SECONDS     = int(os.environ.get("PRICE_CACHE_SECONDS", 30))   # 2026-07-17: ticker cache - gate/trailing/progress checks share one price fetch per symbol per 30s
-AUTO_RESUME_ON_START    = os.environ.get("AUTO_RESUME_ON_START", "false").lower() == "true"   # 2026-07-17: opt-in - resume auto-trading after a Render restart without waiting for /start
-TIGHT_EXTENSION_HARD_SKIP = float(os.environ.get("TIGHT_EXTENSION_HARD_SKIP", 7.0))   # 2026-07-17: same anti-chasing guard Fast has - skip breakouts after a >7xATR run (DEXE bottom-sell class of losses)
-TIGHT_EXTENSION_LOOKBACK  = int(os.environ.get("TIGHT_EXTENSION_LOOKBACK", 20))
-TIGHT_MIN_SL_DIST_PCT     = float(os.environ.get("TIGHT_MIN_SL_DIST_PCT", 0.3))   # 2026-07-17: skip trades whose SL sits closer than 0.3% of price - spread/noise alone stops those out   # hybrid entry (2026-07-16): box/ATR from 15m, breakout trigger from 5m close - cuts entry lag ~10min without giving up close-confirmation
-EXCLUDE_XSTOCKS_TIGHT   = os.environ.get("EXCLUDE_XSTOCKS_TIGHT", "true").lower() == "true"   # 2026-07-16: NCSK tokenized stocks gap around equity sessions, thin books - poison for crypto breakout logic (SOXL/SKHYNIX SLs on Jul 16)
-EXCLUDE_XSTOCKS_FAST    = os.environ.get("EXCLUDE_XSTOCKS_FAST", "false").lower() == "true"
-FAST_BOX_MAX_ATR_MULT   = float(os.environ.get("FAST_BOX_MAX_ATR_MULT", 3.0))   # VBCB core filter (2026-07-16): 20-candle box height must be <= 3x ATR to count as real consolidation - kills the late-entry/chasing problem (e.g. RAVE bought at +17% top)
-FAST_ATR_LEN            = 14
-FAST_SL_ATR_MULT        = 1.2   # NOTE: dead/unused - actual SL uses SL_ATR_BUFFER_MULT below. Kept only for reference.
-FAST_RISK_USDT          = 2.0   # hardcoded for $100 account (2026-07-18) - env override removed so stale Render vars cannot silently change sizing. Scaling plan: $150->3, $250->4, $350->5
-FAST_EXCLUDE_TOP_N       = 75
-FAST_EXTENSION_LOOKBACK  = 20
-FAST_EXTENSION_LIMIT     = 4.0
-FAST_EXTENSION_HARD_SKIP = float(os.environ.get("FAST_EXTENSION_HARD_SKIP", 7.0))   # added 2026-07-14: beyond this many x ATR, skip the trade entirely (too late/exhausted a move), not just half-size
-FAST_EXTENSION_MULT      = 0.5
-FAST_MARGIN_CAP_MULT     = float(os.environ.get("FAST_MARGIN_CAP_MULT", 5.0))   # env-overridable (2026-07-17) - margin cap = FAST_TRADE_AMOUNT x this
-FAST_TP1_RR             = float(os.environ.get("FAST_TP1_RR", 2.0))   # raised 0.8->2.0 (2026-07-16): 0.8R half-qty TP1 banked ~$2 vs -$5 full SL -> needed ~70% WR just to break even. 2R half banks full risk amount.
-FAST_TRAIL_ACTIVATE_RR  = 1.0
-FAST_MAX_CONCURRENT_TRADES = 2   # hardcoded for $100 account (2026-07-18); raise to 3 at $350+
-FAST_CLOSE_POSITION_MIN = float(os.environ.get("FAST_CLOSE_POSITION_MIN", 0.6))   # loosened from 0.7 (2026-07-11)
-FAST_TRAIL_ATR_MULT     = float(os.environ.get("FAST_TRAIL_ATR_MULT", 1.5))
-FAST_TRAIL_PCT_FALLBACK = float(os.environ.get("FAST_TRAIL_PCT_FALLBACK", 3.0))
-
-SL_ATR_BUFFER_MULT = 0.3   # shared SL buffer, used by both Fast and Tight
-
-# ---- Progress-based time exit (reworked 2026-07-11) ----
-# Old behaviour: force-checked every 10 min and killed anything below a fixed R
-# threshold, even trades that were quietly profitable. New behaviour: profit is
-# never time-exited (trailing handles it); only flat/losing trades and trades whose
-# profit has stalled (stagnant) get timed out. A long backup cap protects against
-# a trade getting stuck open due to a bug/glitch.
-FAST_PROGRESS_CHECK_SECONDS   = int(os.environ.get("FAST_PROGRESS_CHECK_SECONDS", 1800))   # 30 min between checks (2026-07-16: was 15min - too twitchy for 15m timeframe)
-FAST_STAGNATION_CHECKS        = int(os.environ.get("FAST_STAGNATION_CHECKS", 3))           # consecutive non-improving checks (~45 min) before locking profit
-FAST_STAGNATION_MIN_R_INCREASE = float(os.environ.get("FAST_STAGNATION_MIN_R_INCREASE", 0.1))
-FAST_SAFETY_CAP_SECONDS       = int(os.environ.get("FAST_SAFETY_CAP_SECONDS", 21600))      # 6h backup net (2026-07-16: was 3.5h - 15m swings need more room)
-
-# ---- Retest limit entry (2026-07-19) ----
-# Every VBCB signal since the 2026-07-16 redesign would have lost (Faisal verified
-# manually, auto-trade was off): entering at the breakout close means buying the very
-# top of the extension (close-strength 0.9 = candle closed at its extreme). The
-# immediate pullback then eats the tight structural SL at 10x lev, even when the
-# breakout direction later plays out. Fix: NO entry at signal time. The signal only
-# arms a pending retest - price must pull back to the retest level (box edge or
-# trigger-candle midpoint, whichever is nearer the breakout side) and the entry
-# happens THERE. No pullback within the window = no trade. Price through the SL
-# before the retest fills = breakout failed, no trade (that loss is now avoided).
-FAST_RETEST_EXPIRY_SECONDS = int(os.environ.get("FAST_RETEST_EXPIRY_SECONDS", 1800))   # 30 min = two 15m candles
-
-# ---- MTF trend filter (added to Fast Signal 2026-07-11, reusing the Tight-era helper) ----
-# Direction-only check against the already-closed 1h candle - no extra waiting,
-# checked at the same instant as the breakout candle itself.
-MTF_FILTER_ENABLED = os.environ.get("MTF_FILTER_ENABLED", "true").lower() == "true"
+# ==================== SHARED / INFRA CONFIG ====================
+# Kept for the infrastructure helpers below (backoff, price cache, MTF/BTC helpers).
+API_BACKOFF_SECONDS = int(os.environ.get("API_BACKOFF_SECONDS", 1200))   # 20 min full silence on a rate-limit hit (self-renewing penalty)
+PRICE_CACHE_SECONDS = int(os.environ.get("PRICE_CACHE_SECONDS", 30))
+AUTO_RESUME_ON_START = os.environ.get("AUTO_RESUME_ON_START", "false").lower() == "true"
+MIN_PRICE           = 0.001
+# get_mtf_trend / get_btc_direction are retained infra helpers - keep their constants defined.
 MTF_INTERVAL        = os.environ.get("MTF_INTERVAL", "1h")
-BTC_FILTER_ENABLED  = os.environ.get("BTC_FILTER_ENABLED", "true").lower() == "true"   # 2026-07-17: alts follow BTC - block Tight breakouts against clear BTC direction
-BTC_FILTER_CANDLES  = int(os.environ.get("BTC_FILTER_CANDLES", 4))                     # how many closed 15m BTC candles define "clear" direction
 EMA200_LEN          = 200
+BTC_FILTER_CANDLES  = int(os.environ.get("BTC_FILTER_CANDLES", 4))
 
-MIN_PRICE = 0.001
+# Tokenized-equity / commodity pairs (NCS* = xStocks, NCCO* = tokenized oil/metals).
+# Thin books, gap around equity sessions - poison for crypto mean-reversion. ALWAYS
+# excluded from both engines (fixes the 2026-07-24 NCCO leak: WTI fired 3x in a day).
+def is_tokenized(sym):
+    return sym.startswith("NCS") or sym.startswith("NCCO")
 
-# ==================== TIGHT CONFIG (Stock Niti strategy, replaces old Tight 2 - 2026-07-11) ====================
-# Volume-spike -> cooldown -> re-entry-on-breakout strategy, all on the 1m timeframe.
-TIGHT_TIMEFRAME              = "1m"
-TIGHT_MIN_QUOTE_VOL          = float(os.environ.get("TIGHT_MIN_QUOTE_VOL", 1_000_000))   # liquidity floor for coin selection
-TIGHT_MAX_SYMBOLS            = int(os.environ.get("TIGHT_MAX_SYMBOLS", 400))
+# ==================== CRASH FADE CONFIG (Market-Breadth Crash Fade, replaces Fast) ====================
+# Backtest: n=922, win 77.3%, net +0.482R, all 3 months positive, 153/165 coins +ve.
+# Only fades sharp drops WHILE THE WHOLE SMALL-CAP MARKET IS CRASHING (breadth gate) -
+# in a panic, individual drops are forced/exaggerated selling that bounces; in calm
+# markets drops are real and don't bounce.
+CF_TIMEFRAME              = os.environ.get("CF_TIMEFRAME", "5m")
+CF_SCAN_INTERVAL_SECONDS  = int(os.environ.get("CF_SCAN_INTERVAL_SECONDS", 180))   # 5m candles - faster scanning is wasted API load
+CF_MIN_QUOTE_VOL          = float(os.environ.get("CF_MIN_QUOTE_VOL", 300_000))     # small-cap focus
+CF_MAX_SYMBOLS            = int(os.environ.get("CF_MAX_SYMBOLS", 150))             # breadth sample + candidate pool; bounds API load. Bigger = truer breadth but heavier polling.
+CF_EXCLUDE_TOP_N          = int(os.environ.get("CF_EXCLUDE_TOP_N", 75))            # drop the majors - the edge is small-cap only
+# ---- Market-breadth index (the winning mechanism) ----
+CF_BREADTH_RET_BARS       = int(os.environ.get("CF_BREADTH_RET_BARS", 12))         # each coin's 1h return = 12x 5m
+CF_BREADTH_SMOOTH_BARS    = int(os.environ.get("CF_BREADTH_SMOOTH_BARS", 12))      # smooth breadth over 1h
+CF_BREADTH_LAG_BARS       = int(os.environ.get("CF_BREADTH_LAG_BARS", 1))          # lag 1 bar = zero look-ahead
+CF_BREADTH_GATE           = float(os.environ.get("CF_BREADTH_GATE", -0.8))         # only trade when smoothed/lagged breadth < -0.8% (market actively falling). Sweet spot where all 3 months stay strong; <-1.2 boosts total but flips July negative.
+# ---- Signal ----
+CF_DROP_LOOKBACK_BARS     = int(os.environ.get("CF_DROP_LOOKBACK_BARS", 12))       # coin must drop over the last 1h...
+CF_DROP_MIN_PCT           = float(os.environ.get("CF_DROP_MIN_PCT", 4.0))          # ...by >=4%, then print ONE green candle (stabilising)
+CF_ATR_TF                 = os.environ.get("CF_ATR_TF", "15m")
+CF_ATR_LEN                = int(os.environ.get("CF_ATR_LEN", 14))
+CF_SL_ATR_MULT            = float(os.environ.get("CF_SL_ATR_MULT", 2.5))           # stop 2.5x ATR15 below entry
+CF_TARGET_RR              = float(os.environ.get("CF_TARGET_RR", 3.0))             # fixed 3R target (no trail)
+CF_MAX_HOLD_SECONDS       = int(os.environ.get("CF_MAX_HOLD_SECONDS", 14400))      # 4h max hold
+CF_COOLDOWN_SECONDS       = int(os.environ.get("CF_COOLDOWN_SECONDS", 7200))       # 24 bars/coin
+# ---- Entry (dip-buy at the green candle's close) ----
+# Backtest entered via a resting MAKER LIMIT bid at the green candle's close, filling
+# only if price traded CF_PIERCE_PCT through it (models adverse selection - you catch
+# the exact dip you wanted). LIVE we cannot rest/cancel a real exchange limit safely
+# (cancel_order is unverified - see its docstring), so we mirror the proven Fast-retest
+# pattern: ARM the bid, monitor price, and MARKET-fill on touch-through. Cost vs
+# backtest: we pay TAKER not maker (backtest taker was still +0.314R, so positive) and
+# a dip that wicks through and bounces inside one 30s poll gap is missed.
+CF_PIERCE_PCT             = float(os.environ.get("CF_PIERCE_PCT", 0.1))            # price must trade 0.1% THROUGH the bid to fill
+CF_PENDING_EXPIRY_SECONDS = int(os.environ.get("CF_PENDING_EXPIRY_SECONDS", 600))  # 2x 5m to get the dip, else skip
+CF_RISK_USDT              = float(os.environ.get("CF_RISK_USDT", 2.0))             # hardcoded $100-account sizing (matches Tight/Fast/T3)
+CF_MAX_MARGIN_USDT        = float(os.environ.get("CF_MAX_MARGIN_USDT", 25.0))
+CF_MAX_CONCURRENT_TRADES  = int(os.environ.get("CF_MAX_CONCURRENT_TRADES", 2))
 
-TIGHT_BASELINE_CANDLES       = int(os.environ.get("TIGHT_BASELINE_CANDLES", 4320))   # 3 days of 1m candles
-BINGX_KLINE_MAX_LIMIT        = 1440   # confirmed 2026-07-11 via live API error: "limit: This field must be less than or equal to 1440." Baseline is paginated in chunks of this size.
-TIGHT_BASELINE_REFRESH_SECONDS = int(os.environ.get("TIGHT_BASELINE_REFRESH_SECONDS", 1800))   # re-fetch baseline every 30 min per symbol, not every scan
-
-TIGHT_SPIKE_VOL_MULT         = float(os.environ.get("TIGHT_SPIKE_VOL_MULT", 20.0))   # live in-progress candle vs 3-day baseline
-TIGHT_COOLDOWN_VOL_RATIO     = float(os.environ.get("TIGHT_COOLDOWN_VOL_RATIO", 3.0))   # below this = "cooling"
-TIGHT_COOLDOWN_MIN_CANDLES   = int(os.environ.get("TIGHT_COOLDOWN_MIN_CANDLES", 5))     # consecutive cool candles to confirm a range
-TIGHT_RANGE_MAX_ATR_MULT     = float(os.environ.get("TIGHT_RANGE_MAX_ATR_MULT", 2.0))   # reject range as "not sideways" if wider than this x ATR (filters slow-bleed)
-TIGHT_REENTRY_VOL_MULT       = float(os.environ.get("TIGHT_REENTRY_VOL_MULT", 5.0))     # volume needed on the breakout candle to re-enter
-TIGHT_SL_ATR_BUFFER_MULT     = float(os.environ.get("TIGHT_SL_ATR_BUFFER_MULT", 0.3))
-TIGHT_RR_TP                  = float(os.environ.get("TIGHT_RR_TP", 4.0))
-TIGHT_BE_TRIGGER_R           = float(os.environ.get("TIGHT_BE_TRIGGER_R", 2.0))         # move SL to breakeven at this R, full size kept
-TIGHT_TRAIL_R_MULT           = float(os.environ.get("TIGHT_TRAIL_R_MULT", 1.0))         # BUGFIX 2026-07-19: was used in track_tight_trades but NEVER DEFINED - every post-TP1 trailing pass died with a silent NameError ([TIGHT TRACK ERROR] in logs), so Tight trailing never actually ran. 1.0 = trail SL one R behind best price.
-TIGHT_MAX_COOLDOWN_WAIT_SECONDS = int(os.environ.get("TIGHT_MAX_COOLDOWN_WAIT_SECONDS", 3600))   # give up watching after 60 min with no breakout
-TIGHT_MAX_CONCURRENT_TRADES  = 2   # hardcoded for $100 account (2026-07-18); raise to 3 at $350+
-TIGHT_RISK_USDT              = 2.0   # hardcoded for $100 account (2026-07-18). Scaling plan: $150->3, $250->4, $350->5
-TIGHT_LEVERAGE               = int(os.environ.get("TIGHT_LEVERAGE", 20))   # fixed, per Faisal's instruction (2026-07-11)
-TIGHT_MAX_MARGIN_USDT        = 25.0   # hardcoded for $100 account (2026-07-18)
-TIGHT_ATR_LEN                = 14
-
-TIGHT_SCAN_INTERVAL_SECONDS  = int(os.environ.get("TIGHT_SCAN_INTERVAL_SECONDS", 30))
-# NOTE: scanning up to TIGHT_MAX_SYMBOLS pairs on a 1m timeframe every 30s is a
-# meaningfully heavier REST-polling load than the old 15m/60s cadence - watch
-# BingX rate-limit responses in the logs after deploying. If it gets throttled,
-# either raise this interval, cut TIGHT_MAX_SYMBOLS, or (better long-term) move
-# to a websocket feed instead of REST polling for the live in-progress candle.
+# ==================== RSI REVERSION CONFIG (RSI Oversold Reversion, replaces Tight 2) ====================
+# Backtest: n=1584, win 55.4%, net +0.114R, ALL SIX 2-week blocks positive (the only
+# Tight-2 candidate with no negative block). Coin-specific, NO breadth dependency.
+RSI_TIMEFRAME             = os.environ.get("RSI_TIMEFRAME", "5m")
+RSI_SCAN_INTERVAL_SECONDS = int(os.environ.get("RSI_SCAN_INTERVAL_SECONDS", 120))
+RSI_MIN_QUOTE_VOL         = float(os.environ.get("RSI_MIN_QUOTE_VOL", 1_000_000))
+RSI_MAX_SYMBOLS           = int(os.environ.get("RSI_MAX_SYMBOLS", 250))
+RSI_EXCLUDE_TOP_N         = int(os.environ.get("RSI_EXCLUDE_TOP_N", 75))           # small-cap set, like the backtest universe
+RSI_LEN                   = int(os.environ.get("RSI_LEN", 14))
+RSI_ENTRY                 = float(os.environ.get("RSI_ENTRY", 20.0))               # RSI(14) < 20 (deep oversold) - the sweet spot; <15 too few, <25 dilutes
+RSI_ATR_TF                = os.environ.get("RSI_ATR_TF", "15m")
+RSI_ATR_LEN               = int(os.environ.get("RSI_ATR_LEN", 14))
+RSI_SL_ATR_MULT           = float(os.environ.get("RSI_SL_ATR_MULT", 3.5))          # stop 3.5x ATR15
+# ---- Exit: BE at 1R, then trail from 1.5R (stop = peak_R minus 1R). No fixed TP. ----
+RSI_BE_TRIGGER_R          = float(os.environ.get("RSI_BE_TRIGGER_R", 1.0))
+RSI_TRAIL_START_R         = float(os.environ.get("RSI_TRAIL_START_R", 1.5))
+RSI_TRAIL_GAP_R           = float(os.environ.get("RSI_TRAIL_GAP_R", 1.0))          # trail stop R = live peak R - 1.0
+RSI_TRAIL_STEP_R          = float(os.environ.get("RSI_TRAIL_STEP_R", 0.25))        # only re-place the exchange SL when it improves >=0.25R
+RSI_MAX_HOLD_SECONDS      = int(os.environ.get("RSI_MAX_HOLD_SECONDS", 14400))     # 4h
+RSI_COOLDOWN_SECONDS      = int(os.environ.get("RSI_COOLDOWN_SECONDS", 7200))      # 24 bars/coin
+RSI_DEDUP_SECONDS         = int(os.environ.get("RSI_DEDUP_SECONDS", 3600))         # skip if this coin took a Crash Fade entry within +/-12 bars - keeps the two strategies disjoint
+RSI_RISK_USDT             = float(os.environ.get("RSI_RISK_USDT", 2.0))
+RSI_LEVERAGE              = int(os.environ.get("RSI_LEVERAGE", 20))
+RSI_MAX_MARGIN_USDT       = float(os.environ.get("RSI_MAX_MARGIN_USDT", 25.0))
+RSI_MAX_CONCURRENT_TRADES = int(os.environ.get("RSI_MAX_CONCURRENT_TRADES", 2))
 
 # ==================== GLOBAL STATE ====================
-tight_auto_trade_enabled = AUTO_RESUME_ON_START
-fast_auto_trade_enabled  = AUTO_RESUME_ON_START
+# Command mapping kept stable so existing Telegram habits / Render setup still work:
+#   /start /stop        -> RSI Reversion engine   (was Tight)
+#   /fast_start /fast_stop -> Crash Fade engine    (was Fast)
+#   /t3_start /t3_stop   -> Tight 3 (unchanged)
+rsi_auto_trade_enabled = AUTO_RESUME_ON_START
+cf_auto_trade_enabled  = AUTO_RESUME_ON_START
 symbol_precision   = {}
 symbol_max_lev     = {}
-tight_open_trades  = {}
-fast_open_trades   = {}
-fast_pending_retests = {}   # symbol -> armed retest waiting for pullback fill, see check_fast_pending()
-fast_alerted       = set()
+
+cf_open_trades   = {}   # symbol -> open Crash Fade trade
+cf_pending       = {}   # symbol -> armed dip-buy waiting for the pierce fill (cf_check_pending)
+cf_cooldown      = {}   # symbol -> unix ts until which no new Crash Fade entry
+cf_last_entry_ts = {}   # symbol -> ts of last Crash Fade entry (used for RSI dedup)
+
+rsi_open_trades  = {}   # order_id -> open RSI Reversion trade
+rsi_cooldown     = {}   # symbol -> unix ts until which no new RSI entry
+
 daily_trades       = []
 last_summary_date  = None
 
-tight_watch          = {}   # symbol -> spike/cooldown/ready state, see check_tight_symbol()
-tight_baseline_cache = {}   # symbol -> {"baseline": val, "ts": ...}
-
-mtf_cache = {}
-
-# ---- API backoff (added 2026-07-11) ----
-# BingX's rate-limit penalty for repeated bad/over-limit requests is self-renewing:
-# each additional request made *while still blocked* pushes the "retry after" time
-# further out. Continuing to scan during a block was preventing the block from
-# ever clearing on its own. This makes the bot go fully quiet on market-data calls
-# for API_BACKOFF_SECONDS as soon as a rate-limit response is detected, instead of
-# keep hammering the endpoint and extending its own penalty.
-API_BACKOFF_SECONDS = int(os.environ.get("API_BACKOFF_SECONDS", 1200))   # 20 min
+# ---- API backoff state (must be defined before the infra helpers below use it) ----
 _api_backoff_until  = 0.0
 _api_backoff_logged = 0.0
 
+mtf_cache = {}   # symbol -> cached MTF trend (used by the retained get_mtf_trend helper)
 
 def api_backoff_active():
     return time.time() < _api_backoff_until
@@ -657,55 +636,257 @@ def place_sl_guarded(symbol, close_side, pos_side, sl_price, qty):
     return None
 
 
-def close_fast_position(symbol, reason=""):
-    if symbol not in fast_open_trades:
+
+
+# ==================== EXTRA INDICATOR: WILDER RSI ====================
+def rsi_series(closes, period=14):
+    """Wilder's RSI. Returns a list the same length as `closes`; indices before the
+    first real value are filled with 50.0 (neutral) - only the last CLOSED-candle
+    value is ever used, so the padding is irrelevant. Standard smoothed RSI, matching
+    the backtest definition (14-period RSI on 5m closes)."""
+    n = len(closes)
+    if n < period + 1:
+        return [50.0] * n
+    gains, losses = [], []
+    for i in range(1, n):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsis = [50.0] * (period + 1)   # closes[0..period] have no defined RSI yet
+    def _rsi(ag, al):
+        if al == 0:
+            return 100.0
+        rs = ag / al
+        return 100.0 - (100.0 / (1.0 + rs))
+    rsis[period] = _rsi(avg_gain, avg_loss)
+    for i in range(period, n - 1):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsis.append(_rsi(avg_gain, avg_loss))
+    if len(rsis) < n:
+        rsis += [rsis[-1]] * (n - len(rsis))
+    return rsis[:n]
+
+
+
+# ==================== CRASH FADE ENGINE (Market-Breadth Crash Fade) ====================
+def cf_in_cooldown(symbol):
+    return time.time() < cf_cooldown.get(symbol, 0)
+
+
+def cf_atr15(symbol):
+    """14-period ATR on the CLOSED 15m candles. Returns 0 on failure."""
+    candles = get_candles(symbol, limit=CF_ATR_LEN + 40, interval=CF_ATR_TF)
+    closed = candles[:-1] if len(candles) > 1 else candles
+    if len(closed) < CF_ATR_LEN + 1:
+        return 0.0
+    highs  = [h(c) for c in closed]
+    lows   = [l(c) for c in closed]
+    closes = [cl(c) for c in closed]
+    return atr_series(highs, lows, closes, CF_ATR_LEN)[-1]
+
+
+def cf_compute_breadth(candles_map):
+    """The winning mechanism. Across the whole small-cap sample, compute each coin's
+    1h return (12x 5m) at each of the last few CLOSED 5m bars, average CROSS-SECTIONALLY
+    per bar (= how the universe is moving), then smooth over the last 12 bars and LAG
+    by 1 (zero look-ahead). Returns the smoothed/lagged breadth in PERCENT.
+
+    Fully reconstructed each cycle from closed 5m candles only - stateless and
+    look-ahead-safe. All coins are fetched within one cycle so position -1 is the same
+    wall-clock 5m bar across the sample."""
+    ret_bars = CF_BREADTH_RET_BARS
+    raw = []   # one cross-sectional mean per lagged bar
+    # Skip the most recent CF_BREADTH_LAG_BARS bars (the lag), then take the next
+    # CF_BREADTH_SMOOTH_BARS bars going back, and average the universe at each.
+    for offset in range(CF_BREADTH_LAG_BARS, CF_BREADTH_LAG_BARS + CF_BREADTH_SMOOTH_BARS):
+        bar_returns = []
+        for candles in candles_map.values():
+            if len(candles) >= ret_bars + offset + 1:
+                c_now  = cl(candles[-1 - offset])
+                c_prev = cl(candles[-1 - offset - ret_bars])
+                if c_prev > 0:
+                    bar_returns.append((c_now / c_prev - 1.0) * 100.0)
+        if bar_returns:
+            raw.append(sum(bar_returns) / len(bar_returns))
+    if not raw:
+        return 0.0
+    return sum(raw) / len(raw)
+
+
+def check_cf(symbol, candles):
+    """Arm a Crash Fade dip-buy if this coin just dropped >=4% over the last 1h and
+    then printed one green candle. `candles` = CLOSED 5m candles (in-progress dropped).
+    The market-wide breadth gate is checked ONCE per cycle by the caller."""
+    if symbol in cf_open_trades or symbol in cf_pending or cf_in_cooldown(symbol):
         return
-    trade = fast_open_trades[symbol]
+    n = CF_DROP_LOOKBACK_BARS
+    if len(candles) < n + 3:
+        return
+    green = candles[-1]
+    if cl(green) <= o(green):            # latest closed candle must be GREEN (stabilising)
+        return
+    start_close = cl(candles[-2 - n])    # n bars before the candle preceding the green one
+    end_close   = cl(candles[-2])        # the (red) candle just before the green stabiliser
+    if start_close <= 0:
+        return
+    drop_pct = (end_close / start_close - 1.0) * 100.0
+    if drop_pct > -CF_DROP_MIN_PCT:      # need a drop of at least CF_DROP_MIN_PCT
+        return
+
+    bid = cl(green)                      # resting maker bid = the green candle's close
+    atr15 = cf_atr15(symbol)
+    if atr15 <= 0:
+        print(f"[CF SKIP] {symbol} - no ATR15")
+        return
+    sl_price = bid - CF_SL_ATR_MULT * atr15
+    if sl_price <= 0 or bid - sl_price <= 0:
+        return
+    target = bid + CF_TARGET_RR * (bid - sl_price)
+    fill_trigger = bid * (1.0 - CF_PIERCE_PCT / 100.0)   # must trade 0.1% THROUGH the bid
+    now = time.time()
+    cf_pending[symbol] = {
+        "side": "BUY", "bid": bid, "sl": sl_price, "target": target,
+        "atr15": atr15, "fill_trigger": fill_trigger, "drop_pct": drop_pct,
+        "armed_ts": now, "expiry_ts": now + CF_PENDING_EXPIRY_SECONDS,
+        "risk_usdt": CF_RISK_USDT,
+    }
+    print(f"[CF ARM] {symbol} drop={drop_pct:.1f}% bid={bid} SL={round(sl_price,6)} "
+          f"TP(3R)={round(target,6)} fill<={round(fill_trigger,6)}")
+    send_tg(
+        "CRASH FADE ARMED - BUY - " + symbol + "\n------------------------------\n"
+        "1h drop: " + str(round(drop_pct, 1)) + "% then green candle (stabilising)\n"
+        "Bid: " + str(round(bid, 6)) + " (fills only on a " + str(CF_PIERCE_PCT) + "% dip through) | SL: " + str(round(sl_price, 6)) + "\n"
+        "TP (" + str(CF_TARGET_RR) + "R): " + str(round(target, 6)) + " | expires " + str(CF_PENDING_EXPIRY_SECONDS // 60) + "min\n"
+        "------------------------------\nNiti Crash Fade"
+    )
+
+
+def cf_check_pending():
+    """Fill monitor for armed Crash Fade dip-buys (called every 30s trailing pass).
+    LONG dip-buy: we want price to come DOWN to our bid.
+      1. price falls to the SL zone first -> the crash kept going, breakout of the
+         fade failed, NO entry (loss avoided)
+      2. price dips through the bid       -> fill at market (catches the dip)
+      3. neither within the window        -> skip"""
+    now_ts = time.time()
+    for symbol in list(cf_pending.keys()):
+        try:
+            p = cf_pending[symbol]
+            if now_ts >= p["expiry_ts"]:
+                del cf_pending[symbol]
+                print(f"[CF EXPIRED] {symbol} - no dip to {round(p['fill_trigger'],6)}")
+                send_tg("CRASH FADE EXPIRED - " + symbol + "\nNo dip to the bid within " +
+                        str(CF_PENDING_EXPIRY_SECONDS // 60) + "min - skipped")
+                continue
+            px = get_current_price(symbol)
+            if px <= 0:
+                continue
+            if px <= p["sl"]:
+                del cf_pending[symbol]
+                print(f"[CF INVALIDATED] {symbol} price {px} hit SL zone {round(p['sl'],6)} before fill")
+                send_tg("CRASH FADE INVALIDATED - " + symbol +
+                        "\nPrice reached the SL zone (" + str(round(p["sl"], 6)) +
+                        ") before the dip filled - crash continued, no entry taken")
+                continue
+            if px > p["fill_trigger"]:
+                continue   # not dipped enough yet
+            del cf_pending[symbol]
+            if symbol in cf_open_trades:
+                continue
+            trade_status = ""
+            if cf_auto_trade_enabled and len(cf_open_trades) >= CF_MAX_CONCURRENT_TRADES:
+                trade_status = "\nSkipped - max concurrent trades (" + str(CF_MAX_CONCURRENT_TRADES) + ") reached"
+            elif cf_auto_trade_enabled:
+                oid = place_cf_order(symbol, p["bid"], p["sl"], p["target"], p["atr15"], p["risk_usdt"])
+                if oid == "MARGIN_SKIP":
+                    trade_status = "\nSkipped - insufficient margin"
+                elif oid and oid != "N/A":
+                    trade_status = "\nOrder: " + str(oid)
+                    cf_last_entry_ts[symbol] = time.time()
+                    cf_cooldown[symbol] = time.time() + CF_COOLDOWN_SECONDS
+                else:
+                    trade_status = "\nOrder failed"
+            else:
+                trade_status = "\nAuto-trade OFF"
+                cf_cooldown[symbol] = time.time() + CF_COOLDOWN_SECONDS
+            print(f"[CF FILL] {symbol} dip filled @ {px} (bid {p['bid']}){trade_status}")
+            send_tg(
+                "CRASH FADE FILLED - BUY - " + symbol + "\n------------------------------\n"
+                "Entry: " + str(round(p["bid"], 6)) + " (dip fill @ " + str(round(px, 6)) + ") | SL: " + str(round(p["sl"], 6)) + "\n"
+                "TP (" + str(CF_TARGET_RR) + "R): " + str(round(p["target"], 6)) + " | max hold " + str(CF_MAX_HOLD_SECONDS // 3600) + "h\n"
+                "1h drop: " + str(round(p["drop_pct"], 1)) + "% | Risk: $" + str(p["risk_usdt"]) +
+                trade_status + "\n------------------------------\nNiti Crash Fade"
+            )
+        except Exception as e:
+            print(f"[CF PENDING {symbol}] error: {e}")
+
+
+def place_cf_order(symbol, entry, sl_price, target, atr15, risk_usdt):
+    """Full-size LONG with a structural SL and a single fixed 3R TP (no half/trail).
+    Mirrors the proven Tight/Fast sizing, margin pre-check and SL/TP guards."""
     try:
-        pos_side   = "LONG"  if trade["side"] == "BUY" else "SHORT"
-        close_side = "SELL"  if trade["side"] == "BUY" else "BUY"
+        lev = get_fast_leverage(symbol)
+        set_leverage_api(symbol, lev)
+        precision = symbol_precision.get(symbol, 4)
+        risk_dist = abs(entry - sl_price)
+        if risk_dist <= 0:
+            return None
+        risk_qty       = risk_usdt / risk_dist
+        margin_cap_qty = (CF_MAX_MARGIN_USDT * lev) / entry
+        total_qty      = round(min(risk_qty, margin_cap_qty), precision)
+        if total_qty <= 0:
+            return None
+        pos_side, close_side = "LONG", "SELL"
+
+        required_margin = total_qty * entry / lev
+        avail = get_available_margin()
+        if avail is not None and avail < required_margin * 1.05:
+            print(f"[CF MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f}")
+            return "MARGIN_SKIP"
+
+        order_id = place_market_order(symbol, "BUY", total_qty, pos_side)
+        print(f"[CF ORDER] {symbol} BUY lev={lev}x qty={total_qty} risk=${risk_usdt}: {order_id}")
+        if order_id != "N/A":
+            time.sleep(0.5)
+            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
+            risk_dist  = abs(entry_fill - sl_price)
+            if risk_dist <= 0:
+                risk_dist = abs(entry - sl_price)
+            tp_price = round(entry_fill + risk_dist * CF_TARGET_RR, 6)   # price precision, not qty precision
+
+            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl_price, total_qty)
+            if sl_id is None:
+                print(f"[CF SL GUARD] {symbol} SL failed twice - emergency closing")
+                place_market_order(symbol, close_side, total_qty, pos_side)
+                send_tg(f"⚠️ CRASH FADE {symbol}: SL placement failed - position emergency-closed for safety")
+                return None
+            tp_id = place_tp_guarded(symbol, close_side, pos_side, tp_price, total_qty, label="TP-3R")
+            cf_open_trades[symbol] = {
+                "symbol": symbol, "side": "BUY", "entry": entry, "entry_fill": entry_fill,
+                "sl": sl_price, "sl_id": sl_id, "tp": tp_price, "tp_id": tp_id,
+                "close_side": close_side, "pos_side": pos_side,
+                "total_qty": total_qty, "remaining_qty": total_qty,
+                "risk_dist": risk_dist, "atr_at_entry": atr15, "opened_ts": time.time(),
+                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+            }
+        return order_id
+    except Exception as e:
+        print(f"[CF ORDER ERROR] {symbol}: {e}")
+        return None
+
+
+def close_cf_position(symbol, reason=""):
+    if symbol not in cf_open_trades:
+        return
+    trade = cf_open_trades[symbol]
+    try:
         remaining  = trade.get("remaining_qty", 0)
         exit_price = get_current_price(symbol)
-        if remaining > 0 and fast_auto_trade_enabled:
-            close_oid = place_market_order(symbol, close_side, remaining, pos_side)
-            if close_oid and close_oid != "N/A":
-                time.sleep(0.5)
-                exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
-        if trade.get("sl_id"):
-            cancel_order(symbol, trade["sl_id"])
-        if not trade.get("tp1_filled") and trade.get("tp1_id"):
-            cancel_order(symbol, trade["tp1_id"])
-        entry_ref = trade.get("entry_fill", trade["entry"])
-        if trade["side"] == "BUY":
-            leg_pnl = (exit_price - entry_ref) * remaining
-        else:
-            leg_pnl = (entry_ref - exit_price) * remaining
-        total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
-        trade["pnl"]    = total_pnl
-        trade["result"] = reason
-        trade["label"]  = "Fast"
-        trade["symbol"] = symbol
-        daily_trades.append(trade)
-        journal_closed_trade(trade)
-        del fast_open_trades[symbol]
-        print(f"[FAST CLOSE] {symbol} {reason}")
-    except Exception as e:
-        print(f"[FAST CLOSE ERROR] {symbol}: {e}")
-
-
-def close_tight_position(oid, reason=""):
-    trade = tight_open_trades.get(oid)
-    if not trade:
-        return
-    try:
-        symbol     = trade["symbol"]
-        pos_side   = trade["pos_side"]
-        close_side = trade["close_side"]
-        qty        = trade.get("remaining_qty", trade.get("total_qty", 0))
-        entry_ref  = trade.get("entry_fill", trade["entry"])
-        exit_price = get_current_price(symbol)
-        if qty > 0 and tight_auto_trade_enabled:
-            close_oid = place_market_order(symbol, close_side, qty, pos_side)
+        if remaining > 0 and cf_auto_trade_enabled:
+            close_oid = place_market_order(symbol, trade["close_side"], remaining, trade["pos_side"])
             if close_oid and close_oid != "N/A":
                 time.sleep(0.5)
                 exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
@@ -713,1333 +894,381 @@ def close_tight_position(oid, reason=""):
             cancel_order(symbol, trade["sl_id"])
         if trade.get("tp_id"):
             cancel_order(symbol, trade["tp_id"])
-        if trade["side"] == "BUY":
-            leg_pnl = (exit_price - entry_ref) * qty
-        else:
-            leg_pnl = (entry_ref - exit_price) * qty
-        trade["pnl"]    = round(trade.get("tp1_pnl", 0) + leg_pnl, 2)
+        entry_ref = trade.get("entry_fill", trade["entry"])
+        leg_pnl = (exit_price - entry_ref) * remaining   # LONG only
+        trade["pnl"]    = round(leg_pnl, 2)
         trade["result"] = reason
-        trade["label"]  = "Tight"
+        trade["label"]  = "CrashFade"
         daily_trades.append(trade)
         journal_closed_trade(trade)
-        tight_open_trades.pop(oid, None)
-        print(f"[TIGHT CLOSE] {symbol} {reason}")
+        del cf_open_trades[symbol]
+        print(f"[CF CLOSE] {symbol} {reason}")
     except Exception as e:
-        print(f"[TIGHT CLOSE ERROR] {oid}: {e}")
+        print(f"[CF CLOSE ERROR] {symbol}: {e}")
 
 
-def place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usdt=FAST_RISK_USDT):
-    try:
-        lev       = get_fast_leverage(symbol)
-        set_leverage_api(symbol, lev)
-        precision  = symbol_precision.get(symbol, 4)
-        risk_dist  = abs(entry - sl_price)
-        if risk_dist <= 0:
-            return None
-
-        risk_qty      = risk_usdt / risk_dist
-        margin_cap_qty = (FAST_TRADE_AMOUNT * FAST_MARGIN_CAP_MULT * lev) / entry
-        total_qty     = round(min(risk_qty, margin_cap_qty), precision)
-        half_qty      = round(total_qty / 2, precision)
-        if total_qty <= 0 or half_qty <= 0:
-            return None
-        pos_side   = "LONG"  if side == "BUY" else "SHORT"
-        close_side = "SELL"  if side == "BUY" else "BUY"
-        sl_pct = abs(entry - sl_price) / entry * 100
-
-        # Pre-trade margin check: skip cleanly instead of firing an order BingX will
-        # reject with 101204. None (endpoint failure) = unknown -> proceed.
-        required_margin = total_qty * entry / lev
-        avail = get_available_margin()
-        if avail is not None and avail < required_margin * 1.05:
-            print(f"[FAST MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f} - skipping")
-            return "MARGIN_SKIP"
-
-        order_id = place_market_order(symbol, side, total_qty, pos_side)
-        print(f"[FAST ORDER] {symbol} {side} lev={lev}x qty={total_qty} risk=${risk_usdt}: {order_id}")
-        if order_id != "N/A":
-            time.sleep(0.5)
-            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
-
-            # Recompute risk distance and TP1 from the REAL fill price so the stated
-            # R-multiples are real (see 2026-07-15 finding: nominal-entry levels made
-            # TP1/Trail profits tiny). SL stays structural (unchanged).
-            risk_dist = abs(entry_fill - sl_price)
-            if risk_dist <= 0:
-                risk_dist = abs(entry - sl_price)
-            if side == "BUY":
-                tp1_price = round(entry_fill + risk_dist * FAST_TP1_RR, 6)   # price precision, NOT qty precision (2026-07-17: qty-precision rounding turned STX TP into 0.0 -> silent reject)
-            else:
-                tp1_price = round(entry_fill - risk_dist * FAST_TP1_RR, 6)
-
-            # SL first, guarded: if it can't be placed even on retry, close the
-            # position immediately instead of leaving it naked.
-            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl_price, total_qty)
-            if sl_id is None:
-                print(f"[FAST SL GUARD] {symbol} SL placement failed twice - emergency closing position")
-                place_market_order(symbol, close_side, total_qty, pos_side)
-                send_tg(f"⚠️ FAST {symbol}: SL placement failed - position emergency-closed for safety")
-                return None
-            tp1_id = place_tp_guarded(symbol, close_side, pos_side, tp1_price, half_qty, label="TP1")
-            fast_open_trades[symbol] = {
-                "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
-                "sl": sl_price, "sl_id": sl_id, "tp1": tp1_price, "tp1_id": tp1_id, "lev": lev,
-                "sl_pct": sl_pct, "close_side": close_side, "pos_side": pos_side,
-                "total_qty": total_qty, "remaining_qty": total_qty, "tp1_filled": False, "partial_pnl": 0.0,
-                "trail_price": entry_fill, "activated": False, "order_id": order_id,
-                "atr_at_entry": atr_now, "opened_ts": time.time(),
-                "risk_dist": risk_dist, "be_price": None,
-                "next_check_ts": time.time() + FAST_PROGRESS_CHECK_SECONDS,
-                "best_favorable_r": 0.0, "stagnation_count": 0,
-                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            }
-        return order_id
-    except Exception as e:
-        print(f"[FAST ORDER ERROR] {symbol}: {e}")
-        return None
-
-
-def track_fast_trades():
-    for symbol in list(fast_open_trades.keys()):
+def track_cf_trades():
+    for symbol in list(cf_open_trades.keys()):
         try:
-            trade = fast_open_trades[symbol]
-
-            if not trade.get("tp1_filled") and trade.get("tp1_id"):
-                status = check_order_status(trade["tp1_id"], symbol)
-                if status == "FILLED":
-                    half_qty  = round(trade["total_qty"] / 2, symbol_precision.get(symbol, 4))
-                    entry_ref = trade.get("entry_fill", trade["entry"])
-                    tp1_fill  = get_fill_price(trade["tp1_id"], symbol, fallback=trade["tp1"])
-                    trade["tp1_fill"] = tp1_fill
-                    leg_pnl   = (tp1_fill - entry_ref) * half_qty if trade["side"] == "BUY" else (entry_ref - tp1_fill) * half_qty
-                    trade["partial_pnl"]   = trade.get("partial_pnl", 0.0) + leg_pnl
-                    trade["remaining_qty"] = trade["total_qty"] - half_qty
-                    trade["tp1_filled"]    = True
-
-                    # Guarded re-placement, new-first order (2026-07-17): place the BE SL
-                    # BEFORE cancelling the old one, so a placement failure can never
-                    # leave the position naked. Sub-second overlap of two SLs is the
-                    # lesser risk. True breakeven = the REAL fill price.
-                    new_sl_id = place_sl_guarded(
-                        symbol, trade["close_side"], trade["pos_side"], entry_ref, trade["remaining_qty"]
-                    )
-                    if new_sl_id:
-                        if trade.get("sl_id"):
-                            cancel_order(symbol, trade["sl_id"])
-                        trade["sl_id"]    = new_sl_id
-                        trade["sl"]       = entry_ref
-                        trade["be_price"] = entry_ref
-                    else:
-                        print(f"[FAST BE FAIL] {symbol} BE SL re-placement failed twice - keeping original SL {trade['sl']}")
-                        if not trade.get("sl_move_alerted"):
-                            trade["sl_move_alerted"] = True
-                            send_tg(f"⚠️ FAST {symbol}: could not move SL to breakeven ({entry_ref}) - original SL {trade['sl']} still active. Consider moving it manually.")
-
-            sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
-            if sl_status == "FILLED":
-                if not trade.get("tp1_filled") and trade.get("tp1_id"):
-                    cancel_order(symbol, trade["tp1_id"])
-                remaining = trade.get("remaining_qty", 0)
-                entry_ref = trade.get("entry_fill", trade["entry"])
-                sl_fill   = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
-                if trade["side"] == "BUY":
-                    leg_pnl = (sl_fill - entry_ref) * remaining
-                else:
-                    leg_pnl = (entry_ref - sl_fill) * remaining
-                total_pnl = round(trade.get("partial_pnl", 0.0) + leg_pnl, 2)
-                trade["pnl"]    = total_pnl
-                trade["result"] = "BE" if trade.get("tp1_filled") else "SL"
-                trade["label"]  = "Fast"
-                trade["symbol"] = symbol
-                daily_trades.append(trade)
-                journal_closed_trade(trade)
-                del fast_open_trades[symbol]
-                continue
-
-            # ---- Progress-based time exit (reworked 2026-07-11) ----
-            # Profit (favorable_r > 0): never TimeExit - hold for trailing to manage,
-            # unless it stagnates (see stagnation_count below).
-            # Flat/loss (favorable_r <= 0): exit at the next check, same as before.
-            # A long safety cap (backup net only) applies regardless of state.
-            now_ts = time.time()
-
-            opened_ts = trade.get("opened_ts", now_ts)
-            if now_ts - opened_ts >= FAST_SAFETY_CAP_SECONDS:
-                print(f"[FAST SAFETY CAP] {symbol} - {FAST_SAFETY_CAP_SECONDS}s backup cap reached")
-                close_fast_position(symbol, "SafetyCap")
-                continue
-
-            if now_ts >= trade.get("next_check_ts", now_ts + 1):
-                current = get_current_price(symbol)
-                risk_dist = trade.get("risk_dist", 0)
-                if current > 0 and risk_dist > 0:
-                    entry_ref = trade.get("entry_fill", trade["entry"])
-                    if trade["side"] == "BUY":
-                        favorable_r = (current - entry_ref) / risk_dist
-                    else:
-                        favorable_r = (entry_ref - current) / risk_dist
-
-                    if favorable_r > 0:
-                        best_r = trade.get("best_favorable_r", 0.0)
-                        if favorable_r > best_r + FAST_STAGNATION_MIN_R_INCREASE:
-                            trade["best_favorable_r"]  = favorable_r
-                            trade["stagnation_count"]  = 0
-                            trade["next_check_ts"]     = now_ts + FAST_PROGRESS_CHECK_SECONDS
-                            print(f"[FAST PROGRESS] {symbol} improving - {favorable_r:.2f}R")
-                        else:
-                            trade["stagnation_count"] = trade.get("stagnation_count", 0) + 1
-                            if trade["stagnation_count"] >= FAST_STAGNATION_CHECKS:
-                                print(f"[FAST STAGNANT] {symbol} - locking {favorable_r:.2f}R, no longer improving")
-                                close_fast_position(symbol, "Stagnant")
-                                continue
-                            else:
-                                trade["next_check_ts"] = now_ts + FAST_PROGRESS_CHECK_SECONDS
-                                print(f"[FAST PROGRESS] {symbol} stalled ({trade['stagnation_count']}/{FAST_STAGNATION_CHECKS}) - {favorable_r:.2f}R")
-                    else:
-                        print(f"[FAST TIME EXIT] {symbol} - flat/dead ({favorable_r:.2f}R)")
-                        close_fast_position(symbol, "TimeExit")
-                        continue
-                else:
-                    trade["next_check_ts"] = now_ts + FAST_PROGRESS_CHECK_SECONDS
-        except Exception as e:
-            print(f"[FAST TRACK ERROR] {symbol}: {e}")
-
-
-def update_fast_trailing():
-    for symbol in list(fast_open_trades.keys()):
-        try:
-            trade   = fast_open_trades[symbol]
-            current = get_current_price(symbol)
-            if current <= 0:
-                continue
-            side = trade["side"]
+            trade = cf_open_trades[symbol]
             entry_ref = trade.get("entry_fill", trade["entry"])
-            activate_pct = (FAST_TRAIL_ACTIVATE_RR * trade.get("sl_pct", 1.5)) / 100
-            atr_ref    = trade.get("atr_at_entry", 0)
-            trail_dist = atr_ref * FAST_TRAIL_ATR_MULT if atr_ref > 0 else entry_ref * (FAST_TRAIL_PCT_FALLBACK / 100)
 
-            if not trade.get("activated"):
-                if side == "BUY" and current >= entry_ref * (1 + activate_pct):
-                    fast_open_trades[symbol]["activated"]   = True
-                    fast_open_trades[symbol]["trail_price"] = current
-                elif side == "SELL" and current <= entry_ref * (1 - activate_pct):
-                    fast_open_trades[symbol]["activated"]   = True
-                    fast_open_trades[symbol]["trail_price"] = current
+            # TP (3R) filled
+            if trade.get("tp_id"):
+                if check_order_status(trade["tp_id"], symbol) == "FILLED":
+                    if trade.get("sl_id"):
+                        cancel_order(symbol, trade["sl_id"])
+                    tp_fill = get_fill_price(trade["tp_id"], symbol, fallback=trade["tp"])
+                    trade["pnl"]    = round((tp_fill - entry_ref) * trade["remaining_qty"], 2)
+                    trade["result"] = "TP"
+                    trade["label"]  = "CrashFade"
+                    daily_trades.append(trade)
+                    journal_closed_trade(trade)
+                    del cf_open_trades[symbol]
+                    continue
+
+            # SL filled
+            if trade.get("sl_id"):
+                if check_order_status(trade["sl_id"], symbol) == "FILLED":
+                    if trade.get("tp_id"):
+                        cancel_order(symbol, trade["tp_id"])
+                    sl_fill = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
+                    trade["pnl"]    = round((sl_fill - entry_ref) * trade["remaining_qty"], 2)
+                    trade["result"] = "SL"
+                    trade["label"]  = "CrashFade"
+                    daily_trades.append(trade)
+                    journal_closed_trade(trade)
+                    del cf_open_trades[symbol]
+                    continue
+
+            # 4h max hold
+            if time.time() - trade.get("opened_ts", time.time()) >= CF_MAX_HOLD_SECONDS:
+                print(f"[CF MAX HOLD] {symbol}")
+                close_cf_position(symbol, "TimeExit")
+                continue
+        except Exception as e:
+            print(f"[CF TRACK ERROR] {symbol}: {e}")
+
+
+def cf_diagnostic_check(breadth, gate_on, universe_n):
+    print(f"[CF DIAG] breadth(smoothed,lagged)={breadth:+.3f}% | gate(<{CF_BREADTH_GATE}%)={'ON' if gate_on else 'off'} | "
+          f"sample={universe_n} | open={len(cf_open_trades)} | pending={len(cf_pending)} | auto={cf_auto_trade_enabled}")
+
+
+def cf_scan_loop():
+    print(f"Crash Fade loop started - {CF_TIMEFRAME} | market-breadth gate <{CF_BREADTH_GATE}% -> fade 4% drops on a green candle -> dip-buy -> 3R")
+    all_symbols = []
+    need = CF_BREADTH_RET_BARS + CF_BREADTH_SMOOTH_BARS + CF_BREADTH_LAG_BARS + 5
+    while True:
+        try:
+            if api_backoff_active():
+                time.sleep(30)
+                continue
+            if not all_symbols:
+                all_symbols = get_futures_symbols() or []
+            universe = get_liquid_symbols(all_symbols, min_quote_vol=CF_MIN_QUOTE_VOL,
+                                          max_n=CF_MAX_SYMBOLS, exclude_top_n=CF_EXCLUDE_TOP_N)
+            universe = [s for s in universe if not is_tokenized(s)]
+
+            candles_map = {}
+            for sym in universe:
+                if api_backoff_active():
+                    break
+                c = get_candles(sym, limit=need + 5, interval=CF_TIMEFRAME)
+                if len(c) > 1:
+                    candles_map[sym] = c[:-1]   # drop the in-progress candle
+                time.sleep(0.15)
+
+            if len(candles_map) < 10:
+                print(f"[CF SCAN] only {len(candles_map)} coins with candles - skipping this pass")
+                time.sleep(CF_SCAN_INTERVAL_SECONDS)
                 continue
 
-            if side == "BUY":
-                if current > trade["trail_price"]:
-                    fast_open_trades[symbol]["trail_price"] = current
-                trail_sl = trade["trail_price"] - trail_dist
-                if current <= trail_sl:
-                    close_fast_position(symbol, "Trail")
+            breadth = cf_compute_breadth(candles_map)
+            gate_on = breadth < CF_BREADTH_GATE
+            cf_diagnostic_check(breadth, gate_on, len(candles_map))
+
+            if gate_on:
+                armed = 0
+                for sym, c in candles_map.items():
+                    check_cf(sym, c)
+                    if sym in cf_pending:
+                        armed += 1
+                print(f"[CF SCAN] gate OPEN (breadth {breadth:+.2f}%) - {armed} dip-buy(s) armed")
             else:
-                if current < trade["trail_price"]:
-                    fast_open_trades[symbol]["trail_price"] = current
-                trail_sl = trade["trail_price"] + trail_dist
-                if current >= trail_sl:
-                    close_fast_position(symbol, "Trail")
+                print(f"[CF SCAN] gate closed (breadth {breadth:+.2f}% >= {CF_BREADTH_GATE}%) - market not crashing, no fades")
         except Exception as e:
-            print(f"[TRAIL ERROR] {symbol}: {e}")
+            print(f"[CF LOOP ERROR] {e}")
+        time.sleep(CF_SCAN_INTERVAL_SECONDS)
 
 
-def fast_enter_now(symbol, side, entry, sl_price, atr_now, risk_usdt, lev,
-                   ratio, close_strength, ext_tag, extension):
-    """Immediate entry at the breakout close - used when FAST_RETEST_ENABLED is off
-    (2026-07-23). Mirrors the concurrency / auto-trade / margin handling in
-    check_fast_pending() so both entry paths behave identically once an order is
-    actually placed; the only difference is WHERE the entry price comes from."""
-    risk = abs(entry - sl_price)
-    if risk <= 0:
+
+# ==================== RSI REVERSION ENGINE (RSI Oversold Reversion) ====================
+def rsi_in_cooldown(symbol):
+    return time.time() < rsi_cooldown.get(symbol, 0)
+
+
+def rsi_symbol_open(symbol):
+    return any(t["symbol"] == symbol for t in rsi_open_trades.values())
+
+
+def rsi_atr15(symbol):
+    candles = get_candles(symbol, limit=RSI_ATR_LEN + 40, interval=RSI_ATR_TF)
+    closed = candles[:-1] if len(candles) > 1 else candles
+    if len(closed) < RSI_ATR_LEN + 1:
+        return 0.0
+    highs  = [h(c) for c in closed]
+    lows   = [l(c) for c in closed]
+    closes = [cl(c) for c in closed]
+    return atr_series(highs, lows, closes, RSI_ATR_LEN)[-1]
+
+
+def check_rsi(symbol):
+    """RSI(14) < 20 on 5m AND a green candle -> buy the reversion. Deduped against
+    Crash Fade so the two engines never fire on the same coin within +/-12 bars."""
+    if rsi_symbol_open(symbol) or rsi_in_cooldown(symbol):
         return
-    if side == "BUY":
-        tp1_price = round(entry + risk * FAST_TP1_RR, 6)
-    else:
-        tp1_price = round(entry - risk * FAST_TP1_RR, 6)
+    # Dedup vs Crash Fade (+/-12 bars ~ 1h): CF and RSI stay disjoint.
+    last_cf = cf_last_entry_ts.get(symbol, 0)
+    if last_cf and (time.time() - last_cf) < RSI_DEDUP_SECONDS:
+        return
+    if symbol in cf_pending or symbol in cf_open_trades:
+        return
+
+    candles = get_candles(symbol, limit=RSI_LEN + 60, interval=RSI_TIMEFRAME)
+    closed = candles[:-1] if len(candles) > 1 else candles
+    if len(closed) < RSI_LEN + 2:
+        return
+    closes = [cl(c) for c in closed]
+    rsi_val = rsi_series(closes, RSI_LEN)[-1]
+    last = closed[-1]
+    if rsi_val >= RSI_ENTRY:
+        return
+    if cl(last) <= o(last):          # candle must be green (turning up)
+        return
+
+    entry = cl(last)
+    atr15 = rsi_atr15(symbol)
+    if atr15 <= 0:
+        print(f"[RSI SKIP] {symbol} - no ATR15")
+        return
+    sl_price = entry - RSI_SL_ATR_MULT * atr15
+    if sl_price <= 0 or entry - sl_price <= 0:
+        return
 
     trade_status = ""
-    if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
-        trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
-    elif fast_auto_trade_enabled:
-        oid = place_fast_order(symbol, side, entry, sl_price, tp1_price, atr_now, risk_usdt)
+    if rsi_auto_trade_enabled and len(rsi_open_trades) >= RSI_MAX_CONCURRENT_TRADES:
+        trade_status = "\nSkipped - max concurrent trades (" + str(RSI_MAX_CONCURRENT_TRADES) + ") reached"
+    elif rsi_auto_trade_enabled:
+        oid = place_rsi_order(symbol, entry, sl_price, atr15)
         if oid == "MARGIN_SKIP":
             trade_status = "\nSkipped - insufficient margin"
         elif oid and oid != "N/A":
             trade_status = "\nOrder: " + str(oid)
+            rsi_cooldown[symbol] = time.time() + RSI_COOLDOWN_SECONDS
         else:
             trade_status = "\nOrder failed"
     else:
         trade_status = "\nAuto-trade OFF"
+        rsi_cooldown[symbol] = time.time() + RSI_COOLDOWN_SECONDS
 
-    print(f"[FAST ENTRY] {symbol} {side} @ {entry} SL {sl_price} | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR{trade_status}")
+    print(f"[RSI ENTRY] {symbol} BUY @ {entry} RSI={rsi_val:.1f} SL={round(sl_price,6)}{trade_status}")
     send_tg(
-        "FAST ENTRY - " + side + " - " + symbol + "\n------------------------------\n"
-        "Entry: " + str(round(entry, 6)) + " (breakout close, no retest wait) | SL: " + str(sl_price) + "\n"
-        "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
-        "Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(close_strength, 2)) +
-        " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
-        trade_status + "\n------------------------------\nNiti Fast Signal"
+        "RSI REVERSION - BUY - " + symbol + "\n------------------------------\n"
+        "RSI(14): " + str(round(rsi_val, 1)) + " (<" + str(RSI_ENTRY) + ", oversold) + green candle\n"
+        "Entry: " + str(round(entry, 6)) + " | SL (" + str(RSI_SL_ATR_MULT) + "x ATR15): " + str(round(sl_price, 6)) + "\n"
+        "Exit: BE at " + str(RSI_BE_TRIGGER_R) + "R, then trail from " + str(RSI_TRAIL_START_R) + "R (peak-" + str(RSI_TRAIL_GAP_R) + "R) | max hold " + str(RSI_MAX_HOLD_SECONDS // 3600) + "h\n"
+        "Risk: $" + str(RSI_RISK_USDT) + trade_status + "\n------------------------------\nNiti RSI Reversion"
     )
 
 
-# ==================== FAST SIGNAL ENTRY LOGIC ====================
-def check_fast(symbol):
+def place_rsi_order(symbol, entry, sl_price, atr15):
+    """Full-size LONG, structural SL, NO exchange TP - the exit is trail-managed
+    (BE at 1R, then trail from 1.5R). Mirrors the proven sizing / margin / SL guard."""
     try:
-        candles = get_candles(symbol, limit=100, interval=FAST_TIMEFRAME)
-        min_needed = max(FAST_CONSOL_LOOKBACK + FAST_VOL_LB + FAST_ATR_LEN + 5, FAST_EXTENSION_LOOKBACK + 5)
-        if len(candles) < min_needed:
-            return
-
-        confirmed = candles[:-1]
-        closes = [cl(c) for c in confirmed]
-        opens  = [o(c)  for c in confirmed]
-        highs  = [h(c)  for c in confirmed]
-        lows   = [l(c)  for c in confirmed]
-        vols   = [v(c)  for c in confirmed]
-
-        i = len(confirmed) - 1
-        if i < min_needed:
-            return
-
-        atr_vals = atr_series(highs, lows, closes, FAST_ATR_LEN)
-        atr_now  = atr_vals[i]
-
-        ext_move  = abs(closes[i] - closes[i - FAST_EXTENSION_LOOKBACK])
-        extension = ext_move / atr_now if atr_now > 0 else 0
-        is_extended = extension > FAST_EXTENSION_LIMIT
-        if extension > FAST_EXTENSION_HARD_SKIP:
-            print(f"[FAST SKIP] {symbol} extension={extension:.1f}x ATR exceeds hard-skip limit ({FAST_EXTENSION_HARD_SKIP}x) - move too exhausted, no trade")
-            return
-
-        box_high = max(highs[i - FAST_CONSOL_LOOKBACK:i])
-        box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
-
-        # ---- Hybrid entry (2026-07-16, fixed same day): box/ATR/extension from 15m,
-        # trigger from 5m close. First version gated the extra 5m fetch on the live 15m
-        # candle's WICK touching the box edge - with VBCB's tight box that fired on
-        # almost every symbol, doubling API calls universe-wide and tripping BingX's
-        # rate limit -> 20min backoff, re-triggered every cycle -> zero signals all day.
-        # Fixed gate: only fetch 5m when live PRICE (cheap ticker call, not a candle
-        # series) is already past the actual breakout threshold - a genuinely rare event.
-        current_px = get_current_price(symbol)
-        if current_px <= 0:
-            return
-        breakout_up   = box_high + atr_now * FAST_BREAKOUT_ATR_MULT
-        breakout_down = box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
-        if current_px < breakout_up and current_px > breakout_down:
-            return
-
-        c5 = get_candles(symbol, limit=FAST_VOL_LB + 5, interval=FAST_TRIGGER_TIMEFRAME)
-        if len(c5) < FAST_VOL_LB + 2:
-            return
-        conf5 = c5[:-1]           # closed 5m candles only
-        trig  = conf5[-1]         # trigger = last CLOSED 5m candle
-        entry = cl(trig)
-        if entry < MIN_PRICE:
-            return
-
-        vols5   = [v(c) for c in conf5[:-1]][-FAST_VOL_LB:]
-        avg_vol = sum(vols5) / len(vols5) if vols5 else 0
-        ratio   = v(trig) / avg_vol if avg_vol > 0 else 0
-        vol_ok  = ratio >= FAST_VOL_MULT
-
-        candle_range = h(trig) - l(trig)
-        bull_close_strength = (cl(trig) - l(trig)) / candle_range if candle_range > 0 else 0
-        bear_close_strength = (h(trig) - cl(trig)) / candle_range if candle_range > 0 else 0
-
-        bull_breakout = (cl(trig) > box_high + atr_now * FAST_BREAKOUT_ATR_MULT
-                         and bull_close_strength >= FAST_CLOSE_POSITION_MIN)
-        bear_breakout = (cl(trig) < box_low  - atr_now * FAST_BREAKOUT_ATR_MULT
-                         and bear_close_strength >= FAST_CLOSE_POSITION_MIN)
-
-        long_signal  = bull_breakout and vol_ok
-        short_signal = bear_breakout and vol_ok
-
-        if not long_signal and not short_signal:
-            return
-
-        # ---- VBCB consolidation filter (added 2026-07-16) ----
-        # A breakout only counts if it breaks out of a genuinely TIGHT range.
-        # Wide box = price was trending, "breakout" is just chasing an extended move.
-        box_height = box_high - box_low
-        if atr_now > 0 and box_height > atr_now * FAST_BOX_MAX_ATR_MULT:
-            print(f"[FAST SKIP] {symbol} box={box_height/atr_now:.1f}x ATR too wide (max {FAST_BOX_MAX_ATR_MULT}x) - not a consolidation, breakout would be chasing")
-            return
-
-        # ---- MTF trend filter (added 2026-07-11) - direction-only, no timing delay ----
-        if MTF_FILTER_ENABLED and (long_signal or short_signal):
-            mtf_trend = get_mtf_trend(symbol)
-            if mtf_trend is not None:
-                if long_signal and mtf_trend != "UP":
-                    print(f"[MTF SKIP] {symbol} long blocked - {MTF_INTERVAL} trend is {mtf_trend}")
-                    long_signal = False
-                if short_signal and mtf_trend != "DOWN":
-                    print(f"[MTF SKIP] {symbol} short blocked - {MTF_INTERVAL} trend is {mtf_trend}")
-                    short_signal = False
-        if not long_signal and not short_signal:
-            return
-
-        if symbol in fast_open_trades:
-            current_side = fast_open_trades[symbol]["side"]
-            if (current_side == "BUY" and short_signal) or (current_side == "SELL" and long_signal):
-                print(f"[FAST CLOSE - OPPOSITE] {symbol}")
-                close_fast_position(symbol, "Opposite")
-            return
-
-        # An armed retest killed by an opposite-direction signal is a failed breakout -
-        # exactly the trade we no longer want. Same-direction re-signal: keep the
-        # original (its retest level came from the FIRST breakout, which is the one
-        # that defines the structure).
-        if symbol in fast_pending_retests:
-            pending_side = fast_pending_retests[symbol]["side"]
-            if (pending_side == "BUY" and short_signal) or (pending_side == "SELL" and long_signal):
-                del fast_pending_retests[symbol]
-                print(f"[FAST PENDING CANCEL - OPPOSITE] {symbol}")
-                send_tg("FAST RETEST CANCELLED - " + symbol + "\nOpposite signal fired before the " + pending_side + " retest filled - breakout failed, no entry")
-            return
-
-        sig_id_long  = (symbol, "BUY",  int(trig["time"]))
-        sig_id_short = (symbol, "SELL", int(trig["time"]))
-
-        # ---- Retest limit entry (2026-07-19): the signal no longer enters. It ARMS
-        # a pending retest; check_fast_pending() (trailing loop, 30s) does the entry
-        # when price pulls back to the retest level. Retest level = the deeper of the
-        # box edge and the trigger-candle midpoint, so a barely-broken-out candle
-        # retests the box edge while a big extension candle only needs to give back
-        # half its range - both realistic pullback targets, both a materially better
-        # price than the breakout close we used to buy.
-        if long_signal and sig_id_long not in fast_alerted:
-            fast_alerted.add(sig_id_long)
-            lev        = get_fast_leverage(symbol)
-            sl_price   = round(box_low - atr_now * SL_ATR_BUFFER_MULT, 6)
-            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
-            ext_tag    = "extended (half size)" if is_extended else "fresh move"
-            if not FAST_RETEST_ENABLED:
-                fast_enter_now(symbol, "BUY", entry, sl_price, atr_now, risk_usdt,
-                               lev, ratio, bull_close_strength, ext_tag, extension)
-                return
-            trig_mid   = (h(trig) + l(trig)) / 2
-            retest     = round(max(box_high, trig_mid), 6)
-            risk       = retest - sl_price
-            if risk <= 0:
-                return
-            tp1_price  = round(retest + risk * FAST_TP1_RR, 6)
-            fast_pending_retests[symbol] = {
-                "side": "BUY", "retest": retest, "sl": sl_price, "atr": atr_now,
-                "risk_usdt": risk_usdt, "lev": lev, "ratio": ratio,
-                "close_strength": bull_close_strength, "ext_tag": ext_tag,
-                "armed_ts": time.time(), "expiry_ts": time.time() + FAST_RETEST_EXPIRY_SECONDS,
-            }
-            print(f"[FAST ARMED] {symbol} BUY retest={retest} | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
-            send_tg(
-                "FAST SIGNAL - BUY - " + symbol + "\n------------------------------\n"
-                "Retest entry: " + str(retest) + " (waiting for pullback) | SL: " + str(sl_price) + "\n"
-                "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
-                "Breakout close: " + str(round(entry, 6)) + " | Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bull_close_strength, 2)) +
-                " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
-                "\nExpires in " + str(FAST_RETEST_EXPIRY_SECONDS // 60) + "min if no pullback"
-                "\n------------------------------\nNiti Fast Signal"
-            )
-
-        elif short_signal and sig_id_short not in fast_alerted:
-            fast_alerted.add(sig_id_short)
-            lev        = get_fast_leverage(symbol)
-            sl_price   = round(box_high + atr_now * SL_ATR_BUFFER_MULT, 6)
-            risk_usdt  = FAST_RISK_USDT * FAST_EXTENSION_MULT if is_extended else FAST_RISK_USDT
-            ext_tag    = "extended (half size)" if is_extended else "fresh move"
-            if not FAST_RETEST_ENABLED:
-                fast_enter_now(symbol, "SELL", entry, sl_price, atr_now, risk_usdt,
-                               lev, ratio, bear_close_strength, ext_tag, extension)
-                return
-            trig_mid   = (h(trig) + l(trig)) / 2
-            retest     = round(min(box_low, trig_mid), 6)
-            risk       = sl_price - retest
-            if risk <= 0:
-                return
-            tp1_price  = round(retest - risk * FAST_TP1_RR, 6)
-            fast_pending_retests[symbol] = {
-                "side": "SELL", "retest": retest, "sl": sl_price, "atr": atr_now,
-                "risk_usdt": risk_usdt, "lev": lev, "ratio": ratio,
-                "close_strength": bear_close_strength, "ext_tag": ext_tag,
-                "armed_ts": time.time(), "expiry_ts": time.time() + FAST_RETEST_EXPIRY_SECONDS,
-            }
-            print(f"[FAST ARMED] {symbol} SELL retest={retest} | vol={ratio:.1f}x | lev={lev}x | {ext_tag} | ext={extension:.1f}x ATR")
-            send_tg(
-                "FAST SIGNAL - SELL - " + symbol + "\n------------------------------\n"
-                "Retest entry: " + str(retest) + " (waiting for pullback) | SL: " + str(sl_price) + "\n"
-                "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
-                "Breakout close: " + str(round(entry, 6)) + " | Breakout vol: " + str(round(ratio, 1)) + "x | Close-strength: " + str(round(bear_close_strength, 2)) +
-                " | Lev: " + str(lev) + "x | " + ext_tag + " | Risk: $" + str(risk_usdt) +
-                "\nExpires in " + str(FAST_RETEST_EXPIRY_SECONDS // 60) + "min if no pullback"
-                "\n------------------------------\nNiti Fast Signal"
-            )
-
-    except Exception as e:
-        print(f"[FAST {symbol}] error: {e}")
-
-
-# ==================== TIGHT ENTRY LOGIC (Stock Niti: spike -> cooldown -> breakout) ====================
-def get_tight_volume_baseline(symbol):
-    """Cached 3-day average 1m volume per symbol, refreshed every
-    TIGHT_BASELINE_REFRESH_SECONDS rather than on every scan (expensive call).
-
-    Paginated (fixed 2026-07-11): BingX's kline endpoint caps `limit` at 1440 per
-    request (confirmed via a live 109400 error - the original single-call
-    limit=4320 request was failing on every symbol, every cycle, which is why the
-    baseline was always None and Tight never watched anything). This now fetches
-    TIGHT_BASELINE_CANDLES worth of history in <=1440-candle chunks, walking
-    backwards with `endTime`, with a small sleep between chunks to avoid bursting."""
-    now = time.time()
-    cached = tight_baseline_cache.get(symbol)
-    if cached and now - cached["ts"] < TIGHT_BASELINE_REFRESH_SECONDS:
-        return cached["baseline"]
-    try:
-        all_vols   = []
-        end_time   = None
-        remaining  = TIGHT_BASELINE_CANDLES
-        first_chunk = True
-        while remaining > 0:
-            chunk_limit = min(remaining, BINGX_KLINE_MAX_LIMIT)
-            candles = get_candles(symbol, limit=chunk_limit, interval=TIGHT_TIMEFRAME, end_time=end_time)
-            if not candles:
-                break
-            # exclude the live in-progress candle - only present in the first
-            # (most recent, end_time=None) chunk
-            chunk = candles[:-1] if first_chunk else candles
-            all_vols.extend(v(c) for c in chunk)
-            end_time = int(candles[0]["time"]) - 1
-            remaining -= len(candles)
-            first_chunk = False
-            if len(candles) < chunk_limit:
-                break   # exchange returned fewer than asked - no more history available
-            time.sleep(0.3)
-        if len(all_vols) < 100:
-            return cached["baseline"] if cached else None
-        baseline = sum(all_vols) / len(all_vols)
-        tight_baseline_cache[symbol] = {"baseline": baseline, "ts": now}
-        return baseline
-    except Exception as e:
-        print(f"[TIGHT BASELINE ERROR] {symbol}: {e}")
-        return cached["baseline"] if cached else None
-
-
-def place_tight_order(symbol, side, entry, sl, tp):
-    try:
-        set_leverage_api(symbol, TIGHT_LEVERAGE)
+        set_leverage_api(symbol, RSI_LEVERAGE)
         precision = symbol_precision.get(symbol, 4)
-        risk_dist = abs(entry - sl)
+        risk_dist = abs(entry - sl_price)
         if risk_dist <= 0:
             return None
-        # Risk-based sizing: qty is set so that hitting SL always loses ~TIGHT_RISK_USDT,
-        # regardless of how tight or wide the SL distance is for this particular setup.
-        risk_qty       = TIGHT_RISK_USDT / risk_dist
-        margin_cap_qty = (TIGHT_MAX_MARGIN_USDT * TIGHT_LEVERAGE) / entry
-        total_qty = round(min(risk_qty, margin_cap_qty), precision)
+        risk_qty       = RSI_RISK_USDT / risk_dist
+        margin_cap_qty = (RSI_MAX_MARGIN_USDT * RSI_LEVERAGE) / entry
+        total_qty      = round(min(risk_qty, margin_cap_qty), precision)
         if total_qty <= 0:
             return None
         if risk_qty > margin_cap_qty:
-            print(f"[TIGHT SIZE CAP] {symbol} SL too tight for full risk qty, margin-capped at ${TIGHT_MAX_MARGIN_USDT}")
-        pos_side   = "LONG" if side == "BUY" else "SHORT"
-        close_side = "SELL" if side == "BUY" else "BUY"
+            print(f"[RSI SIZE CAP] {symbol} SL too wide for full risk qty, margin-capped at ${RSI_MAX_MARGIN_USDT}")
+        pos_side, close_side = "LONG", "SELL"
 
-        half_qty = round(total_qty / 2, precision)
-
-        # Pre-trade margin check: skip cleanly instead of firing an order BingX will
-        # reject with 101204. None (endpoint failure) = unknown -> proceed.
-        required_margin = total_qty * entry / TIGHT_LEVERAGE
+        required_margin = total_qty * entry / RSI_LEVERAGE
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
-            print(f"[TIGHT MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f} - skipping")
+            print(f"[RSI MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f}")
             return "MARGIN_SKIP"
 
-        order_id = place_market_order(symbol, side, total_qty, pos_side)
-        print(f"[TIGHT ORDER] {symbol} {side} qty={total_qty} risk=${TIGHT_RISK_USDT}: {order_id}")
+        order_id = place_market_order(symbol, "BUY", total_qty, pos_side)
+        print(f"[RSI ORDER] {symbol} BUY qty={total_qty} risk=${RSI_RISK_USDT}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
             entry_fill = get_fill_price(order_id, symbol, fallback=entry)
-
-            # Recompute risk distance and BOTH take-profit levels from the REAL fill
-            # price, not the nominal signal price. Otherwise slippage compresses the
-            # actual R-multiples: "TP1 at 2R" measured from a worse real entry can be
-            # only ~0.5-1R away in reality (confirmed 2026-07-15: Trail wins of
-            # +$0.68-$2 against -$5-6 SLs). SL itself stays structural (unchanged).
-            risk_dist = abs(entry_fill - sl)
+            risk_dist  = abs(entry_fill - sl_price)
             if risk_dist <= 0:
-                risk_dist = abs(entry - sl)
-            if side == "BUY":
-                tp1_price = round(entry_fill + risk_dist * TIGHT_BE_TRIGGER_R, 6)   # price precision, NOT qty precision (2026-07-17)
-                tp        = round(entry_fill + risk_dist * TIGHT_RR_TP, 6)
-            else:
-                tp1_price = round(entry_fill - risk_dist * TIGHT_BE_TRIGGER_R, 6)
-                tp        = round(entry_fill - risk_dist * TIGHT_RR_TP, 6)
+                risk_dist = abs(entry - sl_price)
 
-            # SL first, guarded: if it can't be placed even on retry, close the
-            # position immediately instead of leaving it naked.
-            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl, total_qty)
+            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl_price, total_qty)
             if sl_id is None:
-                print(f"[TIGHT SL GUARD] {symbol} SL placement failed twice - emergency closing position")
+                print(f"[RSI SL GUARD] {symbol} SL failed twice - emergency closing")
                 place_market_order(symbol, close_side, total_qty, pos_side)
-                send_tg(f"⚠️ TIGHT {symbol}: SL placement failed - position emergency-closed for safety")
+                send_tg(f"⚠️ RSI {symbol}: SL placement failed - position emergency-closed for safety")
                 return None
-            tp1_id = place_tp_guarded(symbol, close_side, pos_side, tp1_price, half_qty, label="TP1")
-            tp_id  = place_tp_guarded(symbol, close_side, pos_side, tp, total_qty - half_qty, label="TP-final")
-            tight_open_trades[str(order_id)] = {
-                "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill, "sl": sl, "tp": tp,
-                "total_qty": total_qty, "half_qty": half_qty, "remaining_qty": total_qty - half_qty,
-                "tp1": tp1_price, "tp1_id": tp1_id, "tp1_filled": False,
-                "sl_id": sl_id, "tp_id": tp_id,
-                "close_side": close_side, "pos_side": pos_side,
-                "risk_dist": risk_dist, "be_done": False,
-                "trail_price": None, "be_price": None,
+            rsi_open_trades[str(order_id)] = {
+                "symbol": symbol, "side": "BUY", "entry": entry, "entry_fill": entry_fill,
+                "sl": sl_price, "sl_id": sl_id, "close_side": close_side, "pos_side": pos_side,
+                "total_qty": total_qty, "remaining_qty": total_qty,
+                "risk_dist": risk_dist, "atr_at_entry": atr15, "opened_ts": time.time(),
+                "peak_r": 0.0, "be_done": False, "stop_r": None,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
     except Exception as e:
-        print(f"[TIGHT ORDER ERROR] {symbol}: {e}")
+        print(f"[RSI ORDER ERROR] {symbol}: {e}")
         return None
 
 
-# (dead code removed 2026-07-17: the original check_tight_symbol lived here;
-# it was shadowed by the cache-based rewrite further down and never executed)
+def close_rsi_position(oid, reason=""):
+    trade = rsi_open_trades.get(oid)
+    if not trade:
+        return
+    try:
+        symbol = trade["symbol"]
+        qty    = trade.get("remaining_qty", 0)
+        entry_ref  = trade.get("entry_fill", trade["entry"])
+        exit_price = get_current_price(symbol)
+        if qty > 0 and rsi_auto_trade_enabled:
+            close_oid = place_market_order(symbol, trade["close_side"], qty, trade["pos_side"])
+            if close_oid and close_oid != "N/A":
+                time.sleep(0.5)
+                exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
+        if trade.get("sl_id"):
+            cancel_order(symbol, trade["sl_id"])
+        trade["pnl"]    = round((exit_price - entry_ref) * qty, 2)   # LONG only
+        trade["result"] = reason
+        trade["label"]  = "RSI"
+        daily_trades.append(trade)
+        journal_closed_trade(trade)
+        rsi_open_trades.pop(oid, None)
+        print(f"[RSI CLOSE] {symbol} {reason}")
+    except Exception as e:
+        print(f"[RSI CLOSE ERROR] {oid}: {e}")
 
 
-def track_tight_trades():
-    for oid in list(tight_open_trades.keys()):
-        trade = tight_open_trades.get(oid)
+def track_rsi_trades():
+    for oid in list(rsi_open_trades.keys()):
+        trade = rsi_open_trades.get(oid)
         if not trade:
             continue
         try:
             symbol    = trade["symbol"]
             risk_dist = trade.get("risk_dist", 0)
+            entry_ref = trade.get("entry_fill", trade["entry"])
 
-            # ---- TP1 (half) filled at 2R: book real profit, move remaining half to
-            # breakeven, then start trailing its SL toward the final 4R target ----
-            if not trade.get("tp1_filled") and trade.get("tp1_id"):
-                status = check_order_status(trade["tp1_id"], symbol)
-                if status == "FILLED":
-                    trade["tp1_filled"] = True
-                    entry_ref = trade.get("entry_fill", trade["entry"])
-                    tp1_fill  = get_fill_price(trade["tp1_id"], symbol, fallback=trade["tp1"])
-                    trade["tp1_fill"] = tp1_fill
-                    leg_pnl = (tp1_fill - entry_ref) * trade["half_qty"] if trade["side"] == "BUY" else (entry_ref - tp1_fill) * trade["half_qty"]
-                    trade["tp1_pnl"] = round(leg_pnl, 2)
-                    # ---- Post-TP1 stop placement (BUGFIX 2026-07-23) ----
-                    # OLD behaviour: SL -> breakeven, and trail_price seeded at ENTRY.
-                    # The trail only advanced on a NEW high above trail_price, and the
-                    # 30s poll almost always detects the TP1 fill AFTER price has already
-                    # slipped back below 2R. Result: the back half's stop got parked a few
-                    # ticks above BE and never ratcheted again, so essentially every Tight
-                    # winner banked TP1 only (~+1R on half = ~$2) and handed the rest back.
-                    # That, not the signal quality, is why wins were capped near $2 while
-                    # losses ran a full -1R.
-                    # NEW behaviour: anchor the trail at the KNOWN TP1 fill (a genuine 2R)
-                    # instead of at entry, and lock the back half at +1R whenever price is
-                    # still on the right side of that level. If price has already reversed
-                    # below +1R by the time we poll, fall back to plain breakeven exactly
-                    # as before - the fix never places a stop on the wrong side of market.
-                    lock_price = round(
-                        entry_ref + risk_dist * TIGHT_TRAIL_R_MULT if trade["side"] == "BUY"
-                        else entry_ref - risk_dist * TIGHT_TRAIL_R_MULT, 6
-                    )
-                    current_now = get_current_price(symbol)
-                    lock_ok = current_now > 0 and (
-                        (trade["side"] == "BUY"  and current_now > lock_price) or
-                        (trade["side"] == "SELL" and current_now < lock_price)
-                    )
-                    protect_price = lock_price if lock_ok else entry_ref
-                    # Guarded re-placement, new-first order (2026-07-17) - see Fast BE note
-                    new_sl_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], protect_price, trade["remaining_qty"])
-                    if new_sl_id:
-                        if trade.get("sl_id"):
-                            cancel_order(symbol, trade["sl_id"])
-                        trade["sl_id"]      = new_sl_id
-                        trade["sl"]         = protect_price
-                        trade["be_price"]   = entry_ref
-                    else:
-                        print(f"[TIGHT BE FAIL] {symbol} protective SL re-placement failed twice - keeping original SL {trade['sl']}")
-                        if not trade.get("sl_move_alerted"):
-                            trade["sl_move_alerted"] = True
-                            send_tg(f"⚠️ TIGHT {symbol}: could not move SL to {protect_price} - original SL {trade['sl']} still active. Consider moving it manually.")
-                    trade["be_done"]    = True
-                    # Anchor the trail at the real 2R fill, NOT at entry (this is the fix).
-                    trade["trail_price"] = tp1_fill
-                    lock_tag = f"locked +{TIGHT_TRAIL_R_MULT}R ({protect_price})" if lock_ok else f"BE ({entry_ref}) - price already back below +{TIGHT_TRAIL_R_MULT}R"
-                    print(f"[TIGHT TP1] {symbol} - half closed at {tp1_fill}, remaining {trade['remaining_qty']} -> {lock_tag}, trail anchored at {tp1_fill}")
+            # SL fill first (BE / Trail / SL depending on where the stop was sitting).
+            if trade.get("sl_id") and check_order_status(trade["sl_id"], symbol) == "FILLED":
+                sl_fill = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
+                stop_r  = trade.get("stop_r")
+                if stop_r is None:
+                    result = "SL"
+                elif stop_r <= 0.0001:
+                    result = "BE"
+                else:
+                    result = "Trail"
+                trade["pnl"]    = round((sl_fill - entry_ref) * trade["remaining_qty"], 2)
+                trade["result"] = result
+                trade["label"]  = "RSI"
+                daily_trades.append(trade)
+                journal_closed_trade(trade)
+                rsi_open_trades.pop(oid, None)
+                continue
 
-            # ---- Trail the remaining half's SL once TP1 is banked ----
-            if trade.get("tp1_filled") and risk_dist > 0:
-                current = get_current_price(symbol)
-                if current > 0:
-                    # BUGFIX 2026-07-23 (part 2): the new_sl computation used to sit INSIDE
-                    # the "new extreme" branch, so once the extreme stopped advancing the
-                    # stop stopped ratcheting even when it was still behind where it should
-                    # be. It is now recomputed on every pass from the current trail anchor.
-                    # Also: rounding used symbol_precision (QUANTITY precision) on a PRICE -
-                    # the same class of bug fixed for TP on 2026-07-17. On a sub-cent coin
-                    # that rounds the stop to 0.0 and BingX silently rejects it, which is
-                    # how back halves ended up running with no working trail at all.
-                    trail_dist = risk_dist * TIGHT_TRAIL_R_MULT
-                    if trade["side"] == "BUY":
-                        if current > trade["trail_price"]:
-                            trade["trail_price"] = current
-                        new_sl = round(trade["trail_price"] - trail_dist, 6)
-                        # only ratchet UP, and never place a sell-stop above market
+            current = get_current_price(symbol)
+            if current > 0 and risk_dist > 0:
+                favorable_r = (current - entry_ref) / risk_dist   # LONG
+                if favorable_r > trade.get("peak_r", 0.0):
+                    trade["peak_r"] = favorable_r
+                peak_r = trade["peak_r"]
+
+                # Target stop level in R: trail from 1.5R (peak-1R); BE covers 1R-1.5R.
+                target_stop_r = None
+                if peak_r >= RSI_TRAIL_START_R:
+                    target_stop_r = peak_r - RSI_TRAIL_GAP_R
+                elif peak_r >= RSI_BE_TRIGGER_R:
+                    target_stop_r = 0.0
+
+                if target_stop_r is not None:
+                    cur_stop_r = trade.get("stop_r")
+                    if cur_stop_r is None or target_stop_r >= cur_stop_r + RSI_TRAIL_STEP_R:
+                        new_sl = round(entry_ref + target_stop_r * risk_dist, 6)
+                        # ratchet UP only, never place a sell-stop above market
                         if new_sl > trade["sl"] and new_sl < current:
                             new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
                             if new_id:
                                 if trade.get("sl_id"):
                                     cancel_order(symbol, trade["sl_id"])
-                                trade["sl_id"] = new_id
-                                trade["sl"] = new_sl
-                                print(f"[TIGHT TRAIL] {symbol} peak {trade['trail_price']} -> SL {new_sl}")
+                                trade["sl_id"]  = new_id
+                                trade["sl"]     = new_sl
+                                trade["stop_r"] = target_stop_r
+                                tag = "BE" if target_stop_r <= 0.0001 else f"+{target_stop_r:.2f}R"
+                                print(f"[RSI TRAIL] {symbol} peak {peak_r:.2f}R -> SL {new_sl} ({tag})")
                             else:
-                                print(f"[TIGHT TRAIL FAIL] {symbol} trail SL re-placement failed - keeping SL {trade['sl']}")
-                    else:
-                        if current < trade["trail_price"]:
-                            trade["trail_price"] = current
-                        new_sl = round(trade["trail_price"] + trail_dist, 6)
-                        # only ratchet DOWN, and never place a buy-stop below market
-                        if new_sl < trade["sl"] and new_sl > current:
-                            new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
-                            if new_id:
-                                if trade.get("sl_id"):
-                                    cancel_order(symbol, trade["sl_id"])
-                                trade["sl_id"] = new_id
-                                trade["sl"] = new_sl
-                                print(f"[TIGHT TRAIL] {symbol} peak {trade['trail_price']} -> SL {new_sl}")
-                            else:
-                                print(f"[TIGHT TRAIL FAIL] {symbol} trail SL re-placement failed - keeping SL {trade['sl']}")
+                                print(f"[RSI TRAIL FAIL] {symbol} SL re-placement failed - keeping SL {trade['sl']}")
 
-            sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
-            if sl_status == "FILLED":
-                if trade.get("tp_id"):
-                    cancel_order(symbol, trade["tp_id"])
-                entry_ref = trade.get("entry_fill", trade["entry"])
-                sl_fill   = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
-                if trade.get("tp1_filled"):
-                    result   = "Trail" if trade["sl"] != trade.get("be_price", trade["entry"]) else "BE"
-                    rem_qty  = trade["remaining_qty"]
-                    leg_pnl  = (sl_fill - entry_ref) * rem_qty if trade["side"] == "BUY" else (entry_ref - sl_fill) * rem_qty
-                    trade["pnl"] = round(trade.get("tp1_pnl", 0) + leg_pnl, 2)
-                else:
-                    result = "SL"
-                    leg_pnl = (sl_fill - entry_ref) * trade["total_qty"] if trade["side"] == "BUY" else (entry_ref - sl_fill) * trade["total_qty"]
-                    trade["pnl"] = round(leg_pnl, 2)
-                trade["result"] = result
-                trade["label"]  = "Tight"
-                daily_trades.append(trade)
-                journal_closed_trade(trade)
-                tight_open_trades.pop(oid, None)
-                continue
-
-            tp_status = check_order_status(trade["tp_id"], symbol) if trade.get("tp_id") else ""
-            if tp_status == "FILLED":
-                if trade.get("sl_id"):
-                    cancel_order(symbol, trade["sl_id"])
-                entry_ref = trade.get("entry_fill", trade["entry"])
-                tp_fill   = get_fill_price(trade["tp_id"], symbol, fallback=trade["tp"])
-                rem_qty = trade["remaining_qty"] if trade.get("tp1_filled") else trade["total_qty"]
-                leg_pnl = (tp_fill - entry_ref) * rem_qty if trade["side"] == "BUY" else (entry_ref - tp_fill) * rem_qty
-                trade["pnl"]    = round(trade.get("tp1_pnl", 0) + leg_pnl, 2)
-                trade["result"] = "TP"
-                trade["label"]  = "Tight"
-                daily_trades.append(trade)
-                journal_closed_trade(trade)
-                tight_open_trades.pop(oid, None)
+            # 4h max hold
+            if time.time() - trade.get("opened_ts", time.time()) >= RSI_MAX_HOLD_SECONDS:
+                print(f"[RSI MAX HOLD] {symbol}")
+                close_rsi_position(oid, "TimeExit")
                 continue
         except Exception as e:
-            print(f"[TIGHT TRACK ERROR] {oid}: {e}")
+            print(f"[RSI TRACK ERROR] {oid}: {e}")
 
 
-def send_daily_summary():
-    global daily_trades, last_summary_date
-    nzt   = timezone(timedelta(hours=12))
-    now   = datetime.now(nzt)
-    today = now.date()
-    if last_summary_date == today:
-        return
-    if now.hour != 23 or now.minute < 55:
-        return
-    last_summary_date = today
-    total_pnl = round(sum(t.get("pnl", 0) for t in daily_trades), 2)
-    wins      = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
-    losses    = sum(1 for t in daily_trades if t.get("pnl", 0) <= 0)
-    total     = len(daily_trades)
-    win_rate  = round(wins / total * 100, 1) if total > 0 else 0
-    sign      = "+" if total_pnl > 0 else ""
-    lines = ["Daily Summary - " + today.strftime("%b %d, %Y"), "------------------------------"]
-    for idx, t in enumerate(daily_trades, 1):
-        p  = t.get("pnl", 0)
-        ps = "+" if p > 0 else ""
-        lines.append(str(idx) + ". [" + t.get("label", "?") + "] " + t["symbol"] + " " + t["side"] + " | " + t.get("result", "?") + " | " + ps + str(p) + " USDT")
-    lines.append("------------------------------")
-    lines.append("Trades: " + str(total) + " (" + str(wins) + "W/" + str(losses) + "L) | WR: " + str(win_rate) + "%")
-    lines.append("Total PnL: " + sign + str(total_pnl) + " USDT")
-    lines.append("------------------------------\nNiti Journal")
-    send_journal("\n".join(lines))
-    daily_trades = []
-
-
-# ==================== TELEGRAM COMMANDS ====================
-def handle_telegram_commands():
-    global tight_auto_trade_enabled, fast_auto_trade_enabled, t3_auto_trade_enabled
-    offset = None
-    # On startup, discard any backlog of old pending updates (e.g. a /start sent
-    # before a previous crash/redeploy) so they don't get silently replayed and
-    # flip auto-trade ON without a fresh command from Faisal.
+def rsi_diagnostic_check():
     try:
-        flush = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params={"timeout": 0}, timeout=10).json()
-        pending = flush.get("result", [])
-        if pending:
-            offset = pending[-1]["update_id"] + 1
-            requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=10)
-            print(f"[TG CMD] Flushed {len(pending)} stale pending update(s) on startup")
-    except Exception as e:
-        print(f"[TG CMD] startup flush error: {e}")
-    while True:
-        try:
-            url    = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
-            params = {"timeout": 30}
-            if offset:
-                params["offset"] = offset
-            r = requests.get(url, params=params, timeout=35).json()
-            for update in r.get("result", []):
-                offset  = update["update_id"] + 1
-                msg     = update.get("message", {})
-                text    = msg.get("text", "").strip().lower()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-                if chat_id != str(TG_CHAT_ID):
-                    continue
-                if text == "/start":
-                    tight_auto_trade_enabled = True
-                    send_tg("Tight Auto-trade ON.")
-                elif text == "/stop":
-                    tight_auto_trade_enabled = False
-                    send_tg("Tight Auto-trade OFF.")
-                elif text == "/status":
-                    t = "ON" if tight_auto_trade_enabled else "OFF"
-                    f = "ON" if fast_auto_trade_enabled  else "OFF"
-                    backoff = ""
-                    if api_backoff_active():
-                        backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
-                    send_tg("Tight: " + t + " | Watching: " + str(len(tight_watch)) + " | Open: " + str(len(tight_open_trades)) +
-                            "\nFast Signal: " + f + " | Open: " + str(len(fast_open_trades)) +
-                            " | Pending retests: " + str(len(fast_pending_retests)) + backoff)
-                elif text == "/fast_start":
-                    fast_auto_trade_enabled = True
-                    send_tg("Fast Signal Auto-trade ON.")
-                elif text == "/fast_stop":
-                    fast_auto_trade_enabled = False
-                    send_tg("Fast Signal Auto-trade OFF.")
-                elif text == "/fast_status":
-                    f = "ON" if fast_auto_trade_enabled else "OFF"
-                    pend = ""
-                    for s, p in list(fast_pending_retests.items()):
-                        mins_left = max(0, int((p["expiry_ts"] - time.time()) / 60))
-                        pend += "\n" + s + " " + p["side"] + " retest " + str(p["retest"]) + " (" + str(mins_left) + "min left)"
-                    send_tg("Fast Signal: " + f + " | Open: " + str(len(fast_open_trades)) +
-                            " | Pending retests: " + str(len(fast_pending_retests)) + pend)
-                elif text == "/t3_start":
-                    t3_auto_trade_enabled = True
-                    send_tg("Tight 3 Auto-trade ON.")
-                elif text == "/t3_stop":
-                    t3_auto_trade_enabled = False
-                    send_tg("Tight 3 Auto-trade OFF.")
-                elif text == "/t3_status":
-                    s3 = "ON" if t3_auto_trade_enabled else "OFF"
-                    lines3 = ("Tight 3: " + s3 + " | Watchlist: " + str(len(t3_watchlist)) +
-                              " | Awakened: " + str(len(t3_watch)) + " | Open: " + str(len(t3_open_trades)))
-                    for s, st3 in list(t3_watch.items()):
-                        hrs = max(0, int((st3["expiry_ts"] - time.time()) / 3600))
-                        stage = ("setup ready, trigger " + str(round(st3["trigger"], 6))) if st3.get("trigger") is not None else "waiting for pullback"
-                        lines3 += "\n" + s + " " + st3["side"] + " - " + stage + " (" + str(hrs) + "h left)"
-                    for _oid3, t3t in list(t3_open_trades.items()):
-                        lines3 += ("\n" + t3t["symbol"] + " " + t3t["side"] + " open | peak " +
-                                   str(round(t3t.get("peak_r", 0), 1)) + "R | SL " + str(t3t["sl"]))
-                    send_tg(lines3)
-        except Exception as e:
-            print(f"[TG CMD] error: {e}")
-        time.sleep(1)
-
-
-def check_fast_pending():
-    """Retest fill monitor (2026-07-19). Polls price every trailing-loop pass (30s)
-    for each armed retest. Implementation choice: monitor + market-order-on-touch,
-    NOT a real exchange limit order. Reasons: (a) cancel_order is still unverified
-    against the live BingX API (see its docstring) - an uncancellable stale limit
-    order is worse than 30s of fill granularity on a 15m strategy, (b) qty/leverage
-    get computed at FILL time by place_fast_order exactly as before, no new sizing
-    path. Known trade-off: a pullback that wicks through the retest and bounces
-    entirely inside one 30s gap is missed. Acceptable at this timeframe.
-
-    Outcomes per armed retest:
-      1. price reaches SL zone first  -> breakout failed, NO entry (the old losing
-         trade, now skipped - this branch firing a lot is the fix working)
-      2. price pulls back to retest   -> enter there (better price, smaller SL
-         distance, real pullback absorbed before entry)
-      3. neither within expiry window -> skip trade
-    """
-    now_ts = time.time()
-    for symbol in list(fast_pending_retests.keys()):
-        try:
-            p        = fast_pending_retests[symbol]
-            side     = p["side"]
-            retest   = p["retest"]
-            sl_price = p["sl"]
-
-            if now_ts >= p["expiry_ts"]:
-                del fast_pending_retests[symbol]
-                print(f"[FAST PENDING EXPIRED] {symbol} {side} no pullback to {retest}")
-                send_tg("FAST RETEST EXPIRED - " + side + " - " + symbol +
-                        "\nNo pullback to " + str(retest) + " within " + str(FAST_RETEST_EXPIRY_SECONDS // 60) + "min - trade skipped")
-                continue
-
-            px = get_current_price(symbol)
-            if px <= 0:
-                continue
-
-            invalidated = (px <= sl_price) if side == "BUY" else (px >= sl_price)
-            if invalidated:
-                del fast_pending_retests[symbol]
-                print(f"[FAST PENDING INVALIDATED] {symbol} {side} price {px} through SL {sl_price} before fill")
-                send_tg("FAST RETEST INVALIDATED - " + side + " - " + symbol +
-                        "\nPrice hit the SL zone (" + str(sl_price) + ") before the retest at " + str(retest) +
-                        " filled - failed breakout, no entry taken (this would have been a full loss under the old entry)")
-                continue
-
-            touched = (px <= retest) if side == "BUY" else (px >= retest)
-            if not touched:
-                continue
-
-            del fast_pending_retests[symbol]
-            if symbol in fast_open_trades:
-                continue
-            risk_dist = abs(retest - sl_price)
-            if risk_dist <= 0:
-                continue
-            if side == "BUY":
-                tp1_price = round(retest + risk_dist * FAST_TP1_RR, 6)
-            else:
-                tp1_price = round(retest - risk_dist * FAST_TP1_RR, 6)
-
-            print(f"[FAST RETEST FILL] {symbol} {side} @ {px} (retest {retest})")
-            trade_status = ""
-            if fast_auto_trade_enabled and len(fast_open_trades) >= FAST_MAX_CONCURRENT_TRADES:
-                trade_status = "\nSkipped - max concurrent trades (" + str(FAST_MAX_CONCURRENT_TRADES) + ") reached"
-            elif fast_auto_trade_enabled:
-                oid = place_fast_order(symbol, side, retest, sl_price, tp1_price, p["atr"], p["risk_usdt"])
-                if oid == "MARGIN_SKIP":
-                    trade_status = "\nSkipped - insufficient margin"
-                elif oid and oid != "N/A":
-                    trade_status = "\nOrder: " + str(oid)
-                else:
-                    trade_status = "\nOrder failed"
-            else:
-                trade_status = "\nAuto-trade OFF"
-            send_tg(
-                "FAST RETEST FILLED - " + side + " - " + symbol + "\n------------------------------\n"
-                "Entry: " + str(retest) + " (pullback fill @ " + str(round(px, 6)) + ") | SL: " + str(sl_price) + "\n"
-                "TP1 (" + str(FAST_TP1_RR) + "R): " + str(tp1_price) + " | ATR-trail after " + str(FAST_TRAIL_ACTIVATE_RR) + "R\n"
-                "Breakout vol: " + str(round(p["ratio"], 1)) + "x | Close-strength: " + str(round(p["close_strength"], 2)) +
-                " | Lev: " + str(p["lev"]) + "x | " + p["ext_tag"] + " | Risk: $" + str(p["risk_usdt"]) +
-                trade_status + "\n------------------------------\nNiti Fast Signal"
-            )
-        except Exception as e:
-            print(f"[FAST PENDING {symbol}] error: {e}")
-
-
-def trailing_loop():
-    while True:
-        try:
-            if fast_pending_retests:
-                check_fast_pending()
-            if fast_open_trades:
-                track_fast_trades()
-                update_fast_trailing()
-            if tight_open_trades:
-                track_tight_trades()
-            if t3_open_trades:
-                track_t3_trades()
-        except Exception as e:
-            print(f"[TRAIL LOOP ERROR] {e}")
-        time.sleep(30)
-
-
-def fast_diagnostic_check():
-    """Prints a sample calculation for a known-liquid coin every cycle, so we can see
-    in the logs whether the data pipeline (candles -> ratios) is actually alive,
-    independent of whether a real signal happens to fire."""
-    try:
-        candles = get_candles("BTC-USDT", limit=100, interval=FAST_TIMEFRAME)
-        if len(candles) < 60:
-            print(f"[FAST DIAG] BTC-USDT - only got {len(candles)} candles (need ~60+)")
+        candles = get_candles("BTC-USDT", limit=RSI_LEN + 60, interval=RSI_TIMEFRAME)
+        closed = candles[:-1] if len(candles) > 1 else candles
+        if len(closed) < RSI_LEN + 2:
+            print(f"[RSI DIAG] BTC-USDT - only {len(closed)} closed candles")
             return
-        confirmed = candles[:-1]
-        closes = [cl(c) for c in confirmed]
-        highs  = [h(c) for c in confirmed]
-        lows   = [l(c) for c in confirmed]
-        vols   = [v(c) for c in confirmed]
-        i = len(confirmed) - 1
-        avg_vol = sum(vols[i - FAST_VOL_LB:i]) / FAST_VOL_LB
-        ratio = vols[i] / avg_vol if avg_vol > 0 else 0
-        box_high = max(highs[i - FAST_CONSOL_LOOKBACK:i])
-        box_low  = min(lows[i - FAST_CONSOL_LOOKBACK:i])
-        print(f"[FAST DIAG] BTC-USDT close={closes[i]} vol_ratio={ratio:.2f}x box=({box_low},{box_high}) candles={len(candles)}")
+        closes = [cl(c) for c in closed]
+        rv = rsi_series(closes, RSI_LEN)[-1]
+        print(f"[RSI DIAG] BTC-USDT RSI(14)={rv:.1f} close={closes[-1]} (pipeline alive)")
     except Exception as e:
-        print(f"[FAST DIAG ERROR] {e}")
+        print(f"[RSI DIAG ERROR] {e}")
 
 
-def fast_scan_loop():
-    print(f"Fast Signal loop started - {FAST_TIMEFRAME} | consolidation breakout | MTF filter + reworked time-exit (2026-07-11)")
+def rsi_scan_loop():
+    print(f"RSI Reversion loop started - {RSI_TIMEFRAME} | RSI(14)<{RSI_ENTRY} + green candle -> BE1R+trail-from-1.5R")
     all_symbols = []
     while True:
         try:
+            if api_backoff_active():
+                time.sleep(30)
+                continue
             if not all_symbols:
                 all_symbols = get_futures_symbols() or []
-            liquid = get_liquid_symbols(
-                all_symbols, min_quote_vol=FAST_MIN_QUOTE_VOL, max_n=FAST_MAX_SYMBOLS,
-                exclude_top_n=FAST_EXCLUDE_TOP_N, rank_by_gain=FAST_GAINER_TOP_N,
-                gain_min=FAST_GAINER_MIN_PCT, gain_max=FAST_GAINER_MAX_PCT
-            )
-            # NCS tokenized stocks are ALWAYS excluded on weekends (UTC Sat/Sun): the
-            # underlying stock market is closed, books go dead, and stale/thin prints
-            # fake "breakouts" - both Jul 19 NCSKSKHYP2USD SELL signals were weekend
-            # ghosts. Weekday inclusion still controlled by EXCLUDE_XSTOCKS_FAST env.
-            if EXCLUDE_XSTOCKS_FAST or datetime.now(timezone.utc).weekday() >= 5:
-                liquid = [s for s in liquid if not s.startswith("NCS")]
-            mode = "retest-wait" if FAST_RETEST_ENABLED else "immediate breakout entry"
-            rank = (f"top {FAST_GAINER_TOP_N} gainers in +{FAST_GAINER_MIN_PCT}%..+{FAST_GAINER_MAX_PCT}% band"
-                    if FAST_GAINER_TOP_N > 0 else "volume-ordered")
-            print(f"[FAST SCAN] Scanning {len(liquid)} pairs ({rank}, big caps excluded) | entry mode: {mode}")
-            fast_diagnostic_check()
-            for sym in liquid:
-                check_fast(sym)
-                time.sleep(0.15)
-            print(f"[FAST SCAN] Done. Sleeping {FAST_SCAN_INTERVAL_SECONDS}s...")
-        except Exception as e:
-            print(f"[FAST LOOP ERROR] {e}")
-        time.sleep(FAST_SCAN_INTERVAL_SECONDS)
-
-
-# (dead code removed 2026-07-17: shadowed originals of tight_diagnostic_check and
-# tight_scan_loop; the "SPEED FIX" versions below are the ones that actually run)
-
-
-@app.route("/")
-def health():
-    return "Niti Tight (Stock Niti: Vol-Spike+Cooldown+Breakout, 1:4RR) + Fast Signal (Breakout+ATRTrail+ReworkedTimeExit+MTF) + Tight 3 (DormantAwakening: 7xMedian+PullbackEntry+Peak-2R-Trail)", 200
-
-
-
-
-# ==================== COMBINED PATCH: TIGHT 2 SPEED FIX + FAST RISK FIX (2026-07-11) ====================
-# Everything below OVERRIDES the earlier definitions (Python uses the last def).
-# Fixes: (1) baseline fetch moved to a background thread so a scan pass drops
-# from 15-20 min to ~90s, (2) spike detection also checks the last 3 CLOSED
-# candles so spikes finishing between passes aren't missed, (3) cooldown now
-# catches up on ALL closed candles since the last pass, (4) breakout check does
-# the same. Strategy rules (20x spike / 5x re-entry / 1:4 / BE at 2R) unchanged.
-
-# ---- FAST SIGNAL RISK FIX: risk per trade $1.5 -> $5 (2026-07-11) ----
-# Position size = risk / SL-distance, so margins were tiny ($1.4-1.6) when SL
-# was wide. $5 risk => ~3.3x bigger positions. "extended (half size)" trades
-# will now risk $2.5. Overridden by the FAST_RISK_USDT env var if set on Render.
-# (2026-07-18: removed a stray late FAST_RISK_USDT redefinition that silently overrode the top config)
-
-TIGHT_SPIKE_CONFIRMED_LOOKBACK = int(os.environ.get("TIGHT_SPIKE_CONFIRMED_LOOKBACK", 3))
-TIGHT_SCAN_SYMBOL_GAP          = float(os.environ.get("TIGHT_SCAN_SYMBOL_GAP", 0.1))
-TIGHT_BASELINE_SYMBOL_GAP      = float(os.environ.get("TIGHT_BASELINE_SYMBOL_GAP", 0.5))
-
-tight_symbols_current = []   # current scan universe, shared with the baseline refresher thread
-
-
-def fetch_tight_baseline(symbol):
-    """Fetch + cache the 3-day average 1m volume for ONE symbol. Called ONLY
-    from the background refresher thread, never inline from the scan loop."""
-    cached = tight_baseline_cache.get(symbol)
-    try:
-        all_vols    = []
-        end_time    = None
-        remaining   = TIGHT_BASELINE_CANDLES
-        first_chunk = True
-        while remaining > 0:
-            chunk_limit = min(remaining, BINGX_KLINE_MAX_LIMIT)
-            candles = get_candles(symbol, limit=chunk_limit, interval=TIGHT_TIMEFRAME, end_time=end_time)
-            if not candles:
-                break
-            chunk = candles[:-1] if first_chunk else candles   # drop live in-progress candle
-            all_vols.extend(v(c) for c in chunk)
-            end_time = int(candles[0]["time"]) - 1
-            remaining -= len(candles)
-            first_chunk = False
-            if len(candles) < chunk_limit:
-                break
-            time.sleep(0.3)
-        if len(all_vols) < 100:
-            return cached["baseline"] if cached else None
-        baseline = sum(all_vols) / len(all_vols)
-        tight_baseline_cache[symbol] = {"baseline": baseline, "ts": time.time()}
-        return baseline
-    except Exception as e:
-        print(f"[TIGHT BASELINE ERROR] {symbol}: {e}")
-        return cached["baseline"] if cached else None
-
-
-def get_cached_baseline(symbol):
-    """Cache-only lookup for the scan loop - NEVER triggers a fetch."""
-    cached = tight_baseline_cache.get(symbol)
-    return cached["baseline"] if cached else None
-
-
-def tight_baseline_loop():
-    """Background thread: keeps every symbol's 3-day baseline fresh so the scan
-    loop never blocks. First full population of ~400 symbols takes ~10-15 min
-    (watch Baseline=X/Y in the [TIGHT SCAN] log line)."""
-    print("Tight baseline refresher started (background thread)")
-    while True:
-        try:
-            symbols = list(tight_symbols_current)
-            if not symbols:
-                time.sleep(5)
-                continue
-            now = time.time()
-            stale = [s for s in symbols
-                     if s not in tight_baseline_cache
-                     or now - tight_baseline_cache[s]["ts"] >= TIGHT_BASELINE_REFRESH_SECONDS]
-            if not stale:
-                time.sleep(10)
-                continue
-            for sym in stale:
+            universe = get_liquid_symbols(all_symbols, min_quote_vol=RSI_MIN_QUOTE_VOL,
+                                          max_n=RSI_MAX_SYMBOLS, exclude_top_n=RSI_EXCLUDE_TOP_N)
+            universe = [s for s in universe if not is_tokenized(s)]
+            print(f"[RSI SCAN] scanning {len(universe)} pairs (small caps, majors excluded)")
+            rsi_diagnostic_check()
+            for sym in universe:
                 if api_backoff_active():
-                    time.sleep(30)
                     break
-                fetch_tight_baseline(sym)
-                time.sleep(TIGHT_BASELINE_SYMBOL_GAP)
+                check_rsi(sym)
+                time.sleep(0.15)
+            print(f"[RSI SCAN] done. open={len(rsi_open_trades)} | sleeping {RSI_SCAN_INTERVAL_SECONDS}s")
         except Exception as e:
-            print(f"[TIGHT BASELINE LOOP ERROR] {e}")
-            time.sleep(10)
-
-
-def check_tight_symbol(symbol):
-    """OVERRIDES the earlier version. Returns True if it hit the API, False if
-    skipped (no baseline yet) so the scan loop can skip the pacing sleep."""
-    try:
-        baseline = get_cached_baseline(symbol)
-        if not baseline or baseline <= 0:
-            return False
-
-        candles = get_candles(symbol, limit=30, interval=TIGHT_TIMEFRAME)
-        if len(candles) < 20:
-            return True
-        live_candle = candles[-1]
-        confirmed   = candles[:-1]
-
-        live_ratio = v(live_candle) / baseline
-        state = tight_watch.get(symbol)
-
-        # ---- Spike trigger: live candle OR last few closed candles ----
-        if state is None:
-            spike_candle = None
-            spike_ratio  = 0.0
-            if live_ratio >= TIGHT_SPIKE_VOL_MULT:
-                spike_candle, spike_ratio = live_candle, live_ratio
-            else:
-                for c in confirmed[-TIGHT_SPIKE_CONFIRMED_LOOKBACK:]:
-                    r_c = v(c) / baseline
-                    if r_c >= TIGHT_SPIKE_VOL_MULT and r_c > spike_ratio:
-                        spike_candle, spike_ratio = c, r_c
-            if spike_candle is not None:
-                direction = "UP" if cl(spike_candle) > o(spike_candle) else "DOWN"
-                tight_watch[symbol] = {
-                    "state": "COOLDOWN", "direction": direction,
-                    "spike_ts": time.time(),
-                    "cooldown_highs": [], "cooldown_lows": [],
-                    "last_processed_time": int(spike_candle["time"]),
-                }
-                print(f"[TIGHT SPIKE] {symbol} [{direction}] {round(spike_ratio,1)}x - watching")
-            return True
-
-        if time.time() - state["spike_ts"] > TIGHT_MAX_COOLDOWN_WAIT_SECONDS:
-            tight_watch.pop(symbol, None)
-            return True
-
-        if state["state"] == "COOLDOWN":
-            # Catch up on EVERY closed candle since the last pass
-            last_t = int(state.get("last_processed_time") or 0)
-            for c in [x for x in confirmed if int(x["time"]) > last_t]:
-                state["last_processed_time"] = int(c["time"])
-                if v(c) / baseline < TIGHT_COOLDOWN_VOL_RATIO:
-                    state["cooldown_highs"].append(h(c))
-                    state["cooldown_lows"].append(l(c))
-                else:
-                    state["cooldown_highs"] = []
-                    state["cooldown_lows"]  = []
-                    continue
-
-                if len(state["cooldown_highs"]) >= TIGHT_COOLDOWN_MIN_CANDLES:
-                    range_high = max(state["cooldown_highs"][-TIGHT_COOLDOWN_MIN_CANDLES:])
-                    range_low  = min(state["cooldown_lows"][-TIGHT_COOLDOWN_MIN_CANDLES:])
-                    closes_r = [cl(x) for x in confirmed[-30:]]
-                    highs_r  = [h(x)  for x in confirmed[-30:]]
-                    lows_r   = [l(x)  for x in confirmed[-30:]]
-                    atr_vals = atr_series(highs_r, lows_r, closes_r, TIGHT_ATR_LEN)
-                    atr_now  = atr_vals[-1] if atr_vals else (range_high - range_low)
-                    if atr_now > 0 and (range_high - range_low) <= atr_now * TIGHT_RANGE_MAX_ATR_MULT:
-                        state["state"]      = "READY"
-                        state["range_high"] = range_high
-                        state["range_low"]  = range_low
-                        state["atr_now"]    = atr_now
-                        break
-
-        # plain `if` so COOLDOWN -> READY in this same pass checks breakout immediately
-        if state.get("state") == "READY":
-            range_high = state["range_high"]
-            range_low  = state["range_low"]
-            last_t = int(state.get("last_processed_time") or 0)
-            candidates = [c for c in confirmed if int(c["time"]) > last_t] + [live_candle]
-
-            breakout_up = breakout_down = False
-            trigger_ratio = 0.0
-            for c in candidates:
-                if c is not live_candle:
-                    state["last_processed_time"] = int(c["time"])
-                c_ratio = v(c) / baseline
-                if cl(c) > range_high and c_ratio >= TIGHT_REENTRY_VOL_MULT:
-                    breakout_up, trigger_ratio = True, c_ratio
-                    break
-                if cl(c) < range_low and c_ratio >= TIGHT_REENTRY_VOL_MULT:
-                    breakout_down, trigger_ratio = True, c_ratio
-                    break
-
-            if not breakout_up and not breakout_down:
-                return True
-
-            if len(tight_open_trades) >= TIGHT_MAX_CONCURRENT_TRADES:
-                print(f"[TIGHT SKIP] {symbol} breakout ignored - max concurrent trades reached")
-                tight_watch.pop(symbol, None)
-                return True
-
-            side    = "BUY" if breakout_up else "SELL"
-            entry   = cl(live_candle)   # market order fills at current price
-            atr_now = state["atr_now"]
-
-            # ---- BTC direction filter (2026-07-17): alts follow BTC. Block breakouts
-            # against a CLEAR BTC direction; sideways BTC = no opinion, both sides ok ----
-            if BTC_FILTER_ENABLED:
-                btc_dir = get_btc_direction()
-                if btc_dir is not None:
-                    if (side == "BUY" and btc_dir == "DOWN") or (side == "SELL" and btc_dir == "UP"):
-                        print(f"[TIGHT BTC SKIP] {symbol} {side} blocked - BTC direction is {btc_dir}")
-                        tight_watch.pop(symbol, None)
-                        return True
-
-            # ---- MTF trend filter (2026-07-17): Fast has had this since Jul 11, Tight
-            # never did - counter-trend 1m breakouts were free SL donations ----
-            if MTF_FILTER_ENABLED:
-                mtf_trend = get_mtf_trend(symbol)
-                if mtf_trend is not None:
-                    if (side == "BUY" and mtf_trend != "UP") or (side == "SELL" and mtf_trend != "DOWN"):
-                        print(f"[TIGHT MTF SKIP] {symbol} {side} blocked - {MTF_INTERVAL} trend is {mtf_trend}")
-                        tight_watch.pop(symbol, None)
-                        return True
-
-            # ---- Extension hard-skip (2026-07-17): same anti-chasing guard as Fast.
-            # Breakouts fired after a long one-way run are tail-end entries ----
-            closes_e = [cl(x) for x in confirmed]
-            if atr_now > 0 and len(closes_e) > TIGHT_EXTENSION_LOOKBACK:
-                ext = abs(closes_e[-1] - closes_e[-1 - TIGHT_EXTENSION_LOOKBACK]) / atr_now
-                if ext > TIGHT_EXTENSION_HARD_SKIP:
-                    print(f"[TIGHT SKIP] {symbol} extension={ext:.1f}x ATR exceeds hard-skip limit ({TIGHT_EXTENSION_HARD_SKIP}x) - move too exhausted, no trade")
-                    tight_watch.pop(symbol, None)
-                    return True
-
-            sl = range_low - atr_now * TIGHT_SL_ATR_BUFFER_MULT if side == "BUY" else range_high + atr_now * TIGHT_SL_ATR_BUFFER_MULT
-            risk = abs(entry - sl)
-            tight_watch.pop(symbol, None)
-            if risk <= 0:
-                return True
-
-            # ---- Minimum SL distance (2026-07-17): on 1m the range-based SL sometimes
-            # lands within spread/noise of entry - those stop out on nothing ----
-            if entry > 0 and (risk / entry) * 100 < TIGHT_MIN_SL_DIST_PCT:
-                print(f"[TIGHT SKIP] {symbol} SL distance {(risk / entry) * 100:.2f}% < min {TIGHT_MIN_SL_DIST_PCT}% - noise-range trade, skipping")
-                return True
-            tp = round(entry + risk * TIGHT_RR_TP, 6) if side == "BUY" else round(entry - risk * TIGHT_RR_TP, 6)
-            sl = round(sl, 6)
-
-            trade_status = ""
-            if tight_auto_trade_enabled:
-                oid = place_tight_order(symbol, side, entry, sl, tp)
-                if oid == "MARGIN_SKIP":
-                    trade_status = "\nSkipped - insufficient margin"
-                elif oid and oid != "N/A":
-                    trade_status = "\nOrder: " + str(oid)
-                else:
-                    trade_status = "\nOrder failed"
-            else:
-                trade_status = "\nAuto-trade OFF"
-            send_tg(
-                "TIGHT SIGNAL - " + side + " - " + symbol + "\n------------------------------\n"
-                "Entry: " + str(round(entry, 6)) + " | SL: " + str(sl) + " | TP (1:" + str(TIGHT_RR_TP) + "): " + str(tp) + "\n"
-                "Breakout vol: " + str(round(trigger_ratio, 1)) + "x | BE at 1:" + str(TIGHT_BE_TRIGGER_R) + "R" +
-                trade_status + "\n------------------------------\nNiti Tight"
-            )
-        return True
-    except Exception as e:
-        print(f"[TIGHT {symbol}] error: {e}")
-        return True
-
-
-def tight_diagnostic_check():
-    """OVERRIDES the earlier version - cache-only baseline lookup."""
-    try:
-        baseline = get_cached_baseline("BTC-USDT")
-        if not baseline:
-            print(f"[TIGHT DIAG] BTC-USDT baseline not cached yet - refresher warming up ({len(tight_baseline_cache)} symbols covered)")
-            return
-        candles = get_candles("BTC-USDT", limit=5, interval=TIGHT_TIMEFRAME)
-        if len(candles) < 2:
-            print(f"[TIGHT DIAG] BTC-USDT - only got {len(candles)} recent candles")
-            return
-        live_ratio = v(candles[-1]) / baseline
-        print(f"[TIGHT DIAG] BTC-USDT baseline_vol={baseline:.2f} live_vol={v(candles[-1]):.2f} ratio={live_ratio:.2f}x (need {TIGHT_SPIKE_VOL_MULT}x)")
-    except Exception as e:
-        print(f"[TIGHT DIAG ERROR] {e}")
-
-
-def tight_scan_loop():
-    """OVERRIDES the earlier version - never blocks on baseline fetching."""
-    global tight_symbols_current
-    print("Tight loop started - Stock Niti strategy (2026-07-11, non-blocking baseline rework)")
-    all_symbols = []
-    while True:
-        try:
-            if not all_symbols:
-                all_symbols = get_futures_symbols() or []
-            symbols = get_liquid_symbols(all_symbols, min_quote_vol=TIGHT_MIN_QUOTE_VOL, max_n=TIGHT_MAX_SYMBOLS)
-            if EXCLUDE_XSTOCKS_TIGHT:
-                # "NCS" not "NCSK" (2026-07-17): the family prefix is NCS - NCSI-NIKKEI
-                # slipped through the K-only filter and donated -$2.59 on Jul 17
-                symbols = [s for s in symbols if not s.startswith("NCS")]
-            tight_symbols_current = symbols
-            covered = sum(1 for s in symbols if s in tight_baseline_cache)
-            print(f"[TIGHT SCAN] Scanning {len(symbols)}/{len(all_symbols)} liquid pairs | Baseline={covered}/{len(symbols)} | Watching={len(tight_watch)} | Open={len(tight_open_trades)} | Auto={tight_auto_trade_enabled}")
-            tight_diagnostic_check()
-            t0 = time.time()
-            for sym in symbols:
-                if check_tight_symbol(sym):
-                    time.sleep(TIGHT_SCAN_SYMBOL_GAP)
-            print(f"[TIGHT SCAN] Done in {int(time.time() - t0)}s.")
-            send_daily_summary()
-        except Exception as e:
-            print(f"[TIGHT LOOP ERROR] {e}")
-        time.sleep(TIGHT_SCAN_INTERVAL_SECONDS)
-
-
-Thread(target=tight_baseline_loop, daemon=True).start()
-# ==================== END TIGHT 2 SPEED FIX ====================
-
-
+            print(f"[RSI LOOP ERROR] {e}")
+        time.sleep(RSI_SCAN_INTERVAL_SECONDS)
 
 # ==================== TIGHT 3: DORMANT AWAKENING (added 2026-07-19) ====================
 # Catches BANK-USDT-class multi-day runners at the START of the move, which Tight 2
@@ -2504,12 +1733,157 @@ def t3_loop():
             print(f"[T3 LOOP ERROR] {e}")
         time.sleep(60)
 # ==================== END TIGHT 3 ====================
+def send_daily_summary():
+    global daily_trades, last_summary_date
+    nzt   = timezone(timedelta(hours=12))
+    now   = datetime.now(nzt)
+    today = now.date()
+    if last_summary_date == today:
+        return
+    if now.hour != 23 or now.minute < 55:
+        return
+    last_summary_date = today
+    total_pnl = round(sum(t.get("pnl", 0) for t in daily_trades), 2)
+    wins      = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
+    losses    = sum(1 for t in daily_trades if t.get("pnl", 0) <= 0)
+    total     = len(daily_trades)
+    win_rate  = round(wins / total * 100, 1) if total > 0 else 0
+    sign      = "+" if total_pnl > 0 else ""
+    lines = ["Daily Summary - " + today.strftime("%b %d, %Y"), "------------------------------"]
+    for idx, t in enumerate(daily_trades, 1):
+        p  = t.get("pnl", 0)
+        ps = "+" if p > 0 else ""
+        lines.append(str(idx) + ". [" + t.get("label", "?") + "] " + t["symbol"] + " " + t["side"] + " | " + t.get("result", "?") + " | " + ps + str(p) + " USDT")
+    lines.append("------------------------------")
+    lines.append("Trades: " + str(total) + " (" + str(wins) + "W/" + str(losses) + "L) | WR: " + str(win_rate) + "%")
+    lines.append("Total PnL: " + sign + str(total_pnl) + " USDT")
+    lines.append("------------------------------\nNiti Journal")
+    send_journal("\n".join(lines))
+    daily_trades = []
+
+
+
+# ==================== TRAILING / MANAGEMENT LOOP ====================
+def trailing_loop():
+    while True:
+        try:
+            if cf_pending:
+                cf_check_pending()
+            if cf_open_trades:
+                track_cf_trades()
+            if rsi_open_trades:
+                track_rsi_trades()
+            if t3_open_trades:
+                track_t3_trades()
+            send_daily_summary()
+        except Exception as e:
+            print(f"[TRAIL LOOP ERROR] {e}")
+        time.sleep(30)
+
+
+# ==================== TELEGRAM COMMANDS ====================
+def handle_telegram_commands():
+    global rsi_auto_trade_enabled, cf_auto_trade_enabled, t3_auto_trade_enabled
+    offset = None
+    # Discard any stale backlog on startup so an old /start can't silently flip
+    # auto-trade ON after a redeploy.
+    try:
+        flush = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params={"timeout": 0}, timeout=10).json()
+        pending = flush.get("result", [])
+        if pending:
+            offset = pending[-1]["update_id"] + 1
+            requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=10)
+            print(f"[TG CMD] Flushed {len(pending)} stale pending update(s) on startup")
+    except Exception as e:
+        print(f"[TG CMD] startup flush error: {e}")
+    while True:
+        try:
+            url    = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
+            params = {"timeout": 30}
+            if offset:
+                params["offset"] = offset
+            r = requests.get(url, params=params, timeout=35).json()
+            for update in r.get("result", []):
+                offset  = update["update_id"] + 1
+                msg     = update.get("message", {})
+                text    = msg.get("text", "").strip().lower()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if chat_id != str(TG_CHAT_ID):
+                    continue
+                # ---- RSI Reversion (kept on the old Tight tokens: /start /stop) ----
+                if text == "/start":
+                    rsi_auto_trade_enabled = True
+                    send_tg("RSI Reversion Auto-trade ON.")
+                elif text == "/stop":
+                    rsi_auto_trade_enabled = False
+                    send_tg("RSI Reversion Auto-trade OFF.")
+                # ---- Crash Fade (kept on the old Fast tokens: /fast_start /fast_stop) ----
+                elif text == "/fast_start":
+                    cf_auto_trade_enabled = True
+                    send_tg("Crash Fade Auto-trade ON.")
+                elif text == "/fast_stop":
+                    cf_auto_trade_enabled = False
+                    send_tg("Crash Fade Auto-trade OFF.")
+                # ---- Tight 3 (unchanged) ----
+                elif text == "/t3_start":
+                    t3_auto_trade_enabled = True
+                    send_tg("Tight 3 Auto-trade ON.")
+                elif text == "/t3_stop":
+                    t3_auto_trade_enabled = False
+                    send_tg("Tight 3 Auto-trade OFF.")
+                elif text in ("/status", "/rsi_status"):
+                    rs = "ON" if rsi_auto_trade_enabled else "OFF"
+                    cf = "ON" if cf_auto_trade_enabled  else "OFF"
+                    backoff = ""
+                    if api_backoff_active():
+                        backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
+                    send_tg("RSI Reversion: " + rs + " | Open: " + str(len(rsi_open_trades)) +
+                            "\nCrash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
+                            " | Pending: " + str(len(cf_pending)) +
+                            "\nTight 3: " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open: " + str(len(t3_open_trades)) + backoff)
+                elif text == "/fast_status":
+                    cf = "ON" if cf_auto_trade_enabled else "OFF"
+                    pend = ""
+                    for s, p in list(cf_pending.items()):
+                        mins_left = max(0, int((p["expiry_ts"] - time.time()) / 60))
+                        pend += "\n" + s + " dip-buy @ " + str(round(p["bid"], 6)) + " (" + str(mins_left) + "min left)"
+                    send_tg("Crash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
+                            " | Pending: " + str(len(cf_pending)) + pend)
+                elif text == "/t3_status":
+                    s3 = "ON" if t3_auto_trade_enabled else "OFF"
+                    lines3 = ("Tight 3: " + s3 + " | Watchlist: " + str(len(t3_watchlist)) +
+                              " | Awakened: " + str(len(t3_watch)) + " | Open: " + str(len(t3_open_trades)))
+                    for s, st3 in list(t3_watch.items()):
+                        hrs = max(0, int((st3["expiry_ts"] - time.time()) / 3600))
+                        stage = ("setup ready, trigger " + str(round(st3["trigger"], 6))) if st3.get("trigger") is not None else "waiting for pullback"
+                        lines3 += "\n" + s + " " + st3["side"] + " - " + stage + " (" + str(hrs) + "h left)"
+                    for _oid3, t3t in list(t3_open_trades.items()):
+                        lines3 += ("\n" + t3t["symbol"] + " " + t3t["side"] + " open | peak " +
+                                   str(round(t3t.get("peak_r", 0), 1)) + "R | SL " + str(t3t["sl"]))
+                    send_tg(lines3)
+        except Exception as e:
+            print(f"[TG CMD] error: {e}")
+        time.sleep(1)
+
+
+@app.route("/")
+def health():
+    return ("Niti combined - Crash Fade (market-breadth gate + 4% drop fade + dip-buy + 3R) "
+            "+ RSI Reversion (RSI<20 + green + BE1R/trail-from-1.5R) "
+            "+ Tight 3 (Dormant Awakening) + consolidated journal"), 200
 
 
 if __name__ == "__main__":
-    Thread(target=tight_scan_loop,          daemon=True).start()
-    Thread(target=fast_scan_loop,           daemon=True).start()
+    Thread(target=cf_scan_loop,             daemon=True).start()
+    Thread(target=rsi_scan_loop,            daemon=True).start()
     Thread(target=trailing_loop,            daemon=True).start()
     Thread(target=t3_loop,                  daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+</textarea>
+<script>
+  var b=document.getElementById('c'),t=document.getElementById('t');
+  b.onclick=function(){t.select();navigator.clipboard.writeText(t.value).then(function(){
+    b.textContent='Copied \u2713';b.className='done';setTimeout(function(){b.textContent='Copy all';b.className='';},2000);
+  }).catch(function(){document.execCommand('copy');b.textContent='Copied \u2713';b.className='done';});};
+</script></body></html>

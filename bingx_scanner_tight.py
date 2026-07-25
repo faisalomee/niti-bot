@@ -1,20 +1,4 @@
-<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>
-  body{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1117;color:#c9d1d9}
-  .bar{position:sticky;top:0;display:flex;align-items:center;gap:12px;padding:10px 14px;background:#161b22;border-bottom:1px solid #30363d}
-  .bar b{font-family:system-ui,sans-serif;font-size:14px}
-  .bar span{font-family:system-ui,sans-serif;color:#8b949e;font-size:12px}
-  button{margin-left:auto;background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
-  button:hover{background:#2ea043}
-  button.done{background:#1f6feb}
-  textarea{width:100%;height:78vh;box-sizing:border-box;border:0;padding:14px;background:#0d1117;color:#c9d1d9;font-size:12px;line-height:1.5;white-space:pre;overflow:auto;resize:vertical}
-</style></head><body>
-<div class="bar">
-  <b>bingx_scanner_tight.py</b>
-  <span>Crash Fade + RSI Reversion + Tight 3 &middot; 1867 lines</span>
-  <button id="c">Copy all</button>
-</div>
-<textarea id="t" readonly spellcheck="false">import os, time, hmac, hashlib, requests
+import os, time, hmac, hashlib, requests
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone, timedelta
@@ -1880,10 +1864,3 @@ if __name__ == "__main__":
     Thread(target=t3_loop,                  daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-</textarea>
-<script>
-  var b=document.getElementById('c'),t=document.getElementById('t');
-  b.onclick=function(){t.select();navigator.clipboard.writeText(t.value).then(function(){
-    b.textContent='Copied \u2713';b.className='done';setTimeout(function(){b.textContent='Copy all';b.className='';},2000);
-  }).catch(function(){document.execCommand('copy');b.textContent='Copied \u2713';b.className='done';});};
-</script></body></html>

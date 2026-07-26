@@ -100,7 +100,7 @@ RSI_MAX_CONCURRENT_TRADES = int(os.environ.get("RSI_MAX_CONCURRENT_TRADES", 2))
 # Command mapping kept stable so existing Telegram habits / Render setup still work:
 #   /start /stop        -> RSI Reversion engine   (was Tight)
 #   /fast_start /fast_stop -> Crash Fade engine    (was Fast)
-#   /t3_start /t3_stop   -> Tight 3 (unchanged)
+#   /t1_start /t1_stop   -> Tight 1 (Dormant Awakening)
 rsi_auto_trade_enabled = AUTO_RESUME_ON_START
 cf_auto_trade_enabled  = AUTO_RESUME_ON_START
 symbol_precision   = {}
@@ -231,7 +231,7 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
                        rank_by_gain=0, gain_min=None, gain_max=None):
     """rank_by_gain (added 2026-07-23, default 0 = OFF): when > 0, the surviving
     symbols are filtered to the [gain_min, gain_max] daily-move band and then
-    re-sorted by today's % gain and cut to that many. Tight and Tight 3 do not pass
+    re-sorted by today's % gain and cut to that many. Tight and Tight 1 do not pass
     any of these, so their universe selection is byte-for-byte unchanged."""
     global _gain_field_logged
     try:
@@ -1386,10 +1386,10 @@ def rsi_scan_loop():
             print(f"[RSI LOOP ERROR] {e}")
         time.sleep(RSI_SCAN_INTERVAL_SECONDS)
 
-# ==================== TIGHT 3: DORMANT AWAKENING (added 2026-07-19) ====================
+# ==================== TIGHT 1: DORMANT AWAKENING (added 2026-07-19) ====================
 # Catches BANK-USDT-class multi-day runners at the START of the move, which Tight 2
 # structurally cannot: Tight 2's 3-day average baseline gets inflated by the pump
-# itself, so by day 2-3 of a run the 20x spike test is unhittable. Tight 3 instead
+# itself, so by day 2-3 of a run the 20x spike test is unhittable. Tight 1 instead
 # asks the Stock-Niti question directly: "was this coin ASLEEP, and did it just
 # WAKE UP?" Three layers:
 #   1. Dormancy scan (every 4h, daily candles): coin traded in a +/-15% close band
@@ -1410,10 +1410,10 @@ def rsi_scan_loop():
 T3_MIN_QUOTE_VOL          = float(os.environ.get("T3_MIN_QUOTE_VOL", 300_000))   # dormant coins are quiet by definition - the $1M Tight floor would exclude pre-pump BANK. Known cost: thinner books, more slippage.
 T3_MAX_SYMBOLS            = int(os.environ.get("T3_MAX_SYMBOLS", 600))
 T3_MAX_WATCHLIST          = int(os.environ.get("T3_MAX_WATCHLIST", 150))         # keep the TIGHTEST bands if more qualify - the most compressed springs
-T3_DORMANCY_DAYS          = int(os.environ.get("T3_DORMANCY_DAYS", 10))
-T3_DORMANCY_RANGE_PCT     = float(os.environ.get("T3_DORMANCY_RANGE_PCT", 30.0)) # total close band width = +/-15% around mid
+T3_DORMANCY_DAYS          = int(os.environ.get("T3_DORMANCY_DAYS", 5))
+T3_DORMANCY_RANGE_PCT     = float(os.environ.get("T3_DORMANCY_RANGE_PCT", 25.0)) # total close band width = +/-15% around mid
 T3_DORMANCY_VOL_SPIKE_MAX = float(os.environ.get("T3_DORMANCY_VOL_SPIKE_MAX", 3.0))   # any day >3x median inside the window = already awakened earlier, not dormant
-T3_AWAKE_VOL_MULT         = float(os.environ.get("T3_AWAKE_VOL_MULT", 7.0))      # UNTESTED starting point - if T3 stays silent for weeks try 5.0, if it spams try 10.0
+T3_AWAKE_VOL_MULT         = float(os.environ.get("T3_AWAKE_VOL_MULT", 5.0))      # UNTESTED starting point - if T3 stays silent for weeks try 5.0, if it spams try 10.0
 T3_DORMANCY_SCAN_SECONDS  = int(os.environ.get("T3_DORMANCY_SCAN_SECONDS", 14400))   # rebuild watchlist every 4h (1 daily-candle request per symbol)
 T3_AWAKE_CHECK_SECONDS    = int(os.environ.get("T3_AWAKE_CHECK_SECONDS", 300))
 T3_SETUP_EXPIRY_SECONDS   = int(os.environ.get("T3_SETUP_EXPIRY_SECONDS", 172800))   # 48h to form a pullback entry after the awakening, else skip
@@ -1552,11 +1552,11 @@ def t3_check_awakening(symbol, info):
         t3_watchlist.pop(symbol, None)
         print(f"[T3 AWAKENING] {symbol} {side} vol={ratio:.1f}x dormant median | 1h close {h1_close} outside range ({info['dormant_low']}-{info['dormant_high']})")
         send_tg(
-            "TIGHT 3 AWAKENING - " + side + " - " + symbol + "\n------------------------------\n"
+            "TIGHT 1 AWAKENING - " + side + " - " + symbol + "\n------------------------------\n"
             "Dormant " + str(T3_DORMANCY_DAYS) + "d range: " + str(info["dormant_low"]) + " - " + str(info["dormant_high"]) + "\n"
             "Today vol: " + str(round(ratio, 1)) + "x dormant median (need " + str(T3_AWAKE_VOL_MULT) + "x) | 1h close: " + str(h1_close) + "\n"
             "Watching 15m for a pullback entry (window " + str(T3_SETUP_EXPIRY_SECONDS // 3600) + "h)"
-            "\n------------------------------\nNiti Tight 3"
+            "\n------------------------------\nNiti Tight 1"
         )
     except Exception as e:
         print(f"[T3 AWAKE {symbol}] error: {e}")
@@ -1576,7 +1576,7 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
     if atr_now > 0 and risk > atr_now * T3_MAX_SL_ATR_MULT:
         print(f"[T3 SKIP] {symbol} entry-to-SL {risk / atr_now:.1f}x ATR exceeds {T3_MAX_SL_ATR_MULT}x - awakening too extended")
         send_tg(
-            "TIGHT 3 SKIPPED - " + symbol + "\nAwakening detected but too extended: SL distance " +
+            "TIGHT 1 SKIPPED - " + symbol + "\nAwakening detected but too extended: SL distance " +
             str(round(risk / atr_now, 1)) + "x ATR (max " + str(T3_MAX_SL_ATR_MULT) + "x) - position would be meaninglessly small. No trade."
         )
         return
@@ -1596,11 +1596,11 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
         trade_status = "\nAuto-trade OFF"
     print(f"[T3 ENTRY] {symbol} {side} @ {entry_px} SL {sl} vol_ratio={st.get('vol_ratio', 0):.1f}x{trade_status}")
     send_tg(
-        "TIGHT 3 ENTRY - " + side + " - " + symbol + "\n------------------------------\n"
+        "TIGHT 1 ENTRY - " + side + " - " + symbol + "\n------------------------------\n"
         "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(T3_RISK_USDT) + " | Lev: " + str(T3_LEVERAGE) + "x\n"
         "No fixed TP - BE at " + str(T3_BE_TRIGGER_R) + "R, trail from " + str(T3_TRAIL_START_R) + "R at peak-" + str(T3_TRAIL_GAP_R) + "R\n"
         "Awakening vol: " + str(round(st.get("vol_ratio", 0), 1)) + "x dormant median" +
-        trade_status + "\n------------------------------\nNiti Tight 3"
+        trade_status + "\n------------------------------\nNiti Tight 1"
     )
 
 
@@ -1615,7 +1615,7 @@ def t3_check_awakened(symbol):
     if time.time() >= st["expiry_ts"]:
         t3_watch.pop(symbol, None)
         print(f"[T3 EXPIRED] {symbol} - no pullback entry within the window")
-        send_tg("TIGHT 3 EXPIRED - " + symbol + "\nNo clean pullback entry within " + str(T3_SETUP_EXPIRY_SECONDS // 3600) + "h of the awakening - trade skipped")
+        send_tg("TIGHT 1 EXPIRED - " + symbol + "\nNo clean pullback entry within " + str(T3_SETUP_EXPIRY_SECONDS // 3600) + "h of the awakening - trade skipped")
         return
     try:
         candles = get_candles(symbol, limit=60, interval="15m")
@@ -1702,7 +1702,7 @@ def place_t3_order(symbol, side, entry, sl):
             if sl_id is None:
                 print(f"[T3 SL GUARD] {symbol} SL placement failed twice - emergency closing position")
                 place_market_order(symbol, close_side, total_qty, pos_side)
-                send_tg(f"⚠️ TIGHT 3 {symbol}: SL placement failed - position emergency-closed for safety")
+                send_tg(f"⚠️ TIGHT 1 {symbol}: SL placement failed - position emergency-closed for safety")
                 return None
             t3_open_trades[str(order_id)] = {
                 "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
@@ -1749,7 +1749,7 @@ def track_t3_trades():
                     result = "SL"
                 trade["pnl"]    = round(leg_pnl, 2)
                 trade["result"] = result
-                trade["label"]  = "Tight 3"
+                trade["label"]  = "Tight 1"
                 daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t3_open_trades.pop(oid, None)
@@ -1779,12 +1779,12 @@ def track_t3_trades():
                     trade["be_price"] = entry_ref
                     trade["be_done"]  = True
                     print(f"[T3 BE] {symbol} SL moved to breakeven ({entry_ref}) at {trade['peak_r']:.1f}R")
-                    send_tg("TIGHT 3 " + symbol + " - " + str(round(trade['peak_r'], 1)) + "R reached, SL moved to breakeven (" + str(entry_ref) + "). Free trade - trail starts at " + str(T3_TRAIL_START_R) + "R.")
+                    send_tg("TIGHT 1 " + symbol + " - " + str(round(trade['peak_r'], 1)) + "R reached, SL moved to breakeven (" + str(entry_ref) + "). Free trade - trail starts at " + str(T3_TRAIL_START_R) + "R.")
                 else:
                     print(f"[T3 BE FAIL] {symbol} BE SL re-placement failed twice - keeping original SL {trade['sl']}")
                     if not trade.get("sl_move_alerted"):
                         trade["sl_move_alerted"] = True
-                        send_tg(f"⚠️ TIGHT 3 {symbol}: could not move SL to breakeven ({entry_ref}) - original SL {trade['sl']} still active. Consider moving it manually.")
+                        send_tg(f"⚠️ TIGHT 1 {symbol}: could not move SL to breakeven ({entry_ref}) - original SL {trade['sl']} still active. Consider moving it manually.")
 
             # ---- Peak-minus-2R trail from 4R ----
             if trade.get("be_done") and trade["peak_r"] >= T3_TRAIL_START_R:
@@ -1811,10 +1811,10 @@ def track_t3_trades():
 
 
 def t3_loop():
-    """Tight 3 main loop. Internal timers: dormancy rescan every 4h, awakening
+    """Tight 1 main loop. Internal timers: dormancy rescan every 4h, awakening
     check on the watchlist every 5 min, awakened symbols processed every pass
     (60s). Fully respects the global API backoff."""
-    print("Tight 3 loop started - Dormant Awakening (dormancy -> 7x median awakening -> pullback entry -> peak-2R trail)")
+    print("Tight 1 loop started - Dormant Awakening (dormancy -> 5x median awakening -> pullback entry -> peak-2R trail)")
     all_symbols   = []
     last_dormancy = 0.0
     last_awake    = 0.0
@@ -1848,7 +1848,7 @@ def t3_loop():
         except Exception as e:
             print(f"[T3 LOOP ERROR] {e}")
         time.sleep(60)
-# ==================== END TIGHT 3 ====================
+# ==================== END TIGHT 1 ====================
 def send_daily_summary():
     global daily_trades, last_summary_date
     nzt   = timezone(timedelta(hours=12))
@@ -1940,13 +1940,13 @@ def handle_telegram_commands():
                 elif text == "/fast_stop":
                     cf_auto_trade_enabled = False
                     send_tg("Crash Fade Auto-trade OFF.")
-                # ---- Tight 3 (unchanged) ----
-                elif text == "/t3_start":
+                # ---- Tight 1 (unchanged) ----
+                elif text == "/t1_start":
                     t3_auto_trade_enabled = True
-                    send_tg("Tight 3 Auto-trade ON.")
-                elif text == "/t3_stop":
+                    send_tg("Tight 1 Auto-trade ON.")
+                elif text == "/t1_stop":
                     t3_auto_trade_enabled = False
-                    send_tg("Tight 3 Auto-trade OFF.")
+                    send_tg("Tight 1 Auto-trade OFF.")
                 elif text in ("/status", "/rsi_status"):
                     rs = "ON" if rsi_auto_trade_enabled else "OFF"
                     cf = "ON" if cf_auto_trade_enabled  else "OFF"
@@ -1956,7 +1956,7 @@ def handle_telegram_commands():
                     send_tg("RSI Reversion: " + rs + " | Open: " + str(len(rsi_open_trades)) +
                             "\nCrash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
                             " | Pending: " + str(len(cf_pending)) +
-                            "\nTight 3: " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open: " + str(len(t3_open_trades)) + backoff)
+                            "\nTight 1: " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open: " + str(len(t3_open_trades)) + backoff)
                 elif text == "/fast_status":
                     cf = "ON" if cf_auto_trade_enabled else "OFF"
                     pend = ""
@@ -1965,9 +1965,9 @@ def handle_telegram_commands():
                         pend += "\n" + s + " dip-buy @ " + str(round(p["bid"], 6)) + " (" + str(mins_left) + "min left)"
                     send_tg("Crash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
                             " | Pending: " + str(len(cf_pending)) + pend)
-                elif text == "/t3_status":
+                elif text == "/t1_status":
                     s3 = "ON" if t3_auto_trade_enabled else "OFF"
-                    lines3 = ("Tight 3: " + s3 + " | Watchlist: " + str(len(t3_watchlist)) +
+                    lines3 = ("Tight 1: " + s3 + " | Watchlist: " + str(len(t3_watchlist)) +
                               " | Awakened: " + str(len(t3_watch)) + " | Open: " + str(len(t3_open_trades)))
                     for s, st3 in list(t3_watch.items()):
                         hrs = max(0, int((st3["expiry_ts"] - time.time()) / 3600))
@@ -1986,7 +1986,7 @@ def handle_telegram_commands():
 def health():
     return ("Niti combined - Crash Fade (market-breadth gate + 4% drop fade + dip-buy + 3R) "
             "+ RSI Reversion (RSI<20 + green + BE1R/trail-from-1.5R) "
-            "+ Tight 3 (Dormant Awakening) + consolidated journal"), 200
+            "+ Tight 1 (Dormant Awakening) + consolidated journal"), 200
 
 
 if __name__ == "__main__":

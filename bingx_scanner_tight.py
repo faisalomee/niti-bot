@@ -653,6 +653,27 @@ def get_open_positions():
         return []
 
 
+def confirm_liquidated(symbol, trade):
+    """A tracker saw `symbol` missing from the per-cycle open-position set and neither
+    TP nor SL is filled -> it LOOKS liquidated. But an empty/short positions response
+    can also be a transient BingX API hiccup, so before we journal a real liquidation we
+    double-check the exchange's OPEN ORDERS for this symbol. If the position were truly
+    liquidated, BingX auto-cancels its resting SL/TP, so NO stop/target order remains.
+    If our SL (or TP) order is still sitting there, the position is still open and the
+    positions call simply lied -> NOT liquidated, skip this cycle. This removes the old
+    single-open-trade blind spot without ever false-flagging on an API glitch."""
+    try:
+        sl_id, _sl_px, tp_id, _tp_px = get_open_orders_for(symbol)
+        # Any of our brackets still alive on the exchange => position still open.
+        if sl_id or tp_id:
+            return False
+        return True
+    except Exception as e:
+        # Could not verify -> be safe, do NOT liquidate this cycle.
+        print(f"[LIQ CONFIRM ERROR] {symbol}: {e}")
+        return False
+
+
 def journal_liquidation(trade, label):
     """A tracked position vanished from the exchange without our TP or SL filling ->
     BingX liquidated it (isolated margin hit 100%). Journal the REAL outcome instead
@@ -1113,9 +1134,11 @@ def track_cf_trades(open_syms=None):
             # is a set); if the position-fetch failed (None) we skip and try next cycle,
             # never guessing a liquidation from a failed API call.
             if open_syms is not None and symbol not in open_syms:
-                journal_liquidation(trade, "CrashFade")
-                del cf_open_trades[symbol]
-                continue
+                if confirm_liquidated(symbol, trade):
+                    journal_liquidation(trade, "CrashFade")
+                    del cf_open_trades[symbol]
+                    continue
+                # SL/TP still on exchange -> positions call lied, position is open.
 
             # ---- Progress management: BE at 1R, trail from 1.5R (peak-1R) ----
             risk_dist = trade.get("risk_dist", 0)
@@ -1407,9 +1430,11 @@ def track_rsi_trades(open_syms=None):
 
             # ---- Liquidation detect: position gone from exchange, SL didn't fill ----
             if open_syms is not None and symbol not in open_syms:
-                journal_liquidation(trade, "RSI")
-                rsi_open_trades.pop(oid, None)
-                continue
+                if confirm_liquidated(symbol, trade):
+                    journal_liquidation(trade, "RSI")
+                    rsi_open_trades.pop(oid, None)
+                    continue
+                # SL still on exchange -> positions call lied, position is open.
 
             current = get_current_price(symbol)
             if current > 0 and risk_dist > 0:
@@ -1870,9 +1895,11 @@ def track_t3_trades(open_syms=None):
 
             # ---- Liquidation detect: position gone from exchange, SL didn't fill ----
             if open_syms is not None and symbol not in open_syms:
-                journal_liquidation(trade, "Tight 1")
-                t3_open_trades.pop(oid, None)
-                continue
+                if confirm_liquidated(symbol, trade):
+                    journal_liquidation(trade, "Tight 1")
+                    t3_open_trades.pop(oid, None)
+                    continue
+                # SL still on exchange -> positions call lied, position is open.
 
             if risk_dist <= 0:
                 continue
@@ -2004,23 +2031,25 @@ def trailing_loop():
             if cf_pending:
                 cf_check_pending()
 
-            # ---- Liquidation detection (2026-07-29) ----
-            # ONE positions fetch per cycle, shared by all three trackers. This is the
-            # only extra API call added and it replaces any per-position polling, so it
-            # does NOT worsen the 109429 rate-limit situation. If any trade is open we
-            # fetch; if the fetch fails (empty list AND we do have open trades) we pass
-            # open_syms=None so trackers SKIP the liquidation check this cycle rather
-            # than false-flagging every open trade as liquidated on a transient API error.
+            # ---- Liquidation detection (2026-07-29, refined) ----
+            # ONE positions fetch per cycle, shared by all three trackers -> the only
+            # extra API call, replaces any per-position polling, so it does NOT worsen
+            # the 109429 rate limit. `fetch_ok` tells trackers whether the call itself
+            # succeeded. A symbol MISSING from open_syms is only a liquidation SUSPECT;
+            # the tracker then double-checks that symbol's open orders (confirm_liquidated)
+            # before journaling. That verify step removes the old single-open-trade blind
+            # spot: even if this position was the only one open (so positions == []), the
+            # tracker still checks whether its SL/TP survived on the exchange. If the
+            # fetch itself errored we pass open_syms=None so trackers skip entirely.
             open_syms = None
             have_open = bool(cf_open_trades or rsi_open_trades or t3_open_trades)
             if have_open:
                 positions = get_open_positions()
-                if positions:
-                    open_syms = {p["symbol"] for p in positions}
-                # positions == [] is ambiguous (truly flat vs API failure). We keep
-                # open_syms=None to stay safe; a genuinely-closed position is still
-                # caught by its TP/SL-fill check, and a real liquidation is caught on a
-                # later cycle once the fetch succeeds and returns a non-empty set.
+                # get_open_positions returns [] on genuine flat AND on API failure. We
+                # treat [] as a valid "nothing open" set here; the per-symbol open-orders
+                # verify inside each tracker is what actually guards against false flags,
+                # so an API glitch that also drops the open-orders call cannot liquidate.
+                open_syms = {p["symbol"] for p in positions}
 
             if cf_open_trades:
                 track_cf_trades(open_syms)

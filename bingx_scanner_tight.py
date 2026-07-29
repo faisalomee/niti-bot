@@ -69,6 +69,18 @@ CF_PENDING_EXPIRY_SECONDS = int(os.environ.get("CF_PENDING_EXPIRY_SECONDS", 600)
 CF_RISK_USDT              = float(os.environ.get("CF_RISK_USDT", 2.0))             # hardcoded $100-account sizing (matches Tight/Fast/T3)
 CF_MAX_MARGIN_USDT        = float(os.environ.get("CF_MAX_MARGIN_USDT", 25.0))
 CF_MAX_CONCURRENT_TRADES  = int(os.environ.get("CF_MAX_CONCURRENT_TRADES", 2))
+# ---- Progress-based exit (2026-07-29): CF previously had NO trailing/stagnation, only
+# fixed 3R TP / SL / 4h-market-close. That made almost every TimeExit a small loss.
+# Now: BE at 1R, trail from 1.5R (stop = peak_R - 1R), and a stagnation early-exit
+# that closes a flat/barely-green trade instead of holding the full 4h. Mirrors RSI.
+CF_BE_TRIGGER_R           = float(os.environ.get("CF_BE_TRIGGER_R", 1.0))
+CF_TRAIL_START_R          = float(os.environ.get("CF_TRAIL_START_R", 1.5))
+CF_TRAIL_GAP_R            = float(os.environ.get("CF_TRAIL_GAP_R", 1.0))
+CF_TRAIL_STEP_R           = float(os.environ.get("CF_TRAIL_STEP_R", 0.25))
+# Stagnation: after CF_STAGNATION_SECONDS, if the trade never reached CF_STAGNATION_MIN_R
+# of favorable progress, cut it at market rather than waiting for the 4h TimeExit.
+CF_STAGNATION_SECONDS     = int(os.environ.get("CF_STAGNATION_SECONDS", 5400))     # 1.5h
+CF_STAGNATION_MIN_R       = float(os.environ.get("CF_STAGNATION_MIN_R", 0.5))
 
 # ==================== RSI REVERSION CONFIG (RSI Oversold Reversion, replaces Tight 2) ====================
 # Backtest: n=1584, win 55.4%, net +0.114R, ALL SIX 2-week blocks positive (the only
@@ -89,6 +101,10 @@ RSI_TRAIL_START_R         = float(os.environ.get("RSI_TRAIL_START_R", 1.5))
 RSI_TRAIL_GAP_R           = float(os.environ.get("RSI_TRAIL_GAP_R", 1.0))          # trail stop R = live peak R - 1.0
 RSI_TRAIL_STEP_R          = float(os.environ.get("RSI_TRAIL_STEP_R", 0.25))        # only re-place the exchange SL when it improves >=0.25R
 RSI_MAX_HOLD_SECONDS      = int(os.environ.get("RSI_MAX_HOLD_SECONDS", 14400))     # 4h
+# Stagnation early-exit (2026-07-29): RSI already trails, but a trade that never gets
+# going still sat the full 4h. Cut it early if peak_R stays below the floor.
+RSI_STAGNATION_SECONDS    = int(os.environ.get("RSI_STAGNATION_SECONDS", 5400))    # 1.5h
+RSI_STAGNATION_MIN_R      = float(os.environ.get("RSI_STAGNATION_MIN_R", 0.5))
 RSI_COOLDOWN_SECONDS      = int(os.environ.get("RSI_COOLDOWN_SECONDS", 7200))      # 24 bars/coin
 RSI_DEDUP_SECONDS         = int(os.environ.get("RSI_DEDUP_SECONDS", 3600))         # skip if this coin took a Crash Fade entry within +/-12 bars - keeps the two strategies disjoint
 RSI_RISK_USDT             = float(os.environ.get("RSI_RISK_USDT", 2.0))
@@ -637,6 +653,40 @@ def get_open_positions():
         return []
 
 
+def journal_liquidation(trade, label):
+    """A tracked position vanished from the exchange without our TP or SL filling ->
+    BingX liquidated it (isolated margin hit 100%). Journal the REAL outcome instead
+    of the fake 'TimeExit' the old code produced at the 4h mark with a stale in-memory
+    entry price. Realized loss on a liquidation is the whole margin at risk, i.e. the
+    trade's risk_usdt (the SL sat at -1R; a liquidation is at least that bad). We report
+    -risk_usdt as a faithful, non-optimistic figure rather than guessing the exact
+    liquidation fill.  Cancels any leftover SL/TP so no orphan orders remain."""
+    try:
+        symbol = trade.get("symbol", "?")
+        for oid_key in ("sl_id", "tp_id"):
+            if trade.get(oid_key):
+                try:
+                    cancel_order(symbol, trade[oid_key])
+                except Exception:
+                    pass
+        risk_usdt = trade.get("risk_usdt")
+        if risk_usdt is None:
+            # fall back to strategy default via risk_dist * qty if present
+            rd = trade.get("risk_dist", 0)
+            qty = trade.get("total_qty", trade.get("remaining_qty", 0))
+            risk_usdt = round(rd * qty, 2) if (rd and qty) else 0.0
+        trade["pnl"]    = -abs(round(risk_usdt, 2))
+        trade["result"] = "Liquidated"
+        trade["label"]  = label
+        daily_trades.append(trade)
+        journal_closed_trade(trade)
+        send_tg(f"⚠️ {label} {symbol}: position LIQUIDATED on exchange (no TP/SL fill). "
+                f"Logged as Liquidated, realized ~{trade['pnl']} USDT. Check margin.")
+        print(f"[LIQUIDATION] {label} {symbol} pnl={trade['pnl']}")
+    except Exception as e:
+        print(f"[LIQUIDATION JOURNAL ERROR] {e}")
+
+
 def get_open_orders_for(symbol):
     """Open orders for one symbol, split into the first STOP_MARKET and the first
     TAKE_PROFIT_MARKET found -> (sl_id, sl_price, tp_id, tp_price). Any may be None."""
@@ -986,6 +1036,7 @@ def place_cf_order(symbol, entry, sl_price, target, atr15, risk_usdt):
                 "close_side": close_side, "pos_side": pos_side,
                 "total_qty": total_qty, "remaining_qty": total_qty,
                 "risk_dist": risk_dist, "atr_at_entry": atr15, "opened_ts": time.time(),
+                "risk_usdt": risk_usdt, "peak_r": 0.0, "be_done": False, "stop_r": None,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
@@ -1023,7 +1074,7 @@ def close_cf_position(symbol, reason=""):
         print(f"[CF CLOSE ERROR] {symbol}: {e}")
 
 
-def track_cf_trades():
+def track_cf_trades(open_syms=None):
     for symbol in list(cf_open_trades.keys()):
         try:
             trade = cf_open_trades[symbol]
@@ -1057,8 +1108,56 @@ def track_cf_trades():
                     del cf_open_trades[symbol]
                     continue
 
+            # ---- Liquidation detect: position gone from exchange, no TP/SL fill ----
+            # Only trust the open-set when we actually fetched it this cycle (open_syms
+            # is a set); if the position-fetch failed (None) we skip and try next cycle,
+            # never guessing a liquidation from a failed API call.
+            if open_syms is not None and symbol not in open_syms:
+                journal_liquidation(trade, "CrashFade")
+                del cf_open_trades[symbol]
+                continue
+
+            # ---- Progress management: BE at 1R, trail from 1.5R (peak-1R) ----
+            risk_dist = trade.get("risk_dist", 0)
+            current   = get_current_price(symbol)
+            if current > 0 and risk_dist > 0:
+                favorable_r = (current - entry_ref) / risk_dist   # LONG
+                if favorable_r > trade.get("peak_r", 0.0):
+                    trade["peak_r"] = favorable_r
+                peak_r = trade["peak_r"]
+
+                target_stop_r = None
+                if peak_r >= CF_TRAIL_START_R:
+                    target_stop_r = peak_r - CF_TRAIL_GAP_R
+                elif peak_r >= CF_BE_TRIGGER_R:
+                    target_stop_r = 0.0
+
+                if target_stop_r is not None:
+                    cur_stop_r = trade.get("stop_r")
+                    if cur_stop_r is None or target_stop_r >= cur_stop_r + CF_TRAIL_STEP_R:
+                        new_sl = round(entry_ref + target_stop_r * risk_dist, 6)
+                        if new_sl > trade["sl"] and new_sl < current:
+                            new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
+                            if new_id:
+                                if trade.get("sl_id"):
+                                    cancel_order(symbol, trade["sl_id"])
+                                trade["sl_id"]  = new_id
+                                trade["sl"]     = new_sl
+                                trade["stop_r"] = target_stop_r
+                                tag = "BE" if target_stop_r <= 0.0001 else f"+{target_stop_r:.2f}R"
+                                print(f"[CF TRAIL] {symbol} peak {peak_r:.2f}R -> SL {new_sl} ({tag})")
+                            else:
+                                print(f"[CF TRAIL FAIL] {symbol} SL re-placement failed - keeping SL {trade['sl']}")
+
+            # ---- Stagnation early-exit: flat too long, cut before the 4h TimeExit ----
+            held = time.time() - trade.get("opened_ts", time.time())
+            if held >= CF_STAGNATION_SECONDS and trade.get("peak_r", 0.0) < CF_STAGNATION_MIN_R:
+                print(f"[CF STAGNATION] {symbol} peak {trade.get('peak_r',0):.2f}R < {CF_STAGNATION_MIN_R}R after {held/3600:.1f}h")
+                close_cf_position(symbol, "Stagnation")
+                continue
+
             # 4h max hold
-            if time.time() - trade.get("opened_ts", time.time()) >= CF_MAX_HOLD_SECONDS:
+            if held >= CF_MAX_HOLD_SECONDS:
                 print(f"[CF MAX HOLD] {symbol}")
                 close_cf_position(symbol, "TimeExit")
                 continue
@@ -1242,7 +1341,7 @@ def place_rsi_order(symbol, entry, sl_price, atr15):
                 "sl": sl_price, "sl_id": sl_id, "close_side": close_side, "pos_side": pos_side,
                 "total_qty": total_qty, "remaining_qty": total_qty,
                 "risk_dist": risk_dist, "atr_at_entry": atr15, "opened_ts": time.time(),
-                "peak_r": 0.0, "be_done": False, "stop_r": None,
+                "peak_r": 0.0, "be_done": False, "stop_r": None, "risk_usdt": RSI_RISK_USDT,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
@@ -1278,7 +1377,7 @@ def close_rsi_position(oid, reason=""):
         print(f"[RSI CLOSE ERROR] {oid}: {e}")
 
 
-def track_rsi_trades():
+def track_rsi_trades(open_syms=None):
     for oid in list(rsi_open_trades.keys()):
         trade = rsi_open_trades.get(oid)
         if not trade:
@@ -1303,6 +1402,12 @@ def track_rsi_trades():
                 trade["label"]  = "RSI"
                 daily_trades.append(trade)
                 journal_closed_trade(trade)
+                rsi_open_trades.pop(oid, None)
+                continue
+
+            # ---- Liquidation detect: position gone from exchange, SL didn't fill ----
+            if open_syms is not None and symbol not in open_syms:
+                journal_liquidation(trade, "RSI")
                 rsi_open_trades.pop(oid, None)
                 continue
 
@@ -1338,8 +1443,15 @@ def track_rsi_trades():
                             else:
                                 print(f"[RSI TRAIL FAIL] {symbol} SL re-placement failed - keeping SL {trade['sl']}")
 
+            # ---- Stagnation early-exit: flat too long, cut before the 4h TimeExit ----
+            held = time.time() - trade.get("opened_ts", time.time())
+            if held >= RSI_STAGNATION_SECONDS and trade.get("peak_r", 0.0) < RSI_STAGNATION_MIN_R:
+                print(f"[RSI STAGNATION] {symbol} peak {trade.get('peak_r',0):.2f}R < {RSI_STAGNATION_MIN_R}R after {held/3600:.1f}h")
+                close_rsi_position(oid, "Stagnation")
+                continue
+
             # 4h max hold
-            if time.time() - trade.get("opened_ts", time.time()) >= RSI_MAX_HOLD_SECONDS:
+            if held >= RSI_MAX_HOLD_SECONDS:
                 print(f"[RSI MAX HOLD] {symbol}")
                 close_rsi_position(oid, "TimeExit")
                 continue
@@ -1709,7 +1821,7 @@ def place_t3_order(symbol, side, entry, sl):
                 "sl": sl, "sl_id": sl_id, "total_qty": total_qty,
                 "close_side": close_side, "pos_side": pos_side,
                 "risk_dist": risk_dist, "be_done": False, "be_price": None,
-                "trailed": False, "peak_r": 0.0,
+                "trailed": False, "peak_r": 0.0, "risk_usdt": T3_RISK_USDT,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
@@ -1718,7 +1830,7 @@ def place_t3_order(symbol, side, entry, sl):
         return None
 
 
-def track_t3_trades():
+def track_t3_trades(open_syms=None):
     """Runs in the 30s trailing loop. Peak R is tracked from LIVE price every pass
     (a 30s wick to 7R must ratchet the trail even if no candle ever closes there).
     Exit ladder: BE at 2R -> nothing between 2R and 4R (room to run) -> from 4R the
@@ -1754,6 +1866,12 @@ def track_t3_trades():
                 journal_closed_trade(trade)
                 t3_open_trades.pop(oid, None)
                 print(f"[T3 CLOSE] {symbol} {result} pnl={trade['pnl']}")
+                continue
+
+            # ---- Liquidation detect: position gone from exchange, SL didn't fill ----
+            if open_syms is not None and symbol not in open_syms:
+                journal_liquidation(trade, "Tight 1")
+                t3_open_trades.pop(oid, None)
                 continue
 
             if risk_dist <= 0:
@@ -1885,12 +2003,31 @@ def trailing_loop():
         try:
             if cf_pending:
                 cf_check_pending()
+
+            # ---- Liquidation detection (2026-07-29) ----
+            # ONE positions fetch per cycle, shared by all three trackers. This is the
+            # only extra API call added and it replaces any per-position polling, so it
+            # does NOT worsen the 109429 rate-limit situation. If any trade is open we
+            # fetch; if the fetch fails (empty list AND we do have open trades) we pass
+            # open_syms=None so trackers SKIP the liquidation check this cycle rather
+            # than false-flagging every open trade as liquidated on a transient API error.
+            open_syms = None
+            have_open = bool(cf_open_trades or rsi_open_trades or t3_open_trades)
+            if have_open:
+                positions = get_open_positions()
+                if positions:
+                    open_syms = {p["symbol"] for p in positions}
+                # positions == [] is ambiguous (truly flat vs API failure). We keep
+                # open_syms=None to stay safe; a genuinely-closed position is still
+                # caught by its TP/SL-fill check, and a real liquidation is caught on a
+                # later cycle once the fetch succeeds and returns a non-empty set.
+
             if cf_open_trades:
-                track_cf_trades()
+                track_cf_trades(open_syms)
             if rsi_open_trades:
-                track_rsi_trades()
+                track_rsi_trades(open_syms)
             if t3_open_trades:
-                track_t3_trades()
+                track_t3_trades(open_syms)
             send_daily_summary()
         except Exception as e:
             print(f"[TRAIL LOOP ERROR] {e}")

@@ -486,11 +486,16 @@ def journal_closed_trade(trade):
     """Single consolidated journal entry per closed trade - kept deliberately simple,
     no intermediate messages (no TP1-banked / cooldown-triggered spam)."""
     sign = "+" if trade.get("pnl", 0) > 0 else ""
+    r_line = ""
+    if "exit_r" in trade:
+        rs = "+" if trade.get("exit_r", 0) > 0 else ""
+        r_line = "Closed: " + rs + str(trade.get("exit_r", 0)) + "R\n"
     send_journal(
         "Trade Closed [" + trade.get("label", "?") + "] - " + trade["symbol"] + "\n"
         "------------------------------\n"
         "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
         "Result: " + trade.get("result", "?") + "\n"
+        + r_line +
         "PnL   : " + sign + str(trade.get("pnl", 0)) + " USDT\n"
         "------------------------------\nNiti Journal"
     )
@@ -698,6 +703,7 @@ def journal_liquidation(trade, label):
             risk_usdt = round(rd * qty, 2) if (rd and qty) else 0.0
         trade["pnl"]    = -abs(round(risk_usdt, 2))
         trade["result"] = "Liquidated"
+        trade["exit_r"] = round(trade["pnl"] / risk_usdt, 2) if risk_usdt else -1.0
         trade["label"]  = label
         daily_trades.append(trade)
         journal_closed_trade(trade)
@@ -1550,7 +1556,7 @@ T3_MAX_WATCHLIST          = int(os.environ.get("T3_MAX_WATCHLIST", 150))        
 T3_DORMANCY_DAYS          = int(os.environ.get("T3_DORMANCY_DAYS", 5))
 T3_DORMANCY_RANGE_PCT     = float(os.environ.get("T3_DORMANCY_RANGE_PCT", 25.0)) # total close band width = +/-15% around mid
 T3_DORMANCY_VOL_SPIKE_MAX = float(os.environ.get("T3_DORMANCY_VOL_SPIKE_MAX", 3.0))   # any day >3x median inside the window = already awakened earlier, not dormant
-T3_AWAKE_VOL_MULT         = float(os.environ.get("T3_AWAKE_VOL_MULT", 5.0))      # UNTESTED starting point - if T3 stays silent for weeks try 5.0, if it spams try 10.0
+T3_AWAKE_VOL_MULT         = float(os.environ.get("T3_AWAKE_VOL_MULT", 3.0))      # 2026-07-30: 5x->3x, backtest-verified 9.4 trades/wk +$391/8mo (was 4.7/wk $213), holdout-OK both sets. Fixes "no trades for a week". If it spams try 4x; 2.5x gives more but clusters max2 slots.
 T3_DORMANCY_SCAN_SECONDS  = int(os.environ.get("T3_DORMANCY_SCAN_SECONDS", 14400))   # rebuild watchlist every 4h (1 daily-candle request per symbol)
 T3_AWAKE_CHECK_SECONDS    = int(os.environ.get("T3_AWAKE_CHECK_SECONDS", 300))
 T3_SETUP_EXPIRY_SECONDS   = int(os.environ.get("T3_SETUP_EXPIRY_SECONDS", 172800))   # 48h to form a pullback entry after the awakening, else skip
@@ -1568,6 +1574,9 @@ T3_LEVERAGE               = int(os.environ.get("T3_LEVERAGE", 10))   # 10x not 2
 T3_MAX_MARGIN_USDT        = 25.0
 T3_ATR_LEN                = 14
 T3_SL_ATR_BUFFER_MULT     = 0.3
+T3_CHASE_SL_ATR_MULT      = float(os.environ.get("T3_CHASE_SL_ATR_MULT", 1.5))   # 2026-07-30 chase: SL = entry -/+ 1.5xATR(15m). Tune-swept best (1.0/2.0/2.5 all worse), holdout-OK.
+T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 8.0))          # 2026-07-30: visible reduce-only TP at 8R. no-TP=$267 vs 8R=$213/8mo; the $54 buys a chart-visible TP line so drawdown is tolerable. Trail (BE2R/from4R) still the primary exit; 8R is a far ceiling only mega-runners hit.
+T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))      # 2026-07-30: log+alert only (NO auto-skip yet) if entry fill is >this% from signal px. Collect 2-3wk live slip, then decide a skip threshold.
 
 t3_auto_trade_enabled = AUTO_RESUME_ON_START
 t3_watchlist   = {}   # symbol -> dormancy info (dormant range + median vol), rebuilt every 4h
@@ -1676,12 +1685,10 @@ def t3_check_awakening(symbol, info):
         t3_watch[symbol] = {
             "side": side, "awake_ts": time.time(),
             "expiry_ts": time.time() + T3_SETUP_EXPIRY_SECONDS,
-            "peak": h1_close,                     # running post-awakening extreme (high for BUY, low for SELL)
-            "pullback_highs": [], "pullback_lows": [],
-            "trigger": None, "setup_sl": None,
-            # only 15m candles that CLOSE after this moment count - processing
-            # pre-awakening history would build bogus setups out of the dormant
-            # chop itself (caught in dry-run testing before deploy, 2026-07-19)
+            # CHASE (2026-07-30): no pullback wait. Enter at the CLOSE of the first
+            # 15m candle that closes after the awakening, SL = T3_CHASE_SL_ATR_MULT x
+            # ATR(15m). Backtest: chase +0.796R vs pullback +0.283R, holdout-verified.
+            # Only 15m candles that CLOSE after this moment count.
             "last_processed_time": int(time.time() * 1000),
             "vol_ratio": ratio,
             "dormant_high": info["dormant_high"], "dormant_low": info["dormant_low"],
@@ -1710,13 +1717,9 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
     risk = abs(entry_px - sl)
     if risk <= 0:
         return
-    if atr_now > 0 and risk > atr_now * T3_MAX_SL_ATR_MULT:
-        print(f"[T3 SKIP] {symbol} entry-to-SL {risk / atr_now:.1f}x ATR exceeds {T3_MAX_SL_ATR_MULT}x - awakening too extended")
-        send_tg(
-            "TIGHT 1 SKIPPED - " + symbol + "\nAwakening detected but too extended: SL distance " +
-            str(round(risk / atr_now, 1)) + "x ATR (max " + str(T3_MAX_SL_ATR_MULT) + "x) - position would be meaninglessly small. No trade."
-        )
-        return
+    # NOTE: chase SL is a fixed 1.5xATR, so the old "entry-to-SL too extended" guard
+    # can never trip and is removed. Oversized-candle skip was backtest-REJECTED
+    # (every candle>NxATR filter cut PnL - big breakout candles ARE the runners).
     sl = round(sl, 6)
     trade_status = ""
     if t3_auto_trade_enabled and len(t3_open_trades) >= T3_MAX_CONCURRENT_TRADES:
@@ -1735,7 +1738,7 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
     send_tg(
         "TIGHT 1 ENTRY - " + side + " - " + symbol + "\n------------------------------\n"
         "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(T3_RISK_USDT) + " | Lev: " + str(T3_LEVERAGE) + "x\n"
-        "No fixed TP - BE at " + str(T3_BE_TRIGGER_R) + "R, trail from " + str(T3_TRAIL_START_R) + "R at peak-" + str(T3_TRAIL_GAP_R) + "R\n"
+        "Chase entry (breakout candle) | TP " + str(T3_FIXED_TP_R) + "R visible | BE " + str(T3_BE_TRIGGER_R) + "R, trail from " + str(T3_TRAIL_START_R) + "R at peak-" + str(T3_TRAIL_GAP_R) + "R\n"
         "Awakening vol: " + str(round(st.get("vol_ratio", 0), 1)) + "x dormant median" +
         trade_status + "\n------------------------------\nNiti Tight 1"
     )
@@ -1765,40 +1768,19 @@ def t3_check_awakened(symbol):
         atr_now = atr_series(highs, lows, closes, T3_ATR_LEN)[-1]
         side   = st["side"]
         last_t = int(st.get("last_processed_time") or 0)
+        # CHASE: enter at the close of the FIRST 15m candle that closes after the
+        # awakening. No pullback wait, no trigger/peak machine. SL = 1.5xATR(15m).
         for c in [x for x in confirmed if int(x["time"]) > last_t]:
             st["last_processed_time"] = int(c["time"])
-
-            # 1) if a setup exists, the entry check comes FIRST for this candle
-            if st.get("trigger") is not None:
-                if (side == "BUY" and cl(c) > st["trigger"]) or (side == "SELL" and cl(c) < st["trigger"]):
-                    t3_fire_entry(symbol, st, cl(c), atr_now)
-                    return
-
-            # 2) otherwise update the peak / pullback tracking with this candle
+            if atr_now <= 0:
+                continue
+            entry_px = cl(c)
             if side == "BUY":
-                if h(c) > st["peak"]:
-                    st["peak"] = h(c)
-                    st["pullback_highs"], st["pullback_lows"] = [], []
-                    st["trigger"], st["setup_sl"] = None, None
-                else:
-                    st["pullback_highs"].append(h(c))
-                    st["pullback_lows"].append(l(c))
-                    deep_enough = (st["peak"] - min(st["pullback_lows"])) >= atr_now * T3_PULLBACK_ATR_MULT
-                    if len(st["pullback_highs"]) >= T3_PULLBACK_MIN_CANDLES or deep_enough:
-                        st["trigger"]  = max(st["pullback_highs"])
-                        st["setup_sl"] = min(st["pullback_lows"]) - atr_now * T3_SL_ATR_BUFFER_MULT
+                st["setup_sl"] = entry_px - atr_now * T3_CHASE_SL_ATR_MULT
             else:
-                if l(c) < st["peak"]:
-                    st["peak"] = l(c)
-                    st["pullback_highs"], st["pullback_lows"] = [], []
-                    st["trigger"], st["setup_sl"] = None, None
-                else:
-                    st["pullback_highs"].append(h(c))
-                    st["pullback_lows"].append(l(c))
-                    deep_enough = (max(st["pullback_highs"]) - st["peak"]) >= atr_now * T3_PULLBACK_ATR_MULT
-                    if len(st["pullback_lows"]) >= T3_PULLBACK_MIN_CANDLES or deep_enough:
-                        st["trigger"]  = min(st["pullback_lows"])
-                        st["setup_sl"] = max(st["pullback_highs"]) + atr_now * T3_SL_ATR_BUFFER_MULT
+                st["setup_sl"] = entry_px + atr_now * T3_CHASE_SL_ATR_MULT
+            t3_fire_entry(symbol, st, entry_px, atr_now)
+            return
     except Exception as e:
         print(f"[T3 AWAKENED {symbol}] error: {e}")
 
@@ -1832,6 +1814,13 @@ def place_t3_order(symbol, side, entry, sl):
         if order_id != "N/A":
             time.sleep(0.5)
             entry_fill = get_fill_price(order_id, symbol, fallback=entry)
+
+            # ---- Slippage LOG + ALERT (no auto-skip yet - collecting live slip data) ----
+            slip_pct = abs(entry_fill - entry) / entry * 100 if entry > 0 else 0.0
+            print(f"[T3 SLIP] {symbol} signal={entry} fill={entry_fill} slip={slip_pct:.3f}%")
+            if slip_pct > T3_SLIP_ALERT_PCT:
+                send_tg(f"⚠️ TIGHT 1 {symbol}: chase fill slipped {slip_pct:.2f}% (signal {entry} -> fill {entry_fill}). Trade kept - logging for slip review.")
+
             risk_dist = abs(entry_fill - sl)
             if risk_dist <= 0:
                 risk_dist = abs(entry - sl)
@@ -1841,10 +1830,18 @@ def place_t3_order(symbol, side, entry, sl):
                 place_market_order(symbol, close_side, total_qty, pos_side)
                 send_tg(f"⚠️ TIGHT 1 {symbol}: SL placement failed - position emergency-closed for safety")
                 return None
+
+            # ---- Visible 8R reduce-only TP (far ceiling; trail is the primary exit) ----
+            if side == "BUY":
+                tp_price = round(entry_fill + risk_dist * T3_FIXED_TP_R, 6)
+            else:
+                tp_price = round(entry_fill - risk_dist * T3_FIXED_TP_R, 6)
+            tp_id = place_tp_guarded(symbol, close_side, pos_side, tp_price, total_qty, label="TP-" + str(T3_FIXED_TP_R) + "R")
+
             t3_open_trades[str(order_id)] = {
                 "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
-                "sl": sl, "sl_id": sl_id, "total_qty": total_qty,
-                "close_side": close_side, "pos_side": pos_side,
+                "sl": sl, "sl_id": sl_id, "tp": tp_price, "tp_id": tp_id,
+                "total_qty": total_qty, "close_side": close_side, "pos_side": pos_side,
                 "risk_dist": risk_dist, "be_done": False, "be_price": None,
                 "trailed": False, "peak_r": 0.0, "risk_usdt": T3_RISK_USDT,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
@@ -1870,6 +1867,26 @@ def track_t3_trades(open_syms=None):
             risk_dist = trade.get("risk_dist", 0)
             entry_ref = trade.get("entry_fill", trade["entry"])
 
+            # ---- 8R TP fill = trade over ----
+            tp_status = check_order_status(trade["tp_id"], symbol) if trade.get("tp_id") and trade["tp_id"] != "N/A" else ""
+            if tp_status == "FILLED":
+                tp_fill = get_fill_price(trade["tp_id"], symbol, fallback=trade["tp"])
+                if trade["side"] == "BUY":
+                    leg_pnl = (tp_fill - entry_ref) * trade["total_qty"]
+                else:
+                    leg_pnl = (entry_ref - tp_fill) * trade["total_qty"]
+                if trade.get("sl_id"):
+                    cancel_order(symbol, trade["sl_id"])   # cancel orphan SL
+                trade["pnl"]    = round(leg_pnl, 2)
+                trade["result"] = "TP"
+                trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T3_RISK_USDT), 2) if trade.get("risk_usdt") else round(T3_FIXED_TP_R, 2)
+                trade["label"]  = "Tight 1"
+                daily_trades.append(trade)
+                journal_closed_trade(trade)
+                t3_open_trades.pop(oid, None)
+                print(f"[T3 CLOSE] {symbol} TP pnl={trade['pnl']}")
+                continue
+
             # ---- SL fill = trade over (SL / BE / Trail all end here) ----
             sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
             if sl_status == "FILLED":
@@ -1884,13 +1901,16 @@ def track_t3_trades(open_syms=None):
                     result = "BE"
                 else:
                     result = "SL"
+                if trade.get("tp_id") and trade["tp_id"] != "N/A":
+                    cancel_order(symbol, trade["tp_id"])   # cancel orphan TP
                 trade["pnl"]    = round(leg_pnl, 2)
                 trade["result"] = result
+                trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T3_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
                 trade["label"]  = "Tight 1"
                 daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t3_open_trades.pop(oid, None)
-                print(f"[T3 CLOSE] {symbol} {result} pnl={trade['pnl']}")
+                print(f"[T3 CLOSE] {symbol} {result} pnl={trade['pnl']} R={trade['exit_r']}")
                 continue
 
             # ---- Liquidation detect: position gone from exchange, SL didn't fill ----
@@ -1959,7 +1979,7 @@ def t3_loop():
     """Tight 1 main loop. Internal timers: dormancy rescan every 4h, awakening
     check on the watchlist every 5 min, awakened symbols processed every pass
     (60s). Fully respects the global API backoff."""
-    print("Tight 1 loop started - Dormant Awakening (dormancy -> 5x median awakening -> pullback entry -> peak-2R trail)")
+    print("Tight 1 loop started - Dormant Awakening (dormancy -> 3x median awakening -> CHASE entry -> 8R TP + peak-2R trail)")
     all_symbols   = []
     last_dormancy = 0.0
     last_awake    = 0.0

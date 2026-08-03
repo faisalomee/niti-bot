@@ -1578,6 +1578,39 @@ T3_CHASE_SL_ATR_MULT      = float(os.environ.get("T3_CHASE_SL_ATR_MULT", 1.5))  
 T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 8.0))          # 2026-07-30: visible reduce-only TP at 8R. no-TP=$267 vs 8R=$213/8mo; the $54 buys a chart-visible TP line so drawdown is tolerable. Trail (BE2R/from4R) still the primary exit; 8R is a far ceiling only mega-runners hit.
 T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))      # 2026-07-30: log+alert only (NO auto-skip yet) if entry fill is >this% from signal px. Collect 2-3wk live slip, then decide a skip threshold.
 
+# ==================== TIGHT 2 (Trapped-Block Fade, SHORT) ====================
+# 2026-08-02: replaces retired RSI Reversion on the /start /stop commands.
+# Concept (only survivor of 4 discretionary docs): SHORT a prior high-volume
+# "trapped block" resistance when price returns up into it on declining volume
+# (demand exhaustion). Backtest (15m 8mo, band5/dump18, TP4/buf1.0/exh0.8):
+# max2 win 52% $144 DD -$8; holdout A+1.51/B+1.09; random -0.445; 8/9 months+.
+T2_RET_BAND_PCT           = float(os.environ.get("T2_RET_BAND_PCT", 5.0))    # price within this % of block level = "returned into level"
+T2_DUMP_PCT               = float(os.environ.get("T2_DUMP_PCT", 18.0))       # block qualifies only if its close later fell >= this % within lookahead
+T2_DUMP_LOOKAHEAD_DAYS    = int(os.environ.get("T2_DUMP_LOOKAHEAD_DAYS", 5))
+T2_VOL_SPIKE              = float(os.environ.get("T2_VOL_SPIKE", 3.0))        # block day vol >= this x trailing-5d median
+T2_VOL_EXHAUSTION         = float(os.environ.get("T2_VOL_EXHAUSTION", 0.8))  # entry only if current 15m vol < this x median(last 20). Tighter than 1.0 halves DD.
+T2_SL_ATR_BUF             = float(os.environ.get("T2_SL_ATR_BUF", 1.0))      # SL = block_high + this x ATR(15m)
+T2_TP_R                   = float(os.environ.get("T2_TP_R", 4.0))            # fixed reduce-only TP at 4R (win-neutral vs 3R, +PnL)
+T2_ATR_LEN                = 14
+T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline median volume
+T2_BLOCK_SCAN_SECONDS     = int(os.environ.get("T2_BLOCK_SCAN_SECONDS", 14400))  # rebuild block map every 4h (1 daily request per symbol)
+T2_ENTRY_CHECK_SECONDS    = int(os.environ.get("T2_ENTRY_CHECK_SECONDS", 300))
+T2_COOLDOWN_SECONDS       = int(os.environ.get("T2_COOLDOWN_SECONDS", 86400))    # 1 day per coin after a fade fires
+T2_RISK_USDT              = 2.0
+T2_LEVERAGE               = int(os.environ.get("T2_LEVERAGE", 10))
+T2_MAX_MARGIN_USDT        = 25.0
+T2_MAX_SYMBOLS            = int(os.environ.get("T2_MAX_SYMBOLS", 250))
+T2_EXCLUDE_TOP_N          = int(os.environ.get("T2_EXCLUDE_TOP_N", 75))
+
+# Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
+# (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
+SHARED_MAX_CONCURRENT     = int(os.environ.get("SHARED_MAX_CONCURRENT", 2))
+
+t2_auto_trade_enabled = AUTO_RESUME_ON_START
+t2_blocks       = {}    # symbol -> list of (resistance_level, formed_day_ms)
+t2_open_trades  = {}    # order_id -> open Tight 2 fade trade
+t2_last_fire    = {}    # symbol -> ts of last fired fade (cooldown)
+
 t3_auto_trade_enabled = AUTO_RESUME_ON_START
 t3_watchlist   = {}   # symbol -> dormancy info (dormant range + median vol), rebuilt every 4h
 t3_watch       = {}   # symbol -> AWAKENED state machine (pullback tracking -> entry)
@@ -1722,8 +1755,8 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
     # (every candle>NxATR filter cut PnL - big breakout candles ARE the runners).
     sl = round(sl, 6)
     trade_status = ""
-    if t3_auto_trade_enabled and len(t3_open_trades) >= T3_MAX_CONCURRENT_TRADES:
-        trade_status = "\nSkipped - max concurrent T3 trades (" + str(T3_MAX_CONCURRENT_TRADES) + ") reached"
+    if t3_auto_trade_enabled and t2_total_open() >= SHARED_MAX_CONCURRENT:
+        trade_status = "\nSkipped - shared T1+T2 cap (" + str(SHARED_MAX_CONCURRENT) + ") reached"
     elif t3_auto_trade_enabled:
         oid = place_t3_order(symbol, side, entry_px, sl)
         if oid == "MARGIN_SKIP":
@@ -2014,6 +2047,245 @@ def t3_loop():
             print(f"[T3 LOOP ERROR] {e}")
         time.sleep(60)
 # ==================== END TIGHT 1 ====================
+
+
+# ==================== TIGHT 2 (Trapped-Block Fade) ====================
+def t2_total_open():
+    """Shared open count across BOTH engines for the shared concurrency cap."""
+    return len(t3_open_trades) + len(t2_open_trades)
+
+def t2_in_cooldown(symbol):
+    last = t2_last_fire.get(symbol, 0)
+    return (time.time() - last) < T2_COOLDOWN_SECONDS
+
+def t2_symbol_has_open_trade(symbol):
+    return any(t["symbol"] == symbol for t in t2_open_trades.values())
+
+def t2_build_blocks(all_symbols):
+    """For each symbol, build the list of trapped-block resistance levels from
+    DAILY candles: a day whose volume >= T2_VOL_SPIKE x trailing-5d median and
+    whose close then FELL >= T2_DUMP_PCT within the next T2_DUMP_LOOKAHEAD_DAYS.
+    That day's HIGH is the resistance (trapped longs). Rebuilt every 4h."""
+    syms = get_liquid_symbols(all_symbols, min_quote_vol=T3_MIN_QUOTE_VOL, max_n=T2_MAX_SYMBOLS, exclude_top_n=T2_EXCLUDE_TOP_N)
+    new_blocks = {}
+    for sym in syms:
+        if api_backoff_active():
+            break
+        try:
+            daily = get_candles(sym, limit=60, interval="1d")
+            if not daily or len(daily) < T2_DORMANCY_DAYS + T2_DUMP_LOOKAHEAD_DAYS + 2:
+                continue
+            highs  = [h(c)  for c in daily]
+            lows   = [l(c)  for c in daily]
+            closes = [cl(c) for c in daily]
+            vols   = [v(c)  for c in daily]
+            times  = [int(c["time"]) for c in daily]
+            blocks = []
+            for i in range(T2_DORMANCY_DAYS, len(daily) - T2_DUMP_LOOKAHEAD_DAYS):
+                window = vols[i - T2_DORMANCY_DAYS:i]
+                med = sorted(window)[len(window) // 2] if window else 0
+                if med <= 0 or vols[i] < T2_VOL_SPIKE * med:
+                    continue
+                fut_low = min(lows[i + 1:i + 1 + T2_DUMP_LOOKAHEAD_DAYS])
+                if closes[i] > 0 and (closes[i] - fut_low) / closes[i] * 100 >= T2_DUMP_PCT:
+                    blocks.append((highs[i], times[i]))
+            if blocks:
+                new_blocks[sym] = blocks
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"[T2 BLOCK {sym}] error: {e}")
+    t2_blocks.clear()
+    t2_blocks.update(new_blocks)
+    print(f"[T2 BLOCKS] built for {len(t2_blocks)} symbols")
+
+def t2_check_entry(symbol, blocks):
+    """On 15m: if price is returning UP into a past block level (within band) from
+    below, on declining volume (< T2_VOL_EXHAUSTION x median-of-last-20), SHORT."""
+    try:
+        candles = get_candles(symbol, limit=40, interval="15m")
+        if len(candles) < 22:
+            return
+        confirmed = candles[:-1]
+        c_last = confirmed[-1]
+        price  = cl(c_last)
+        hi     = h(c_last)
+        cur_vol = v(c_last)
+        highs  = [h(x)  for x in confirmed]
+        lows   = [l(x)  for x in confirmed]
+        closes = [cl(x) for x in confirmed]
+        vols   = [v(x)  for x in confirmed]
+        atr_now = atr_series(highs, lows, closes, T2_ATR_LEN)[-1]
+        if atr_now <= 0:
+            return
+        vol_window = vols[-21:-1] if len(vols) >= 21 else vols[:-1]
+        vmed = sorted(vol_window)[len(vol_window) // 2] if vol_window else cur_vol
+        if cur_vol > T2_VOL_EXHAUSTION * vmed:      # demand not exhausted -> skip
+            return
+        now_ms = int(c_last["time"])
+        for lvl, formed_ms in blocks:
+            if formed_ms >= now_ms:
+                continue
+            # price returning up INTO the level from below (band around lvl), close still below
+            if price < lvl and hi >= lvl * (1 - T2_RET_BAND_PCT / 100) and hi <= lvl * (1 + T2_RET_BAND_PCT / 100):
+                sl = round(lvl + atr_now * T2_SL_ATR_BUF, 6)
+                if sl <= price:
+                    continue
+                t2_fire_entry(symbol, price, sl)
+                return
+    except Exception as e:
+        print(f"[T2 ENTRY {symbol}] error: {e}")
+
+def t2_fire_entry(symbol, entry_px, sl):
+    if t2_symbol_has_open_trade(symbol):
+        return
+    risk = sl - entry_px       # short: SL above entry
+    if risk <= 0:
+        return
+    send_tg(
+        "TIGHT 2 SHORT - " + symbol + "\n"
+        "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(T2_RISK_USDT) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
+        "Trapped-block fade | TP " + str(T2_TP_R) + "R\n"
+    )
+    place_t2_order(symbol, entry_px, sl)
+    t2_last_fire[symbol] = time.time()
+
+def place_t2_order(symbol, entry, sl):
+    try:
+        set_leverage_api(symbol, T2_LEVERAGE)
+        precision = symbol_precision.get(symbol, 4)
+        risk_dist = abs(sl - entry)
+        if risk_dist <= 0:
+            return None
+        risk_qty       = T2_RISK_USDT / risk_dist
+        margin_cap_qty = (T2_MAX_MARGIN_USDT * T2_LEVERAGE) / entry
+        qty = round(min(risk_qty, margin_cap_qty), precision)
+        if qty <= 0:
+            return None
+        side, pos_side, close_side = "SELL", "SHORT", "BUY"
+
+        required_margin = qty * entry / T2_LEVERAGE
+        avail = get_available_margin()
+        if avail is not None and avail < required_margin * 1.05:
+            print(f"[T2 MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f}")
+            return "MARGIN_SKIP"
+
+        order_id = place_market_order(symbol, side, qty, pos_side)
+        print(f"[T2 ORDER] {symbol} SHORT qty={qty} risk=${T2_RISK_USDT}: {order_id}")
+        if order_id != "N/A" and order_id != "MARGIN_SKIP":
+            time.sleep(0.5)
+            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
+            slip_pct = abs(entry_fill - entry) / entry * 100 if entry > 0 else 0.0
+            print(f"[T2 SLIP] {symbol} signal={entry} fill={entry_fill} slip={slip_pct:.3f}%")
+            if slip_pct > T3_SLIP_ALERT_PCT:
+                send_tg(f"⚠️ TIGHT 2 {symbol}: fill slipped {slip_pct:.2f}% (signal {entry} -> fill {entry_fill}). Kept - logging.")
+            rd = abs(sl - entry_fill)
+            if rd <= 0:
+                rd = risk_dist
+            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl, qty)
+            if sl_id is None:
+                print(f"[T2 SL GUARD] {symbol} SL failed twice - emergency close")
+                place_market_order(symbol, close_side, qty, pos_side)
+                send_tg(f"⚠️ TIGHT 2 {symbol}: SL placement failed - position emergency-closed")
+                return None
+            tp_price = round(entry_fill - rd * T2_TP_R, 6)   # short TP below entry
+            tp_id = place_tp_guarded(symbol, close_side, pos_side, tp_price, qty, label="TP-" + str(T2_TP_R) + "R")
+            t2_open_trades[str(order_id)] = {
+                "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
+                "sl": sl, "sl_id": sl_id, "tp": tp_price, "tp_id": tp_id,
+                "total_qty": qty, "close_side": close_side, "pos_side": pos_side,
+                "risk_dist": rd, "risk_usdt": T2_RISK_USDT,
+                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+            }
+        return order_id
+    except Exception as e:
+        print(f"[T2 ORDER ERROR] {symbol}: {e}")
+        return None
+
+def track_t2_trades(open_syms=None):
+    for oid in list(t2_open_trades.keys()):
+        trade = t2_open_trades.get(oid)
+        if not trade:
+            continue
+        symbol = trade["symbol"]
+        entry_ref = trade.get("entry_fill", trade["entry"])
+        try:
+            # ---- TP fill ----
+            tp_status = check_order_status(trade["tp_id"], symbol) if trade.get("tp_id") and trade["tp_id"] != "N/A" else ""
+            if tp_status == "FILLED":
+                tp_fill = get_fill_price(trade["tp_id"], symbol, fallback=trade["tp"])
+                leg_pnl = (entry_ref - tp_fill) * trade["total_qty"]     # short
+                if trade.get("sl_id"):
+                    cancel_order(symbol, trade["sl_id"])
+                trade["pnl"]    = round(leg_pnl, 2)
+                trade["result"] = "TP"
+                trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T2_RISK_USDT), 2) if trade.get("risk_usdt") else round(T2_TP_R, 2)
+                trade["label"]  = "Tight 2"
+                daily_trades.append(trade)
+                journal_closed_trade(trade)
+                t2_open_trades.pop(oid, None)
+                print(f"[T2 CLOSE] {symbol} TP pnl={trade['pnl']}")
+                continue
+            # ---- SL fill ----
+            sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
+            if sl_status == "FILLED":
+                sl_fill = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
+                leg_pnl = (entry_ref - sl_fill) * trade["total_qty"]     # short
+                if trade.get("tp_id") and trade["tp_id"] != "N/A":
+                    cancel_order(symbol, trade["tp_id"])
+                trade["pnl"]    = round(leg_pnl, 2)
+                trade["result"] = "SL"
+                trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T2_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
+                trade["label"]  = "Tight 2"
+                daily_trades.append(trade)
+                journal_closed_trade(trade)
+                t2_open_trades.pop(oid, None)
+                print(f"[T2 CLOSE] {symbol} SL pnl={trade['pnl']} R={trade['exit_r']}")
+                continue
+            # ---- liquidation (position gone, no TP/SL fill) ----
+            if open_syms is not None and symbol not in open_syms:
+                if confirm_liquidated(symbol, trade):
+                    journal_liquidation(trade, "Tight 2")
+                    t2_open_trades.pop(oid, None)
+                    continue
+        except Exception as e:
+            print(f"[T2 TRACK {symbol}] error: {e}")
+
+def t2_loop():
+    print("Tight 2 loop started - Trapped-Block Fade (short: block map every 4h -> return-into-level + volume-exhaustion -> 4R TP)")
+    all_symbols = []
+    last_block  = 0.0
+    last_entry  = 0.0
+    while True:
+        try:
+            if api_backoff_active():
+                time.sleep(30)
+                continue
+            if time.time() - last_block >= T2_BLOCK_SCAN_SECONDS or last_block == 0:
+                if not all_symbols:
+                    all_symbols = get_futures_symbols() or []
+                t2_build_blocks(all_symbols)
+                last_block = time.time()
+
+            if time.time() - last_entry >= T2_ENTRY_CHECK_SECONDS:
+                checked = 0
+                for sym, blocks in list(t2_blocks.items()):
+                    if api_backoff_active():
+                        break
+                    if not t2_auto_trade_enabled:
+                        break
+                    if t2_total_open() >= SHARED_MAX_CONCURRENT:   # shared T1+T2 cap
+                        break
+                    if t2_symbol_has_open_trade(sym) or t2_in_cooldown(sym):
+                        continue
+                    t2_check_entry(sym, blocks)
+                    checked += 1
+                    time.sleep(0.2)
+                last_entry = time.time()
+                print(f"[T2 SCAN] blocks={len(t2_blocks)} checked={checked} open={len(t2_open_trades)} auto={t2_auto_trade_enabled}")
+        except Exception as e:
+            print(f"[T2 LOOP ERROR] {e}")
+        time.sleep(60)
+# ==================== END TIGHT 2 ====================
 def send_daily_summary():
     global daily_trades, last_summary_date
     nzt   = timezone(timedelta(hours=12))
@@ -2062,7 +2334,7 @@ def trailing_loop():
             # tracker still checks whether its SL/TP survived on the exchange. If the
             # fetch itself errored we pass open_syms=None so trackers skip entirely.
             open_syms = None
-            have_open = bool(cf_open_trades or rsi_open_trades or t3_open_trades)
+            have_open = bool(cf_open_trades or rsi_open_trades or t3_open_trades or t2_open_trades)
             if have_open:
                 positions = get_open_positions()
                 # get_open_positions returns [] on genuine flat AND on API failure. We
@@ -2077,6 +2349,8 @@ def trailing_loop():
                 track_rsi_trades(open_syms)
             if t3_open_trades:
                 track_t3_trades(open_syms)
+            if t2_open_trades:
+                track_t2_trades(open_syms)
             send_daily_summary()
         except Exception as e:
             print(f"[TRAIL LOOP ERROR] {e}")
@@ -2085,7 +2359,7 @@ def trailing_loop():
 
 # ==================== TELEGRAM COMMANDS ====================
 def handle_telegram_commands():
-    global rsi_auto_trade_enabled, cf_auto_trade_enabled, t3_auto_trade_enabled
+    global rsi_auto_trade_enabled, cf_auto_trade_enabled, t3_auto_trade_enabled, t2_auto_trade_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2112,13 +2386,13 @@ def handle_telegram_commands():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != str(TG_CHAT_ID):
                     continue
-                # ---- RSI Reversion (kept on the old Tight tokens: /start /stop) ----
+                # ---- Tight 2 Trapped-Block Fade (on the old Tight tokens: /start /stop) ----
                 if text == "/start":
-                    rsi_auto_trade_enabled = True
-                    send_tg("RSI Reversion Auto-trade ON.")
+                    t2_auto_trade_enabled = True
+                    send_tg("Tight 2 (Trapped-Block Fade) Auto-trade ON.")
                 elif text == "/stop":
-                    rsi_auto_trade_enabled = False
-                    send_tg("RSI Reversion Auto-trade OFF.")
+                    t2_auto_trade_enabled = False
+                    send_tg("Tight 2 (Trapped-Block Fade) Auto-trade OFF.")
                 # ---- Crash Fade (kept on the old Fast tokens: /fast_start /fast_stop) ----
                 elif text == "/fast_start":
                     cf_auto_trade_enabled = True
@@ -2133,16 +2407,17 @@ def handle_telegram_commands():
                 elif text == "/t1_stop":
                     t3_auto_trade_enabled = False
                     send_tg("Tight 1 Auto-trade OFF.")
-                elif text in ("/status", "/rsi_status"):
-                    rs = "ON" if rsi_auto_trade_enabled else "OFF"
+                elif text in ("/status", "/t2_status"):
+                    rs = "ON" if t2_auto_trade_enabled else "OFF"
                     cf = "ON" if cf_auto_trade_enabled  else "OFF"
                     backoff = ""
                     if api_backoff_active():
                         backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
-                    send_tg("RSI Reversion: " + rs + " | Open: " + str(len(rsi_open_trades)) +
+                    send_tg("Tight 2 (Fade): " + rs + " | Open: " + str(len(t2_open_trades)) + " | Blocks: " + str(len(t2_blocks)) +
                             "\nCrash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
                             " | Pending: " + str(len(cf_pending)) +
-                            "\nTight 1: " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open: " + str(len(t3_open_trades)) + backoff)
+                            "\nTight 1: " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open: " + str(len(t3_open_trades)) +
+                            "\nShared cap: " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + backoff)
                 elif text == "/fast_status":
                     cf = "ON" if cf_auto_trade_enabled else "OFF"
                     pend = ""
@@ -2185,7 +2460,7 @@ if __name__ == "__main__":
         print(f"[STARTUP ADOPT ERROR] {e}")
 
     Thread(target=cf_scan_loop,             daemon=True).start()
-    Thread(target=rsi_scan_loop,            daemon=True).start()
+    Thread(target=t2_loop,                  daemon=True).start()   # Tight 2 fade (replaces retired RSI on /start /stop)
     Thread(target=trailing_loop,            daemon=True).start()
     Thread(target=t3_loop,                  daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()

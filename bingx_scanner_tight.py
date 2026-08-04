@@ -174,6 +174,15 @@ def build_signed_params(params: dict) -> dict:
     return params
 
 
+def is_tokenized_stock(sym):
+    """BingX lists tokenized STOCK perps (SanDisk, SK Hynix, SOXL, etc) that also end
+    in -USDT, so a plain 'USDT in symbol' check lets them through. They share a clear
+    naming pattern: an 'NCSK' prefix and/or a '2USD-USDT' quote tail (e.g.
+    NCSKSNDK2USD-USDT, NCSKSKHYNIX2USD-USDT, ...SOXL2USD-USDT). All strategies are
+    validated on CRYPTO only, so these must be excluded from the universe entirely."""
+    s = sym.upper()
+    return s.startswith("NCSK") or "2USD-USDT" in s or "2USD_USDT" in s
+
 def get_futures_symbols():
     url = BASE_URL + "/openApi/swap/v2/quote/contracts"
     r = requests.get(url, timeout=10).json()
@@ -181,6 +190,8 @@ def get_futures_symbols():
     for c in r.get("data", []):
         if c.get("status") == 1 and "USDT" in c["symbol"]:
             sym = c["symbol"]
+            if is_tokenized_stock(sym):        # skip tokenized stock perps - crypto only
+                continue
             symbols.append(sym)
             symbol_precision[sym] = int(c.get("quantityPrecision", 4))
             try:
@@ -1569,9 +1580,9 @@ T3_TRAIL_GAP_R            = float(os.environ.get("T3_TRAIL_GAP_R", 2.0))        
 T3_TRAIL_STEP_R           = float(os.environ.get("T3_TRAIL_STEP_R", 0.5))        # only re-place the exchange SL when it improves by >=0.5R - not every 30s tick
 T3_COOLDOWN_SECONDS       = int(os.environ.get("T3_COOLDOWN_SECONDS", 604800))   # 7 days per coin after a signal fires, win or lose
 T3_MAX_CONCURRENT_TRADES  = 2      # hardcoded for $100 account (2026-07-18 sizing policy)
-T3_RISK_USDT              = 2.0    # hardcoded for $100 account, same scaling plan as Tight/Fast: $150->3, $250->4, $350->5
+T3_RISK_USDT              = 5.0    # 2026-08-05: 2->5 per Faisal. $100 acct, ~5% risk/trade. margin follows ~$6-10 (SL at structure, NOT moved in to inflate margin).
 T3_LEVERAGE               = int(os.environ.get("T3_LEVERAGE", 10))   # 10x not 20x - $300k-liquidity pairs, wider structural SLs
-T3_MAX_MARGIN_USDT        = 25.0
+T3_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so a $5-risk trade with a wide (structure) SL is never shrunk by the margin cap below its intended risk
 T3_ATR_LEN                = 14
 T3_SL_ATR_BUFFER_MULT     = 0.3
 T3_CHASE_SL_ATR_MULT      = float(os.environ.get("T3_CHASE_SL_ATR_MULT", 1.5))   # 2026-07-30 chase: SL = entry -/+ 1.5xATR(15m). Tune-swept best (1.0/2.0/2.5 all worse), holdout-OK.
@@ -1597,9 +1608,9 @@ T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline me
 T2_BLOCK_SCAN_SECONDS     = int(os.environ.get("T2_BLOCK_SCAN_SECONDS", 14400))  # rebuild block map every 4h (1 daily request per symbol)
 T2_ENTRY_CHECK_SECONDS    = int(os.environ.get("T2_ENTRY_CHECK_SECONDS", 300))
 T2_COOLDOWN_SECONDS       = int(os.environ.get("T2_COOLDOWN_SECONDS", 86400))    # 1 day per coin after a fade fires
-T2_RISK_USDT              = 2.0
+T2_RISK_USDT              = 5.0    # 2026-08-05: 2->5 per Faisal (~5% risk on $100). SL stays at block level; size scales up, margin follows (~$6-10 typical).
 T2_LEVERAGE               = int(os.environ.get("T2_LEVERAGE", 10))
-T2_MAX_MARGIN_USDT        = 25.0
+T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk
 T2_MAX_SYMBOLS            = int(os.environ.get("T2_MAX_SYMBOLS", 250))
 T2_EXCLUDE_TOP_N          = int(os.environ.get("T2_EXCLUDE_TOP_N", 0))     # 2026-08-04: 75->0, INCLUDE majors - big coins form clean trapped-blocks too, excluding them halved signals (block-syms 51->81)
 

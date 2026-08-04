@@ -1584,13 +1584,14 @@ T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))     
 # "trapped block" resistance when price returns up into it on declining volume
 # (demand exhaustion). Backtest (15m 8mo, band5/dump18, TP4/buf1.0/exh0.8):
 # max2 win 52% $144 DD -$8; holdout A+1.51/B+1.09; random -0.445; 8/9 months+.
-T2_RET_BAND_PCT           = float(os.environ.get("T2_RET_BAND_PCT", 5.0))    # price within this % of block level = "returned into level"
+T2_RET_BAND_PCT           = float(os.environ.get("T2_RET_BAND_PCT", 6.0))    # 2026-08-04: 5->6, wider retest zone raises win 50->54% (trapped selling starts before price exactly reaches level)
 T2_DUMP_PCT               = float(os.environ.get("T2_DUMP_PCT", 18.0))       # block qualifies only if its close later fell >= this % within lookahead
 T2_DUMP_LOOKAHEAD_DAYS    = int(os.environ.get("T2_DUMP_LOOKAHEAD_DAYS", 5))
-T2_VOL_SPIKE              = float(os.environ.get("T2_VOL_SPIKE", 3.0))        # block day vol >= this x trailing-5d median
-T2_VOL_EXHAUSTION         = float(os.environ.get("T2_VOL_EXHAUSTION", 0.8))  # entry only if current 15m vol < this x median(last 20). Tighter than 1.0 halves DD.
-T2_SL_ATR_BUF             = float(os.environ.get("T2_SL_ATR_BUF", 1.0))      # SL = block_high + this x ATR(15m)
+T2_VOL_SPIKE              = float(os.environ.get("T2_VOL_SPIKE", 1.8))       # 2026-08-04: 3->1.8, 3x too strict (only 12 live blocks); 1.8x ~3x more blocks, edge intact, fixes no-trades
+T2_VOL_EXHAUSTION         = float(os.environ.get("T2_VOL_EXHAUSTION", 0))    # 2026-08-04: DISABLED (0=off). exh0.8 killed 87% of signals (only starved, not helped) - exhOFF has more trades, higher win, better holdout.
+T2_SL_ATR_BUF             = float(os.environ.get("T2_SL_ATR_BUF", 0.5))      # 2026-08-04: 1.0->0.5, SL nearer level = smaller R = more R per move ($147->$190)
 T2_TP_R                   = float(os.environ.get("T2_TP_R", 4.0))            # fixed reduce-only TP at 4R (win-neutral vs 3R, +PnL)
+T2_BLOCK_MAX_AGE_DAYS     = int(os.environ.get("T2_BLOCK_MAX_AGE_DAYS", 10)) # 2026-08-04 biggest refinement: only fade blocks formed within last 10d. Old blocks' trapped holders already exited (level dead); fresh blocks still have active trapped selling. win 54->62%, $222->$252, DD-$11->-$8.
 T2_ATR_LEN                = 14
 T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline median volume
 T2_BLOCK_SCAN_SECONDS     = int(os.environ.get("T2_BLOCK_SCAN_SECONDS", 14400))  # rebuild block map every 4h (1 daily request per symbol)
@@ -1600,7 +1601,7 @@ T2_RISK_USDT              = 2.0
 T2_LEVERAGE               = int(os.environ.get("T2_LEVERAGE", 10))
 T2_MAX_MARGIN_USDT        = 25.0
 T2_MAX_SYMBOLS            = int(os.environ.get("T2_MAX_SYMBOLS", 250))
-T2_EXCLUDE_TOP_N          = int(os.environ.get("T2_EXCLUDE_TOP_N", 75))
+T2_EXCLUDE_TOP_N          = int(os.environ.get("T2_EXCLUDE_TOP_N", 0))     # 2026-08-04: 75->0, INCLUDE majors - big coins form clean trapped-blocks too, excluding them halved signals (block-syms 51->81)
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
@@ -2119,12 +2120,15 @@ def t2_check_entry(symbol, blocks):
             return
         vol_window = vols[-21:-1] if len(vols) >= 21 else vols[:-1]
         vmed = sorted(vol_window)[len(vol_window) // 2] if vol_window else cur_vol
-        if cur_vol > T2_VOL_EXHAUSTION * vmed:      # demand not exhausted -> skip
+        if T2_VOL_EXHAUSTION > 0 and cur_vol > T2_VOL_EXHAUSTION * vmed:   # 0 = filter disabled
             return
         now_ms = int(c_last["time"])
+        max_age_ms = T2_BLOCK_MAX_AGE_DAYS * 86400000
         for lvl, formed_ms in blocks:
             if formed_ms >= now_ms:
                 continue
+            if T2_BLOCK_MAX_AGE_DAYS > 0 and (now_ms - formed_ms) > max_age_ms:
+                continue   # stale block - trapped holders already exited, level dead
             # price returning up INTO the level from below (band around lvl), close still below
             if price < lvl and hi >= lvl * (1 - T2_RET_BAND_PCT / 100) and hi <= lvl * (1 + T2_RET_BAND_PCT / 100):
                 sl = round(lvl + atr_now * T2_SL_ATR_BUF, 6)
@@ -2386,38 +2390,61 @@ def handle_telegram_commands():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != str(TG_CHAT_ID):
                     continue
-                # ---- Tight 2 Trapped-Block Fade (on the old Tight tokens: /start /stop) ----
-                if text == "/start":
+                # ---- Tight 2 Trapped-Block Fade: /t2_start /t2_stop (/start /stop alias) ----
+                if text in ("/t2_start", "/start"):
                     t2_auto_trade_enabled = True
                     send_tg("Tight 2 (Trapped-Block Fade) Auto-trade ON.")
-                elif text == "/stop":
+                elif text in ("/t2_stop", "/stop"):
                     t2_auto_trade_enabled = False
                     send_tg("Tight 2 (Trapped-Block Fade) Auto-trade OFF.")
-                # ---- Crash Fade (kept on the old Fast tokens: /fast_start /fast_stop) ----
+                # ---- Tight 1 Dormant Awakening (chase): /t1_start /t1_stop ----
+                elif text == "/t1_start":
+                    t3_auto_trade_enabled = True
+                    send_tg("Tight 1 (Dormant Awakening) Auto-trade ON.")
+                elif text == "/t1_stop":
+                    t3_auto_trade_enabled = False
+                    send_tg("Tight 1 (Dormant Awakening) Auto-trade OFF.")
+                # ---- Crash Fade: /fast_start /fast_stop ----
                 elif text == "/fast_start":
                     cf_auto_trade_enabled = True
                     send_tg("Crash Fade Auto-trade ON.")
                 elif text == "/fast_stop":
                     cf_auto_trade_enabled = False
                     send_tg("Crash Fade Auto-trade OFF.")
-                # ---- Tight 1 (unchanged) ----
-                elif text == "/t1_start":
-                    t3_auto_trade_enabled = True
-                    send_tg("Tight 1 Auto-trade ON.")
-                elif text == "/t1_stop":
-                    t3_auto_trade_enabled = False
-                    send_tg("Tight 1 Auto-trade OFF.")
-                elif text in ("/status", "/t2_status"):
-                    rs = "ON" if t2_auto_trade_enabled else "OFF"
-                    cf = "ON" if cf_auto_trade_enabled  else "OFF"
+                # ---- /status : everything at a glance ----
+                elif text == "/status":
                     backoff = ""
                     if api_backoff_active():
                         backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
-                    send_tg("Tight 2 (Fade): " + rs + " | Open: " + str(len(t2_open_trades)) + " | Blocks: " + str(len(t2_blocks)) +
-                            "\nCrash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
-                            " | Pending: " + str(len(cf_pending)) +
-                            "\nTight 1: " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open: " + str(len(t3_open_trades)) +
-                            "\nShared cap: " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + backoff)
+                    send_tg(
+                        "===== NITI BOT STATUS =====\n"
+                        "Tight 1 (Awakening): " + ("ON" if t3_auto_trade_enabled else "OFF") +
+                        " | Open: " + str(len(t3_open_trades)) + " | Watchlist: " + str(len(t3_watchlist)) + " | Awakened: " + str(len(t3_watch)) + "\n"
+                        "Tight 2 (Fade): " + ("ON" if t2_auto_trade_enabled else "OFF") +
+                        " | Open: " + str(len(t2_open_trades)) + " | Blocks: " + str(len(t2_blocks)) + "\n"
+                        "Crash Fade: " + ("ON" if cf_auto_trade_enabled else "OFF") +
+                        " | Open: " + str(len(cf_open_trades)) + " | Pending: " + str(len(cf_pending)) + "\n"
+                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + backoff
+                    )
+                # ---- per-strategy detail ----
+                elif text == "/t2_status":
+                    lines2 = ("Tight 2 (Fade): " + ("ON" if t2_auto_trade_enabled else "OFF") +
+                              " | Blocks: " + str(len(t2_blocks)) + " | Open: " + str(len(t2_open_trades)))
+                    for _oid2, t2t in list(t2_open_trades.items()):
+                        lines2 += ("\n" + t2t["symbol"] + " SHORT | entry " + str(t2t["entry"]) +
+                                   " | SL " + str(t2t["sl"]) + " | TP " + str(t2t.get("tp", "?")))
+                    send_tg(lines2)
+                elif text == "/t1_status":
+                    lines3 = ("Tight 1 (Awakening): " + ("ON" if t3_auto_trade_enabled else "OFF") +
+                              " | Watchlist: " + str(len(t3_watchlist)) +
+                              " | Awakened: " + str(len(t3_watch)) + " | Open: " + str(len(t3_open_trades)))
+                    for s, st3 in list(t3_watch.items()):
+                        hrs = max(0, int((st3["expiry_ts"] - time.time()) / 3600))
+                        lines3 += "\n" + s + " " + st3["side"] + " - awaiting chase entry (" + str(hrs) + "h left)"
+                    for _oid3, t3t in list(t3_open_trades.items()):
+                        lines3 += ("\n" + t3t["symbol"] + " " + t3t["side"] + " open | peak " +
+                                   str(round(t3t.get("peak_r", 0), 1)) + "R | SL " + str(t3t["sl"]))
+                    send_tg(lines3)
                 elif text == "/fast_status":
                     cf = "ON" if cf_auto_trade_enabled else "OFF"
                     pend = ""
@@ -2426,18 +2453,6 @@ def handle_telegram_commands():
                         pend += "\n" + s + " dip-buy @ " + str(round(p["bid"], 6)) + " (" + str(mins_left) + "min left)"
                     send_tg("Crash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
                             " | Pending: " + str(len(cf_pending)) + pend)
-                elif text == "/t1_status":
-                    s3 = "ON" if t3_auto_trade_enabled else "OFF"
-                    lines3 = ("Tight 1: " + s3 + " | Watchlist: " + str(len(t3_watchlist)) +
-                              " | Awakened: " + str(len(t3_watch)) + " | Open: " + str(len(t3_open_trades)))
-                    for s, st3 in list(t3_watch.items()):
-                        hrs = max(0, int((st3["expiry_ts"] - time.time()) / 3600))
-                        stage = ("setup ready, trigger " + str(round(st3["trigger"], 6))) if st3.get("trigger") is not None else "waiting for pullback"
-                        lines3 += "\n" + s + " " + st3["side"] + " - " + stage + " (" + str(hrs) + "h left)"
-                    for _oid3, t3t in list(t3_open_trades.items()):
-                        lines3 += ("\n" + t3t["symbol"] + " " + t3t["side"] + " open | peak " +
-                                   str(round(t3t.get("peak_r", 0), 1)) + "R | SL " + str(t3t["sl"]))
-                    send_tg(lines3)
         except Exception as e:
             print(f"[TG CMD] error: {e}")
         time.sleep(1)

@@ -1567,7 +1567,7 @@ T3_MAX_WATCHLIST          = int(os.environ.get("T3_MAX_WATCHLIST", 150))        
 T3_DORMANCY_DAYS          = int(os.environ.get("T3_DORMANCY_DAYS", 5))
 T3_DORMANCY_RANGE_PCT     = float(os.environ.get("T3_DORMANCY_RANGE_PCT", 25.0)) # total close band width = +/-15% around mid
 T3_DORMANCY_VOL_SPIKE_MAX = float(os.environ.get("T3_DORMANCY_VOL_SPIKE_MAX", 3.0))   # any day >3x median inside the window = already awakened earlier, not dormant
-T3_AWAKE_VOL_MULT         = float(os.environ.get("T3_AWAKE_VOL_MULT", 3.0))      # 2026-07-30: 5x->3x, backtest-verified 9.4 trades/wk +$391/8mo (was 4.7/wk $213), holdout-OK both sets. Fixes "no trades for a week". If it spams try 4x; 2.5x gives more but clusters max2 slots.
+T3_AWAKE_VOL_MULT         = 3.0      # HARDCODED. 5x->3x: 9.4 trades/wk +$391/8mo, holdout-OK both sets.
 T3_DORMANCY_SCAN_SECONDS  = int(os.environ.get("T3_DORMANCY_SCAN_SECONDS", 14400))   # rebuild watchlist every 4h (1 daily-candle request per symbol)
 T3_AWAKE_CHECK_SECONDS    = int(os.environ.get("T3_AWAKE_CHECK_SECONDS", 300))
 T3_SETUP_EXPIRY_SECONDS   = int(os.environ.get("T3_SETUP_EXPIRY_SECONDS", 172800))   # 48h to form a pullback entry after the awakening, else skip
@@ -1595,28 +1595,29 @@ T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))     
 # "trapped block" resistance when price returns up into it on declining volume
 # (demand exhaustion). Backtest (15m 8mo, band5/dump18, TP4/buf1.0/exh0.8):
 # max2 win 52% $144 DD -$8; holdout A+1.51/B+1.09; random -0.445; 8/9 months+.
-T2_RET_BAND_PCT           = float(os.environ.get("T2_RET_BAND_PCT", 6.0))    # 2026-08-04: 5->6, wider retest zone raises win 50->54% (trapped selling starts before price exactly reaches level)
-T2_DUMP_PCT               = float(os.environ.get("T2_DUMP_PCT", 18.0))       # block qualifies only if its close later fell >= this % within lookahead
-T2_DUMP_LOOKAHEAD_DAYS    = int(os.environ.get("T2_DUMP_LOOKAHEAD_DAYS", 5))
-T2_VOL_SPIKE              = float(os.environ.get("T2_VOL_SPIKE", 1.8))       # 2026-08-04: 3->1.8, 3x too strict (only 12 live blocks); 1.8x ~3x more blocks, edge intact, fixes no-trades
-T2_VOL_EXHAUSTION         = float(os.environ.get("T2_VOL_EXHAUSTION", 0))    # 2026-08-04: DISABLED (0=off). exh0.8 killed 87% of signals (only starved, not helped) - exhOFF has more trades, higher win, better holdout.
-T2_SL_ATR_BUF             = float(os.environ.get("T2_SL_ATR_BUF", 0.5))      # 2026-08-04: 1.0->0.5, SL nearer level = smaller R = more R per move ($147->$190)
-T2_TP_R                   = float(os.environ.get("T2_TP_R", 4.0))            # fixed reduce-only TP at 4R (win-neutral vs 3R, +PnL)
-T2_BLOCK_MAX_AGE_DAYS     = int(os.environ.get("T2_BLOCK_MAX_AGE_DAYS", 10)) # 2026-08-04 biggest refinement: only fade blocks formed within last 10d. Old blocks' trapped holders already exited (level dead); fresh blocks still have active trapped selling. win 54->62%, $222->$252, DD-$11->-$8.
+T2_RET_BAND_PCT           = 6.0    # HARDCODED. wider retest zone raises win 50->54%
+T2_DUMP_PCT               = 18.0   # HARDCODED. block qualifies if price moved >= this % within lookahead
+T2_DUMP_LOOKAHEAD_DAYS    = 5      # HARDCODED
+T2_VOL_SPIKE              = 1.8    # HARDCODED. 3->1.8: ~3x more blocks, edge intact, fixes no-trades
+T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
+T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
+T2_TP_R                   = 4.0    # HARDCODED. fixed reduce-only TP at 4R
+T2_BLOCK_MAX_AGE_DAYS     = 30     # HARDCODED. only trade blocks formed within last 30d (fresh = active trapped holders). fixes dry spells.
+T2_LONG_SIDE              = True   # HARDCODED. both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
 T2_ATR_LEN                = 14
 T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline median volume
-T2_BLOCK_SCAN_SECONDS     = int(os.environ.get("T2_BLOCK_SCAN_SECONDS", 14400))  # rebuild block map every 4h (1 daily request per symbol)
-T2_ENTRY_CHECK_SECONDS    = int(os.environ.get("T2_ENTRY_CHECK_SECONDS", 300))
-T2_COOLDOWN_SECONDS       = int(os.environ.get("T2_COOLDOWN_SECONDS", 86400))    # 1 day per coin after a fade fires
+T2_BLOCK_SCAN_SECONDS     = 14400  # HARDCODED. rebuild block map every 4h
+T2_ENTRY_CHECK_SECONDS    = 300    # HARDCODED. check entries every 5min
+T2_COOLDOWN_SECONDS       = 86400  # HARDCODED. 1 day per coin after a fire
 T2_RISK_USDT              = 5.0    # 2026-08-05: 2->5 per Faisal (~5% risk on $100). SL stays at block level; size scales up, margin follows (~$6-10 typical).
-T2_LEVERAGE               = int(os.environ.get("T2_LEVERAGE", 10))
+T2_LEVERAGE               = 10     # HARDCODED
 T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk
-T2_MAX_SYMBOLS            = int(os.environ.get("T2_MAX_SYMBOLS", 250))
-T2_EXCLUDE_TOP_N          = int(os.environ.get("T2_EXCLUDE_TOP_N", 0))     # 2026-08-04: 75->0, INCLUDE majors - big coins form clean trapped-blocks too, excluding them halved signals (block-syms 51->81)
+T2_MAX_SYMBOLS            = 250    # HARDCODED
+T2_EXCLUDE_TOP_N          = 0      # HARDCODED. INCLUDE majors - they form clean blocks too
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
-SHARED_MAX_CONCURRENT     = int(os.environ.get("SHARED_MAX_CONCURRENT", 2))
+SHARED_MAX_CONCURRENT     = 2      # HARDCODED. T1+T2 together = max 2 open on $100 acct
 
 t2_auto_trade_enabled = AUTO_RESUME_ON_START
 t2_blocks       = {}    # symbol -> list of (resistance_level, formed_day_ms)
@@ -2074,10 +2075,12 @@ def t2_symbol_has_open_trade(symbol):
     return any(t["symbol"] == symbol for t in t2_open_trades.values())
 
 def t2_build_blocks(all_symbols):
-    """For each symbol, build the list of trapped-block resistance levels from
-    DAILY candles: a day whose volume >= T2_VOL_SPIKE x trailing-5d median and
-    whose close then FELL >= T2_DUMP_PCT within the next T2_DUMP_LOOKAHEAD_DAYS.
-    That day's HIGH is the resistance (trapped longs). Rebuilt every 4h."""
+    """For each symbol, build BOTH block types from DAILY candles:
+    - RESISTANCE block (short): day vol >= T2_VOL_SPIKE x trailing-5d median whose close
+      then FELL >= T2_DUMP_PCT within lookahead. Day HIGH = resistance (trapped longs).
+    - DEMAND block (long): same volume spike but whose price then ROSE >= T2_DUMP_PCT.
+      Day LOW = support (trapped shorts). Mirror edge, validated 2026-08-05.
+    Each block stored as (level, formed_ms, side) with side 'S' or 'L'. Rebuilt every 4h."""
     syms = get_liquid_symbols(all_symbols, min_quote_vol=T3_MIN_QUOTE_VOL, max_n=T2_MAX_SYMBOLS, exclude_top_n=T2_EXCLUDE_TOP_N)
     new_blocks = {}
     for sym in syms:
@@ -2098,9 +2101,16 @@ def t2_build_blocks(all_symbols):
                 med = sorted(window)[len(window) // 2] if window else 0
                 if med <= 0 or vols[i] < T2_VOL_SPIKE * med:
                     continue
-                fut_low = min(lows[i + 1:i + 1 + T2_DUMP_LOOKAHEAD_DAYS])
-                if closes[i] > 0 and (closes[i] - fut_low) / closes[i] * 100 >= T2_DUMP_PCT:
-                    blocks.append((highs[i], times[i]))
+                if closes[i] <= 0:
+                    continue
+                fut_low  = min(lows[i + 1:i + 1 + T2_DUMP_LOOKAHEAD_DAYS])
+                fut_high = max(highs[i + 1:i + 1 + T2_DUMP_LOOKAHEAD_DAYS])
+                # resistance block -> short (price fell after the spike)
+                if (closes[i] - fut_low) / closes[i] * 100 >= T2_DUMP_PCT:
+                    blocks.append((highs[i], times[i], "S"))
+                # demand block -> long (price rose after the spike)
+                if T2_LONG_SIDE and (fut_high - closes[i]) / closes[i] * 100 >= T2_DUMP_PCT:
+                    blocks.append((lows[i], times[i], "L"))
             if blocks:
                 new_blocks[sym] = blocks
             time.sleep(0.2)
@@ -2108,11 +2118,13 @@ def t2_build_blocks(all_symbols):
             print(f"[T2 BLOCK {sym}] error: {e}")
     t2_blocks.clear()
     t2_blocks.update(new_blocks)
-    print(f"[T2 BLOCKS] built for {len(t2_blocks)} symbols")
+    n_s = sum(1 for bl in t2_blocks.values() for b in bl if b[2] == "S")
+    n_l = sum(1 for bl in t2_blocks.values() for b in bl if b[2] == "L")
+    print(f"[T2 BLOCKS] built for {len(t2_blocks)} symbols (short-blocks={n_s} long-blocks={n_l})")
 
 def t2_check_entry(symbol, blocks):
-    """On 15m: if price is returning UP into a past block level (within band) from
-    below, on declining volume (< T2_VOL_EXHAUSTION x median-of-last-20), SHORT."""
+    """On 15m: SHORT when price returns UP into a resistance block; LONG when price
+    returns DOWN into a demand block. Both within band, fresh block only."""
     try:
         candles = get_candles(symbol, limit=40, interval="15m")
         if len(candles) < 22:
@@ -2121,6 +2133,7 @@ def t2_check_entry(symbol, blocks):
         c_last = confirmed[-1]
         price  = cl(c_last)
         hi     = h(c_last)
+        lo     = l(c_last)
         cur_vol = v(c_last)
         highs  = [h(x)  for x in confirmed]
         lows   = [l(x)  for x in confirmed]
@@ -2135,18 +2148,29 @@ def t2_check_entry(symbol, blocks):
             return
         now_ms = int(c_last["time"])
         max_age_ms = T2_BLOCK_MAX_AGE_DAYS * 86400000
-        for lvl, formed_ms in blocks:
+        for blk in blocks:
+            lvl, formed_ms = blk[0], blk[1]
+            side = blk[2] if len(blk) > 2 else "S"
             if formed_ms >= now_ms:
                 continue
             if T2_BLOCK_MAX_AGE_DAYS > 0 and (now_ms - formed_ms) > max_age_ms:
                 continue   # stale block - trapped holders already exited, level dead
-            # price returning up INTO the level from below (band around lvl), close still below
-            if price < lvl and hi >= lvl * (1 - T2_RET_BAND_PCT / 100) and hi <= lvl * (1 + T2_RET_BAND_PCT / 100):
-                sl = round(lvl + atr_now * T2_SL_ATR_BUF, 6)
-                if sl <= price:
-                    continue
-                t2_fire_entry(symbol, price, sl)
-                return
+            if side == "S":
+                # price returning UP into resistance from below (band), close still below → SHORT
+                if price < lvl and hi >= lvl * (1 - T2_RET_BAND_PCT / 100) and hi <= lvl * (1 + T2_RET_BAND_PCT / 100):
+                    sl = round(lvl + atr_now * T2_SL_ATR_BUF, 6)
+                    if sl <= price:
+                        continue
+                    t2_fire_entry(symbol, price, sl, "SELL")
+                    return
+            else:
+                # price returning DOWN into demand from above (band), close still above → LONG
+                if price > lvl and lo <= lvl * (1 + T2_RET_BAND_PCT / 100) and lo >= lvl * (1 - T2_RET_BAND_PCT / 100):
+                    sl = round(lvl - atr_now * T2_SL_ATR_BUF, 6)
+                    if sl >= price:
+                        continue
+                    t2_fire_entry(symbol, price, sl, "BUY")
+                    return
     except Exception as e:
         print(f"[T2 ENTRY {symbol}] error: {e}")
 
@@ -2154,17 +2178,23 @@ def t2_fire_entry(symbol, entry_px, sl):
     if t2_symbol_has_open_trade(symbol):
         return
     risk = sl - entry_px       # short: SL above entry
+def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
+    if t2_symbol_has_open_trade(symbol):
+        return
+    risk = abs(sl - entry_px)
     if risk <= 0:
         return
+    label = "SHORT" if side == "SELL" else "LONG"
+    kind  = "Trapped-block fade" if side == "SELL" else "Demand-block bounce"
     send_tg(
-        "TIGHT 2 SHORT - " + symbol + "\n"
+        "TIGHT 2 " + label + " - " + symbol + "\n"
         "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(T2_RISK_USDT) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
-        "Trapped-block fade | TP " + str(T2_TP_R) + "R\n"
+        + kind + " | TP " + str(T2_TP_R) + "R\n"
     )
-    place_t2_order(symbol, entry_px, sl)
+    place_t2_order(symbol, entry_px, sl, side)
     t2_last_fire[symbol] = time.time()
 
-def place_t2_order(symbol, entry, sl):
+def place_t2_order(symbol, entry, sl, side="SELL"):
     try:
         set_leverage_api(symbol, T2_LEVERAGE)
         precision = symbol_precision.get(symbol, 4)
@@ -2176,7 +2206,10 @@ def place_t2_order(symbol, entry, sl):
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
-        side, pos_side, close_side = "SELL", "SHORT", "BUY"
+        if side == "SELL":
+            pos_side, close_side = "SHORT", "BUY"
+        else:
+            pos_side, close_side = "LONG", "SELL"
 
         required_margin = qty * entry / T2_LEVERAGE
         avail = get_available_margin()
@@ -2185,7 +2218,7 @@ def place_t2_order(symbol, entry, sl):
             return "MARGIN_SKIP"
 
         order_id = place_market_order(symbol, side, qty, pos_side)
-        print(f"[T2 ORDER] {symbol} SHORT qty={qty} risk=${T2_RISK_USDT}: {order_id}")
+        print(f"[T2 ORDER] {symbol} {pos_side} qty={qty} risk=${T2_RISK_USDT}: {order_id}")
         if order_id != "N/A" and order_id != "MARGIN_SKIP":
             time.sleep(0.5)
             entry_fill = get_fill_price(order_id, symbol, fallback=entry)
@@ -2202,7 +2235,10 @@ def place_t2_order(symbol, entry, sl):
                 place_market_order(symbol, close_side, qty, pos_side)
                 send_tg(f"⚠️ TIGHT 2 {symbol}: SL placement failed - position emergency-closed")
                 return None
-            tp_price = round(entry_fill - rd * T2_TP_R, 6)   # short TP below entry
+            if side == "SELL":
+                tp_price = round(entry_fill - rd * T2_TP_R, 6)   # short TP below entry
+            else:
+                tp_price = round(entry_fill + rd * T2_TP_R, 6)   # long TP above entry
             tp_id = place_tp_guarded(symbol, close_side, pos_side, tp_price, qty, label="TP-" + str(T2_TP_R) + "R")
             t2_open_trades[str(order_id)] = {
                 "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
@@ -2223,12 +2259,13 @@ def track_t2_trades(open_syms=None):
             continue
         symbol = trade["symbol"]
         entry_ref = trade.get("entry_fill", trade["entry"])
+        is_short = trade.get("side", "SELL") == "SELL"
         try:
             # ---- TP fill ----
             tp_status = check_order_status(trade["tp_id"], symbol) if trade.get("tp_id") and trade["tp_id"] != "N/A" else ""
             if tp_status == "FILLED":
                 tp_fill = get_fill_price(trade["tp_id"], symbol, fallback=trade["tp"])
-                leg_pnl = (entry_ref - tp_fill) * trade["total_qty"]     # short
+                leg_pnl = (entry_ref - tp_fill) * trade["total_qty"] if is_short else (tp_fill - entry_ref) * trade["total_qty"]
                 if trade.get("sl_id"):
                     cancel_order(symbol, trade["sl_id"])
                 trade["pnl"]    = round(leg_pnl, 2)
@@ -2244,7 +2281,7 @@ def track_t2_trades(open_syms=None):
             sl_status = check_order_status(trade["sl_id"], symbol) if trade.get("sl_id") else ""
             if sl_status == "FILLED":
                 sl_fill = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
-                leg_pnl = (entry_ref - sl_fill) * trade["total_qty"]     # short
+                leg_pnl = (entry_ref - sl_fill) * trade["total_qty"] if is_short else (sl_fill - entry_ref) * trade["total_qty"]
                 if trade.get("tp_id") and trade["tp_id"] != "N/A":
                     cancel_order(symbol, trade["tp_id"])
                 trade["pnl"]    = round(leg_pnl, 2)

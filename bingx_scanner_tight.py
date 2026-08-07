@@ -1614,6 +1614,7 @@ T2_LEVERAGE               = 10     # HARDCODED
 T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk
 T2_MAX_SYMBOLS            = 250    # HARDCODED
 T2_EXCLUDE_TOP_N          = 0      # HARDCODED. INCLUDE majors - they form clean blocks too
+T2_MIN_QUOTE_VOL          = 1_500_000  # HARDCODED 2026-08-05: daily quote-vol floor to exclude ultra-thin coins (VELVET/BEAT-tier) that gave 1.76% entry slip live. =15k/bar in backtest where the directional edge is still intact (gap +0.057, unchanged from no-floor); a higher floor (90k/bar) LOOKED better on win% but random-dir control showed it was liquid-coin-selection bias not real edge, so kept light. Slip fix, not a curve-fit.
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
@@ -2081,7 +2082,7 @@ def t2_build_blocks(all_symbols):
     - DEMAND block (long): same volume spike but whose price then ROSE >= T2_DUMP_PCT.
       Day LOW = support (trapped shorts). Mirror edge, validated 2026-08-05.
     Each block stored as (level, formed_ms, side) with side 'S' or 'L'. Rebuilt every 4h."""
-    syms = get_liquid_symbols(all_symbols, min_quote_vol=T3_MIN_QUOTE_VOL, max_n=T2_MAX_SYMBOLS, exclude_top_n=T2_EXCLUDE_TOP_N)
+    syms = get_liquid_symbols(all_symbols, min_quote_vol=T2_MIN_QUOTE_VOL, max_n=T2_MAX_SYMBOLS, exclude_top_n=T2_EXCLUDE_TOP_N)
     new_blocks = {}
     for sym in syms:
         if api_backoff_active():

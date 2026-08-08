@@ -118,7 +118,8 @@ RSI_MAX_CONCURRENT_TRADES = int(os.environ.get("RSI_MAX_CONCURRENT_TRADES", 2))
 #   /fast_start /fast_stop -> Crash Fade engine    (was Fast)
 #   /t1_start /t1_stop   -> Tight 1 (Dormant Awakening)
 rsi_auto_trade_enabled = AUTO_RESUME_ON_START
-cf_auto_trade_enabled  = AUTO_RESUME_ON_START
+cf_auto_trade_enabled  = False   # 2026-08-08: CrashFade PERMANENTLY OFF. It has no validated edge and it opened 1000BONK at the same time as Tight 2 (uncapped), causing a duplicate position + liquidation. /fast_start is also blocked below. Do not re-enable without a shared-cap-aware rewrite.
+CF_PERMANENTLY_DISABLED = True
 symbol_precision   = {}
 symbol_max_lev     = {}
 
@@ -998,10 +999,12 @@ def cf_check_pending():
             if px > p["fill_trigger"]:
                 continue   # not dipped enough yet
             del cf_pending[symbol]
-            if symbol in cf_open_trades:
-                continue
+            if symbol in cf_open_trades or symbol in all_open_symbols():
+                continue   # cross-engine: never open a coin another engine holds
             trade_status = ""
-            if cf_auto_trade_enabled and len(cf_open_trades) >= CF_MAX_CONCURRENT_TRADES:
+            if cf_auto_trade_enabled and t2_total_open() >= SHARED_MAX_CONCURRENT:
+                trade_status = "\nSkipped - shared cap (" + str(SHARED_MAX_CONCURRENT) + ") reached"
+            elif cf_auto_trade_enabled and len(cf_open_trades) >= CF_MAX_CONCURRENT_TRADES:
                 trade_status = "\nSkipped - max concurrent trades (" + str(CF_MAX_CONCURRENT_TRADES) + ") reached"
             elif cf_auto_trade_enabled:
                 oid = place_cf_order(symbol, p["bid"], p["sl"], p["target"], p["atr15"], p["risk_usdt"])
@@ -1651,7 +1654,8 @@ def t3_in_cooldown(symbol):
 
 
 def t3_symbol_has_open_trade(symbol):
-    return any(t.get("symbol") == symbol for t in t3_open_trades.values())
+    # cross-engine: block if ANY engine (T1/T2/CF) holds this symbol
+    return symbol in all_open_symbols()
 
 
 def t3_build_watchlist(all_symbols):
@@ -2064,16 +2068,31 @@ def t3_loop():
 
 
 # ==================== TIGHT 2 (Trapped-Block Fade) ====================
+def all_open_symbols():
+    """Every symbol currently held by ANY engine (T1 + T2 + CrashFade). Used so no
+    engine opens a coin another engine already holds — this is the guard that was
+    missing when CF + Tight 2 both opened 1000BONK at once and one got liquidated."""
+    syms = set()
+    for d in (t3_open_trades, t2_open_trades, cf_open_trades):
+        for t in d.values():
+            s = t.get("symbol")
+            if s:
+                syms.add(s)
+    return syms
+
 def t2_total_open():
-    """Shared open count across BOTH engines for the shared concurrency cap."""
-    return len(t3_open_trades) + len(t2_open_trades)
+    """Shared open count across ALL THREE engines for the shared concurrency cap.
+    2026-08-08: was T1+T2 only — CF was uncapped, so CF+T2 could both open and the
+    account carried 3-4 positions at once. Now counts CF too."""
+    return len(t3_open_trades) + len(t2_open_trades) + len(cf_open_trades)
 
 def t2_in_cooldown(symbol):
     last = t2_last_fire.get(symbol, 0)
     return (time.time() - last) < T2_COOLDOWN_SECONDS
 
 def t2_symbol_has_open_trade(symbol):
-    return any(t["symbol"] == symbol for t in t2_open_trades.values())
+    # cross-engine: block if ANY engine holds this symbol, not just Tight 2
+    return symbol in all_open_symbols()
 
 def t2_build_blocks(all_symbols):
     """For each symbol, build BOTH block types from DAILY candles:
@@ -2455,8 +2474,8 @@ def handle_telegram_commands():
                     send_tg("Tight 1 (Dormant Awakening) Auto-trade OFF.")
                 # ---- Crash Fade: /fast_start /fast_stop ----
                 elif text == "/fast_start":
-                    cf_auto_trade_enabled = True
-                    send_tg("Crash Fade Auto-trade ON.")
+                    # 2026-08-08: CrashFade is permanently disabled (no edge + caused the BONK duplicate/liquidation)
+                    send_tg("Crash Fade is permanently disabled (no validated edge, caused duplicate-position liquidation). Ignored.")
                 elif text == "/fast_stop":
                     cf_auto_trade_enabled = False
                     send_tg("Crash Fade Auto-trade OFF.")

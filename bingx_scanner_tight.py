@@ -1167,7 +1167,7 @@ def track_cf_trades(open_syms=None):
                 favorable_r = (current - entry_ref) / risk_dist   # LONG
                 if favorable_r > trade.get("peak_r", 0.0):
                     trade["peak_r"] = favorable_r
-                peak_r = trade["peak_r"]
+                peak_r = trade.get("peak_r", 0.0)
 
                 target_stop_r = None
                 if peak_r >= CF_TRAIL_START_R:
@@ -1461,7 +1461,7 @@ def track_rsi_trades(open_syms=None):
                 favorable_r = (current - entry_ref) / risk_dist   # LONG
                 if favorable_r > trade.get("peak_r", 0.0):
                     trade["peak_r"] = favorable_r
-                peak_r = trade["peak_r"]
+                peak_r = trade.get("peak_r", 0.0)
 
                 # Target stop level in R: trail from 1.5R (peak-1R); BE covers 1R-1.5R.
                 target_stop_r = None

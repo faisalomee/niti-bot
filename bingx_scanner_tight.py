@@ -1570,7 +1570,7 @@ T3_MAX_WATCHLIST          = int(os.environ.get("T3_MAX_WATCHLIST", 150))        
 T3_DORMANCY_DAYS          = int(os.environ.get("T3_DORMANCY_DAYS", 5))
 T3_DORMANCY_RANGE_PCT     = float(os.environ.get("T3_DORMANCY_RANGE_PCT", 25.0)) # total close band width = +/-15% around mid
 T3_DORMANCY_VOL_SPIKE_MAX = float(os.environ.get("T3_DORMANCY_VOL_SPIKE_MAX", 3.0))   # any day >3x median inside the window = already awakened earlier, not dormant
-T3_AWAKE_VOL_MULT         = 3.0      # HARDCODED. 5x->3x: 9.4 trades/wk +$391/8mo, holdout-OK both sets.
+T3_AWAKE_VOL_MULT         = 2.0      # 2026-08-10: 3x->2x for delayed-entry (backtest: 7.6 trades/wk, meanR +1.5, holdout A/B identical)
 T3_DORMANCY_SCAN_SECONDS  = int(os.environ.get("T3_DORMANCY_SCAN_SECONDS", 14400))   # rebuild watchlist every 4h (1 daily-candle request per symbol)
 T3_AWAKE_CHECK_SECONDS    = int(os.environ.get("T3_AWAKE_CHECK_SECONDS", 300))
 T3_SETUP_EXPIRY_SECONDS   = int(os.environ.get("T3_SETUP_EXPIRY_SECONDS", 172800))   # 48h to form a pullback entry after the awakening, else skip
@@ -1589,6 +1589,17 @@ T3_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so a $5-risk trade with 
 T3_ATR_LEN                = 14
 T3_SL_ATR_BUFFER_MULT     = 0.3
 T3_CHASE_SL_ATR_MULT      = float(os.environ.get("T3_CHASE_SL_ATR_MULT", 1.5))   # 2026-07-30 chase: SL = entry -/+ 1.5xATR(15m). Tune-swept best (1.0/2.0/2.5 all worse), holdout-OK.
+# ---- 2026-08-10 DELAYED-ENTRY + CONFLUENCE ----
+T3_DELAY_MAX_DAYS         = int(os.environ.get("T3_DELAY_MAX_DAYS", 10))          # wait up to 10 days after awakening for a confirmation day
+T3_DELAY_SL_ATR_MULT      = float(os.environ.get("T3_DELAY_SL_ATR_MULT", 2.0))    # delayed-entry SL = 2.0x ATR15 (backtest winner)
+T3_CONF_RISK_USDT         = float(os.environ.get("T3_CONF_RISK_USDT", 10.0))      # confluence trade (T1+T2 agree same coin/dir within 5d) risk = $10
+T3_CONF_WINDOW_SEC        = int(os.environ.get("T3_CONF_WINDOW_SEC", 432000))     # 5 days
+recent_signals = {}   # symbol -> {"side","ts"} : shared T1/T2 signal log for confluence
+def record_signal(symbol, side):
+    recent_signals[symbol] = {"side": side, "ts": time.time()}
+def is_confluence(symbol, side):
+    s = recent_signals.get(symbol)
+    return bool(s) and s["side"] == side and (time.time() - s["ts"]) <= T3_CONF_WINDOW_SEC
 T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 8.0))          # 2026-07-30: visible reduce-only TP at 8R. no-TP=$267 vs 8R=$213/8mo; the $54 buys a chart-visible TP line so drawdown is tolerable. Trail (BE2R/from4R) still the primary exit; 8R is a far ceiling only mega-runners hit.
 T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))      # 2026-07-30: log+alert only (NO auto-skip yet) if entry fill is >this% from signal px. Collect 2-3wk live slip, then decide a skip threshold.
 
@@ -1772,11 +1783,14 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
     # can never trip and is removed. Oversized-candle skip was backtest-REJECTED
     # (every candle>NxATR filter cut PnL - big breakout candles ARE the runners).
     sl = round(sl, 6)
+    record_signal(symbol, side)                       # log for confluence (T2 can see this)
+    conf = is_confluence(symbol, side)                # True if T2 signalled same coin/dir within 5d
+    risk_usdt = T3_CONF_RISK_USDT if conf else T3_RISK_USDT
     trade_status = ""
     if t3_auto_trade_enabled and t2_total_open() >= SHARED_MAX_CONCURRENT:
         trade_status = "\nSkipped - shared T1+T2 cap (" + str(SHARED_MAX_CONCURRENT) + ") reached"
     elif t3_auto_trade_enabled:
-        oid = place_t3_order(symbol, side, entry_px, sl)
+        oid = place_t3_order(symbol, side, entry_px, sl, risk_usdt)
         if oid == "MARGIN_SKIP":
             trade_status = "\nSkipped - insufficient margin"
         elif oid and oid != "N/A":
@@ -1785,21 +1799,21 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
             trade_status = "\nOrder failed"
     else:
         trade_status = "\nAuto-trade OFF"
-    print(f"[T3 ENTRY] {symbol} {side} @ {entry_px} SL {sl} vol_ratio={st.get('vol_ratio', 0):.1f}x{trade_status}")
+    conf_tag = " [CONFLUENCE $10]" if conf else ""
+    print(f"[T3 ENTRY]{conf_tag} {symbol} {side} @ {entry_px} SL {sl} risk=${risk_usdt} vol_ratio={st.get('vol_ratio', 0):.1f}x{trade_status}")
     send_tg(
-        "TIGHT 1 ENTRY - " + side + " - " + symbol + "\n------------------------------\n"
-        "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(T3_RISK_USDT) + " | Lev: " + str(T3_LEVERAGE) + "x\n"
-        "Chase entry (breakout candle) | TP " + str(T3_FIXED_TP_R) + "R visible | BE " + str(T3_BE_TRIGGER_R) + "R, trail from " + str(T3_TRAIL_START_R) + "R at peak-" + str(T3_TRAIL_GAP_R) + "R\n"
+        "TIGHT 1 ENTRY" + conf_tag + " - " + side + " - " + symbol + "\n------------------------------\n"
+        "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(risk_usdt) + " | Lev: " + str(T3_LEVERAGE) + "x\n"
+        "Delayed entry (higher-low+green day) | TP " + str(T3_FIXED_TP_R) + "R visible | BE " + str(T3_BE_TRIGGER_R) + "R, trail from " + str(T3_TRAIL_START_R) + "R at peak-" + str(T3_TRAIL_GAP_R) + "R\n"
         "Awakening vol: " + str(round(st.get("vol_ratio", 0), 1)) + "x dormant median" +
         trade_status + "\n------------------------------\nNiti Tight 1"
     )
 
 
 def t3_check_awakened(symbol):
-    """15m pullback-entry state machine for one awakened symbol. Processes every
-    CLOSED 15m candle exactly once (last_processed_time). A new post-awakening
-    extreme resets the pullback; T3_PULLBACK_MIN_CANDLES without a new extreme (or
-    a >=1x ATR retrace) forms the setup; a close through the setup trigger enters."""
+    """DELAYED daily-confirmation entry for one awakened symbol (2026-08-10). After
+    awakening, waits up to T3_DELAY_MAX_DAYS for a confirmation DAY (green + higher
+    low for longs; red + lower high for shorts), then enters at that day's close."""
     st = t3_watch.get(symbol)
     if not st:
         return
@@ -1809,44 +1823,58 @@ def t3_check_awakened(symbol):
         send_tg("TIGHT 1 EXPIRED - " + symbol + "\nNo clean pullback entry within " + str(T3_SETUP_EXPIRY_SECONDS // 3600) + "h of the awakening - trade skipped")
         return
     try:
-        candles = get_candles(symbol, limit=60, interval="15m")
-        if len(candles) < T3_ATR_LEN + 5:
+        # DELAYED ENTRY (2026-08-10, replaces chase): after the awakening, watch DAILY
+        # candles. Enter on the first CLOSED day (within T3_DELAY_MAX_DAYS) that is
+        # GREEN (close>open) AND makes a higher low than the prior day (mirror for
+        # shorts: red + lower high). SL = T3_DELAY_SL_ATR_MULT x ATR(15m). This is the
+        # backtested upgrade: day-1 breakout chase -> confirmed continuation day.
+        daily = get_candles(symbol, limit=T3_DELAY_MAX_DAYS + 5, interval="1d")
+        if len(daily) < 3:
             return
-        confirmed = candles[:-1]
-        highs  = [h(c)  for c in confirmed]
-        lows   = [l(c)  for c in confirmed]
-        closes = [cl(c) for c in confirmed]
-        atr_now = atr_series(highs, lows, closes, T3_ATR_LEN)[-1]
-        side   = st["side"]
-        last_t = int(st.get("last_processed_time") or 0)
-        # CHASE: enter at the close of the FIRST 15m candle that closes after the
-        # awakening. No pullback wait, no trigger/peak machine. SL = 1.5xATR(15m).
-        for c in [x for x in confirmed if int(x["time"]) > last_t]:
-            st["last_processed_time"] = int(c["time"])
-            if atr_now <= 0:
-                continue
-            entry_px = cl(c)
-            if side == "BUY":
-                st["setup_sl"] = entry_px - atr_now * T3_CHASE_SL_ATR_MULT
-            else:
-                st["setup_sl"] = entry_px + atr_now * T3_CHASE_SL_ATR_MULT
+        confirmed = daily[:-1]                     # closed days only (drop the live day)
+        prev  = confirmed[-2]
+        today = confirmed[-1]
+        if int(today["time"]) <= int(st.get("last_processed_time") or 0):
+            return                                 # this day already processed
+        st["last_processed_time"] = int(today["time"])
+        side = st["side"]
+        is_green   = cl(today) > o(today)
+        higher_low = l(today) > l(prev)
+        lower_high = h(today) < h(prev)
+        # ATR on 15m for the stop distance
+        c15 = get_candles(symbol, limit=T3_ATR_LEN + 40, interval="15m")
+        c15c = c15[:-1] if len(c15) > 1 else c15
+        if len(c15c) < T3_ATR_LEN + 1:
+            return
+        atr_now = atr_series([h(c) for c in c15c], [l(c) for c in c15c], [cl(c) for c in c15c], T3_ATR_LEN)[-1]
+        if atr_now <= 0:
+            return
+        entry_px = cl(today)
+        if side == "BUY" and is_green and higher_low:
+            st["setup_sl"] = entry_px - atr_now * T3_DELAY_SL_ATR_MULT
             t3_fire_entry(symbol, st, entry_px, atr_now)
-            return
+        elif side == "SELL" and (not is_green) and lower_high:
+            st["setup_sl"] = entry_px + atr_now * T3_DELAY_SL_ATR_MULT
+            t3_fire_entry(symbol, st, entry_px, atr_now)
+        # else: no confirmation this day - keep waiting until expiry
     except Exception as e:
         print(f"[T3 AWAKENED {symbol}] error: {e}")
 
 
-def place_t3_order(symbol, side, entry, sl):
+def place_t3_order(symbol, side, entry, sl, risk_usdt=None):
     """Market entry + guarded SL only - deliberately NO exchange TP orders (the exit
     is the trail). Same risk-based sizing, margin pre-check and naked-position
-    emergency-close discipline as Tight/Fast."""
+    emergency-close discipline as Tight/Fast. risk_usdt defaults to T3_RISK_USDT;
+    confluence trades pass T3_CONF_RISK_USDT."""
     try:
+        if risk_usdt is None:
+            risk_usdt = T3_RISK_USDT
         set_leverage_api(symbol, T3_LEVERAGE)
         precision = symbol_precision.get(symbol, 4)
         risk_dist = abs(entry - sl)
         if risk_dist <= 0:
             return None
-        risk_qty       = T3_RISK_USDT / risk_dist
+        risk_qty       = risk_usdt / risk_dist
         margin_cap_qty = (T3_MAX_MARGIN_USDT * T3_LEVERAGE) / entry
         total_qty = round(min(risk_qty, margin_cap_qty), precision)
         if total_qty <= 0:
@@ -1861,7 +1889,7 @@ def place_t3_order(symbol, side, entry, sl):
             return "MARGIN_SKIP"
 
         order_id = place_market_order(symbol, side, total_qty, pos_side)
-        print(f"[T3 ORDER] {symbol} {side} qty={total_qty} risk=${T3_RISK_USDT}: {order_id}")
+        print(f"[T3 ORDER] {symbol} {side} qty={total_qty} risk=${risk_usdt}: {order_id}")
         if order_id != "N/A":
             time.sleep(0.5)
             entry_fill = get_fill_price(order_id, symbol, fallback=entry)
@@ -1894,7 +1922,7 @@ def place_t3_order(symbol, side, entry, sl):
                 "sl": sl, "sl_id": sl_id, "tp": tp_price, "tp_id": tp_id,
                 "total_qty": total_qty, "close_side": close_side, "pos_side": pos_side,
                 "risk_dist": risk_dist, "be_done": False, "be_price": None,
-                "trailed": False, "peak_r": 0.0, "risk_usdt": T3_RISK_USDT,
+                "trailed": False, "peak_r": 0.0, "risk_usdt": risk_usdt,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
         return order_id
@@ -2211,6 +2239,7 @@ def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
         "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(T2_RISK_USDT) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
         + kind + " | TP " + str(T2_TP_R) + "R\n"
     )
+    record_signal(symbol, side)                # log for confluence (T1 can see this)
     place_t2_order(symbol, entry_px, sl, side)
     t2_last_fire[symbol] = time.time()
 
@@ -2533,6 +2562,86 @@ def health():
             "+ Tight 1 (Dormant Awakening) + consolidated journal"), 200
 
 
+
+
+# ============================================================================
+# ==================== OI COLLECTOR (add-on, 2026-08-10) =====================
+# Standalone open-interest logger -> Supabase. Own thread. Reads the symbol list
+# and writes to Supabase only; touches no trading engine. Needs two Render env
+# vars: SUPABASE_URL and SUPABASE_SERVICE_KEY. Table oi_history must exist.
+# ============================================================================
+def get_open_interest(symbol):
+    """BingX public open interest for one symbol (no key/signature). float or None."""
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/openInterest"
+        r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
+        if r.get("code") == 0:
+            oi = r.get("data", {}).get("openInterest")
+            if oi is not None:
+                return float(oi)
+    except Exception as e:
+        print(f"[OI FETCH ERROR] {symbol}: {e}")
+    return None
+
+
+def supabase_insert_oi(rows):
+    if not rows:
+        return
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("[OI SUPABASE] SUPABASE_URL / SUPABASE_SERVICE_KEY not set - skipping insert")
+        return
+    try:
+        url = SUPABASE_URL + "/rest/v1/oi_history"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": "Bearer " + SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        resp = requests.post(url, headers=headers, json=rows, timeout=15)
+        if resp.status_code not in (200, 201, 204):
+            print(f"[OI SUPABASE] insert failed {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[OI SUPABASE ERROR] {e}")
+
+
+def oi_collector_loop():
+    """Every OI_SCAN_INTERVAL_SECONDS: pull OI for all futures symbols, compute USD
+    value (OI x price), batch-insert into Supabase. Respects the global API backoff."""
+    print(f"OI collector started - logging open interest for all symbols every {OI_SCAN_INTERVAL_SECONDS // 60} min to Supabase")
+    all_symbols = []
+    while True:
+        try:
+            if api_backoff_active():
+                time.sleep(30)
+                continue
+            if not all_symbols:
+                all_symbols = get_futures_symbols() or []
+            now_ms = int(time.time() * 1000)
+            rows = []
+            logged = 0
+            for sym in all_symbols:
+                if api_backoff_active():
+                    break
+                oi = get_open_interest(sym)
+                if oi is not None:
+                    price = get_current_price(sym)
+                    oi_value = oi * price if price and price > 0 else 0.0
+                    rows.append({"symbol": sym, "ts": now_ms, "open_interest": oi, "oi_value": oi_value})
+                    logged += 1
+                    if len(rows) >= OI_BATCH_INSERT:
+                        supabase_insert_oi(rows)
+                        rows = []
+                time.sleep(OI_REQUEST_PAUSE)
+            if rows:
+                supabase_insert_oi(rows)
+            print(f"[OI COLLECTOR] logged OI for {logged} symbols at {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+        except Exception as e:
+            print(f"[OI COLLECTOR ERROR] {e}")
+        time.sleep(OI_SCAN_INTERVAL_SECONDS)
+# ==================== END OI COLLECTOR ====================
+
+
 if __name__ == "__main__":
     # Re-adopt anything already open on BingX BEFORE the engines start, so a restart
     # can't breach the concurrency caps or orphan a trail-managed position.
@@ -2547,4 +2656,5 @@ if __name__ == "__main__":
     Thread(target=trailing_loop,            daemon=True).start()
     Thread(target=t3_loop,                  daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()
+    Thread(target=oi_collector_loop,        daemon=True).start()   # OI logger -> Supabase (2026-08-10)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -15,6 +15,13 @@ FAST_TRADE_AMOUNT = float(os.environ.get("FAST_TRADE_AMOUNT", 20))
 
 BASE_URL = "https://open-api.bingx.com"
 
+# ==================== SUPABASE / OI COLLECTOR CONFIG (2026-08-10) ====================
+SUPABASE_URL             = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY     = os.environ.get("SUPABASE_SERVICE_KEY", "")
+OI_SCAN_INTERVAL_SECONDS = int(os.environ.get("OI_SCAN_INTERVAL_SECONDS", 900))   # log every 15 min
+OI_REQUEST_PAUSE         = float(os.environ.get("OI_REQUEST_PAUSE", 0.15))
+OI_BATCH_INSERT          = int(os.environ.get("OI_BATCH_INSERT", 50))
+
 # ==================== SHARED / INFRA CONFIG ====================
 # Kept for the infrastructure helpers below (backoff, price cache, MTF/BTC helpers).
 API_BACKOFF_SECONDS = int(os.environ.get("API_BACKOFF_SECONDS", 1200))   # 20 min full silence on a rate-limit hit (self-renewing penalty)
@@ -2058,7 +2065,7 @@ def t3_loop():
     """Tight 1 main loop. Internal timers: dormancy rescan every 4h, awakening
     check on the watchlist every 5 min, awakened symbols processed every pass
     (60s). Fully respects the global API backoff."""
-    print("Tight 1 loop started - Dormant Awakening (dormancy -> 3x median awakening -> CHASE entry -> 8R TP + peak-2R trail)")
+    print("Tight 1 loop started - Dormant Awakening (dormancy -> 2x median awakening -> DELAYED higher-low+green day entry -> 8R TP + peak-2R trail)")
     all_symbols   = []
     last_dormancy = 0.0
     last_awake    = 0.0

@@ -1577,7 +1577,7 @@ T3_MAX_WATCHLIST          = int(os.environ.get("T3_MAX_WATCHLIST", 150))        
 T3_DORMANCY_DAYS          = int(os.environ.get("T3_DORMANCY_DAYS", 5))
 T3_DORMANCY_RANGE_PCT     = float(os.environ.get("T3_DORMANCY_RANGE_PCT", 25.0)) # total close band width = +/-15% around mid
 T3_DORMANCY_VOL_SPIKE_MAX = float(os.environ.get("T3_DORMANCY_VOL_SPIKE_MAX", 3.0))   # any day >3x median inside the window = already awakened earlier, not dormant
-T3_AWAKE_VOL_MULT         = 2.0      # 2026-08-10: 3x->2x for delayed-entry (backtest: 7.6 trades/wk, meanR +1.5, holdout A/B identical)
+T3_AWAKE_VOL_MULT         = 1.5      # 2026-08-10 PnL: 2x->1.5x nearly doubles trades (7.7->13.4/wk), meanR unchanged +1.5, holdout strong
 T3_DORMANCY_SCAN_SECONDS  = int(os.environ.get("T3_DORMANCY_SCAN_SECONDS", 14400))   # rebuild watchlist every 4h (1 daily-candle request per symbol)
 T3_AWAKE_CHECK_SECONDS    = int(os.environ.get("T3_AWAKE_CHECK_SECONDS", 300))
 T3_SETUP_EXPIRY_SECONDS   = int(os.environ.get("T3_SETUP_EXPIRY_SECONDS", 172800))   # 48h to form a pullback entry after the awakening, else skip
@@ -1607,7 +1607,7 @@ def record_signal(symbol, side):
 def is_confluence(symbol, side):
     s = recent_signals.get(symbol)
     return bool(s) and s["side"] == side and (time.time() - s["ts"]) <= T3_CONF_WINDOW_SEC
-T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 8.0))          # 2026-07-30: visible reduce-only TP at 8R. no-TP=$267 vs 8R=$213/8mo; the $54 buys a chart-visible TP line so drawdown is tolerable. Trail (BE2R/from4R) still the primary exit; 8R is a far ceiling only mega-runners hit.
+T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 6.0))          # 2026-08-10 PnL: 8R->6R, delayed-entry backtest sweet spot (TP6 sumR786 vs TP4 719 vs TP8 787-no-gain). Visible reduce-only TP; BE@2R still fires for a free trade.
 T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))      # 2026-07-30: log+alert only (NO auto-skip yet) if entry fill is >this% from signal px. Collect 2-3wk live slip, then decide a skip threshold.
 
 # ==================== TIGHT 2 (Trapped-Block Fade, SHORT) ====================
@@ -1619,10 +1619,10 @@ T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))     
 T2_RET_BAND_PCT           = 6.0    # HARDCODED. wider retest zone raises win 50->54%
 T2_DUMP_PCT               = 18.0   # HARDCODED. block qualifies if price moved >= this % within lookahead
 T2_DUMP_LOOKAHEAD_DAYS    = 5      # HARDCODED
-T2_VOL_SPIKE              = 1.8    # HARDCODED. 3->1.8: ~3x more blocks, edge intact, fixes no-trades
+T2_VOL_SPIKE              = 1.3    # 2026-08-10 PnL: 1.8->1.3 ~2x more T2-long trades (23->42/wk), sumR +81%, win unchanged 52%, holdout A+0.92/B+0.80. Do NOT loosen dump% (weakens holdout).
 T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
-T2_TP_R                   = 4.0    # HARDCODED. fixed reduce-only TP at 4R
+T2_TP_R                   = 8.0    # 2026-08-10 PnL: 4R->8R, sumR 518->711 (+37%), win UNCHANGED 52% (demand-bounce trades are big runners). TP12 tested even better (1350) but Faisal chose 8R for shorter holds; 12R is a future lever.
 T2_BLOCK_MAX_AGE_DAYS     = 30     # HARDCODED. only trade blocks formed within last 30d (fresh = active trapped holders). fixes dry spells.
 T2_LONG_SIDE              = True   # HARDCODED. both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
 T2_ATR_LEN                = 14
@@ -1848,6 +1848,14 @@ def t3_check_awakened(symbol):
         is_green   = cl(today) > o(today)
         higher_low = l(today) > l(prev)
         lower_high = h(today) < h(prev)
+        # 2026-08-10 win-rate lever: confirmation day must also carry volume >= median of the
+        # prior days in the fetched window (filters weak confirmations; win 48->51%, holdout stronger).
+        try:
+            prior_vols = sorted(v(d) for d in confirmed[:-1] if v(d) > 0)
+            conf_vol_median = prior_vols[len(prior_vols)//2] if prior_vols else 0.0
+            has_volume = v(today) >= conf_vol_median if conf_vol_median > 0 else True
+        except Exception:
+            has_volume = True
         # ATR on 15m for the stop distance
         c15 = get_candles(symbol, limit=T3_ATR_LEN + 40, interval="15m")
         c15c = c15[:-1] if len(c15) > 1 else c15
@@ -1857,10 +1865,10 @@ def t3_check_awakened(symbol):
         if atr_now <= 0:
             return
         entry_px = cl(today)
-        if side == "BUY" and is_green and higher_low:
+        if side == "BUY" and is_green and higher_low and has_volume:
             st["setup_sl"] = entry_px - atr_now * T3_DELAY_SL_ATR_MULT
             t3_fire_entry(symbol, st, entry_px, atr_now)
-        elif side == "SELL" and (not is_green) and lower_high:
+        elif side == "SELL" and (not is_green) and lower_high and has_volume:
             st["setup_sl"] = entry_px + atr_now * T3_DELAY_SL_ATR_MULT
             t3_fire_entry(symbol, st, entry_px, atr_now)
         # else: no confirmation this day - keep waiting until expiry

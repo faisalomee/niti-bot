@@ -1619,7 +1619,7 @@ T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))     
 T2_RET_BAND_PCT           = 6.0    # HARDCODED. wider retest zone raises win 50->54%
 T2_DUMP_PCT               = 18.0   # HARDCODED. block qualifies if price moved >= this % within lookahead
 T2_DUMP_LOOKAHEAD_DAYS    = 5      # HARDCODED
-T2_VOL_SPIKE              = 1.3    # 2026-08-10 PnL: 1.8->1.3 ~2x more T2-long trades (23->42/wk), sumR +81%, win unchanged 52%, holdout A+0.92/B+0.80. Do NOT loosen dump% (weakens holdout).
+T2_VOL_SPIKE              = 1.8    # 2026-08-11: reverted 1.3->1.8. The 1.3 PnL-boost pulled in ~2x more trades but MANY were thin coins where SL slips (ON/RIF/HOME -2.66R). Fewer, higher-quality blocks matters more than trade count on a small account. Re-loosen only after slippage confirmed fixed by the 5M vol floor.
 T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
 T2_TP_R                   = 8.0    # 2026-08-10 PnL: 4R->8R, sumR 518->711 (+37%), win UNCHANGED 52% (demand-bounce trades are big runners). TP12 tested even better (1350) but Faisal chose 8R for shorter holds; 12R is a future lever.
@@ -1635,7 +1635,7 @@ T2_LEVERAGE               = 10     # HARDCODED
 T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk
 T2_MAX_SYMBOLS            = 250    # HARDCODED
 T2_EXCLUDE_TOP_N          = 0      # HARDCODED. INCLUDE majors - they form clean blocks too
-T2_MIN_QUOTE_VOL          = 1_500_000  # HARDCODED 2026-08-05: daily quote-vol floor to exclude ultra-thin coins (VELVET/BEAT-tier) that gave 1.76% entry slip live. =15k/bar in backtest where the directional edge is still intact (gap +0.057, unchanged from no-floor); a higher floor (90k/bar) LOOKED better on win% but random-dir control showed it was liquid-coin-selection bias not real edge, so kept light. Slip fix, not a curve-fit.
+T2_MIN_QUOTE_VOL          = 3_000_000  # 2026-08-11: 1.5M->3M (verified). At 1.5M, RIF (med $2.71M daily qvol)/ON/HOME slipped SL to -2.66R/-1.8R live (planned -1R). Backtest: 13% of SL-hits fill worse than -1.5R on thin coins. 3M floor excludes RIF-tier; verified win 56->59%, 11.4 trades/wk kept, top3 19%, holdout A+1.44/B+1.10 robust (5M was win60% but only 5.9/wk & top3 27% concentrated). Slippage fix.
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)

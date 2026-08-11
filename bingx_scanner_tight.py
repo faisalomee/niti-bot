@@ -1418,7 +1418,7 @@ def close_rsi_position(oid, reason=""):
             cancel_order(symbol, trade["sl_id"])
         trade["pnl"]    = round((exit_price - entry_ref) * qty, 2)   # LONG only
         trade["result"] = reason
-        trade["label"]  = "RSI"
+        trade["label"]  = "Adopted"
         daily_trades.append(trade)
         journal_closed_trade(trade)
         rsi_open_trades.pop(oid, None)
@@ -1449,7 +1449,7 @@ def track_rsi_trades(open_syms=None):
                     result = "Trail"
                 trade["pnl"]    = round((sl_fill - entry_ref) * trade["remaining_qty"], 2)
                 trade["result"] = result
-                trade["label"]  = "RSI"
+                trade["label"]  = "Adopted"
                 daily_trades.append(trade)
                 journal_closed_trade(trade)
                 rsi_open_trades.pop(oid, None)
@@ -1458,7 +1458,7 @@ def track_rsi_trades(open_syms=None):
             # ---- Liquidation detect: position gone from exchange, SL didn't fill ----
             if open_syms is not None and symbol not in open_syms:
                 if confirm_liquidated(symbol, trade):
-                    journal_liquidation(trade, "RSI")
+                    journal_liquidation(trade, "Adopted")
                     rsi_open_trades.pop(oid, None)
                     continue
                 # SL still on exchange -> positions call lied, position is open.
@@ -1571,7 +1571,7 @@ def rsi_scan_loop():
 # awakenings will hit SL, one real runner pays for the month. Runs fully alongside
 # Tight 2 + Fast; nothing above this section changed for T3.
 
-T3_MIN_QUOTE_VOL          = float(os.environ.get("T3_MIN_QUOTE_VOL", 300_000))   # dormant coins are quiet by definition - the $1M Tight floor would exclude pre-pump BANK. Known cost: thinner books, more slippage.
+T3_MIN_QUOTE_VOL          = float(os.environ.get("T3_MIN_QUOTE_VOL", 1_000_000)) # 2026-08-11: 300k->1M. Structure SL has small risk-dist so slippage hurts proportionally MORE; 1M floor cuts thin-coin slippage while keeping 9.9 trades/wk (3M would halve to 6.4). Slippage protection for the tight structure stop.
 T3_MAX_SYMBOLS            = int(os.environ.get("T3_MAX_SYMBOLS", 600))
 T3_MAX_WATCHLIST          = int(os.environ.get("T3_MAX_WATCHLIST", 150))         # keep the TIGHTEST bands if more qualify - the most compressed springs
 T3_DORMANCY_DAYS          = int(os.environ.get("T3_DORMANCY_DAYS", 5))
@@ -1598,7 +1598,8 @@ T3_SL_ATR_BUFFER_MULT     = 0.3
 T3_CHASE_SL_ATR_MULT      = float(os.environ.get("T3_CHASE_SL_ATR_MULT", 1.5))   # 2026-07-30 chase: SL = entry -/+ 1.5xATR(15m). Tune-swept best (1.0/2.0/2.5 all worse), holdout-OK.
 # ---- 2026-08-10 DELAYED-ENTRY + CONFLUENCE ----
 T3_DELAY_MAX_DAYS         = int(os.environ.get("T3_DELAY_MAX_DAYS", 10))          # wait up to 10 days after awakening for a confirmation day
-T3_DELAY_SL_ATR_MULT      = float(os.environ.get("T3_DELAY_SL_ATR_MULT", 2.0))    # delayed-entry SL = 2.0x ATR15 (backtest winner)
+T3_DELAY_SL_ATR_MULT      = float(os.environ.get("T3_DELAY_SL_ATR_MULT", 2.0))    # (legacy ATR stop; superseded by structure SL below, kept as the min-floor multiplier)
+T3_STRUCT_SL_MIN_ATR      = float(os.environ.get("T3_STRUCT_SL_MIN_ATR", 1.0))    # 2026-08-11 STRUCTURE SL: stop at confirmation-day low, but at least this x ATR15 away (avoids too-tight noise stops). Backtest: win 48->77%, meanR +1.69->+3.34, holdout A+3.28/B+3.40. THE big Tight-1 fix.
 T3_CONF_RISK_USDT         = float(os.environ.get("T3_CONF_RISK_USDT", 10.0))      # confluence trade (T1+T2 agree same coin/dir within 5d) risk = $10
 T3_CONF_WINDOW_SEC        = int(os.environ.get("T3_CONF_WINDOW_SEC", 432000))     # 5 days
 recent_signals = {}   # symbol -> {"side","ts"} : shared T1/T2 signal log for confluence
@@ -1607,7 +1608,7 @@ def record_signal(symbol, side):
 def is_confluence(symbol, side):
     s = recent_signals.get(symbol)
     return bool(s) and s["side"] == side and (time.time() - s["ts"]) <= T3_CONF_WINDOW_SEC
-T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 6.0))          # 2026-08-10 PnL: 8R->6R, delayed-entry backtest sweet spot (TP6 sumR786 vs TP4 719 vs TP8 787-no-gain). Visible reduce-only TP; BE@2R still fires for a free trade.
+T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 8.0))          # 2026-08-11: 6R->8R with STRUCTURE SL. Tight structure stop = small risk-dist = more R per win; backtest win 75% meanR +3.9 sumR1820 (vs TP6 win77%/+3.34). Visible reduce-only TP.
 T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))      # 2026-07-30: log+alert only (NO auto-skip yet) if entry fill is >this% from signal px. Collect 2-3wk live slip, then decide a skip threshold.
 
 # ==================== TIGHT 2 (Trapped-Block Fade, SHORT) ====================
@@ -1619,7 +1620,8 @@ T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))     
 T2_RET_BAND_PCT           = 6.0    # HARDCODED. wider retest zone raises win 50->54%
 T2_DUMP_PCT               = 18.0   # HARDCODED. block qualifies if price moved >= this % within lookahead
 T2_DUMP_LOOKAHEAD_DAYS    = 5      # HARDCODED
-T2_VOL_SPIKE              = 1.8    # 2026-08-11: reverted 1.3->1.8. The 1.3 PnL-boost pulled in ~2x more trades but MANY were thin coins where SL slips (ON/RIF/HOME -2.66R). Fewer, higher-quality blocks matters more than trade count on a small account. Re-loosen only after slippage confirmed fixed by the 5M vol floor.
+T2_VOL_SPIKE              = 1.3    # 2026-08-11: 1.3 (with 3M floor + drawdown filter now guarding quality). More trades (9.9/wk) AND high win because the DD filter removes the deep-downtrend losers that 1.3 alone pulled in. Verified vol1.3+DD30 = win 62% meanR +1.59 holdout A+1.41/B+1.84.
+T2_MAX_DRAWDOWN_PCT       = float(os.environ.get("T2_MAX_DRAWDOWN_PCT", 0.30))   # 2026-08-11 FAISAL'S INSIGHT: skip demand-long if coin is >30% below its 60-day high. Heavy-downtrend coins have TP far above (old price) but SL near -> hit SL, never TP. Backtest by drawdown bucket: 0-20%below win73%, 20-40% win47%, 40%+ win45%. DD<=30% filter: win 60->62%, meanR +1.59, holdout robust, TP hits faster (less margin lock).
 T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
 T2_TP_R                   = 8.0    # 2026-08-10 PnL: 4R->8R, sumR 518->711 (+37%), win UNCHANGED 52% (demand-bounce trades are big runners). TP12 tested even better (1350) but Faisal chose 8R for shorter holds; 12R is a future lever.
@@ -1865,11 +1867,21 @@ def t3_check_awakened(symbol):
         if atr_now <= 0:
             return
         entry_px = cl(today)
+        # 2026-08-11 STRUCTURE SL: stop at the confirmation day's low (longs) / high (shorts) -
+        # the level that, if broken, invalidates the setup. Clamped to >= T3_STRUCT_SL_MIN_ATR x ATR15
+        # so a too-tight structure doesn't create a noise stop. Backtest win 48->77%, meanR +3.34.
+        min_dist = atr_now * T3_STRUCT_SL_MIN_ATR
         if side == "BUY" and is_green and higher_low and has_volume:
-            st["setup_sl"] = entry_px - atr_now * T3_DELAY_SL_ATR_MULT
+            struct_sl = l(today) * 0.999
+            if entry_px - struct_sl < min_dist:
+                struct_sl = entry_px - min_dist
+            st["setup_sl"] = struct_sl
             t3_fire_entry(symbol, st, entry_px, atr_now)
         elif side == "SELL" and (not is_green) and lower_high and has_volume:
-            st["setup_sl"] = entry_px + atr_now * T3_DELAY_SL_ATR_MULT
+            struct_sl = h(today) * 1.001
+            if struct_sl - entry_px < min_dist:
+                struct_sl = entry_px + min_dist
+            st["setup_sl"] = struct_sl
             t3_fire_entry(symbol, st, entry_px, atr_now)
         # else: no confirmation this day - keep waiting until expiry
     except Exception as e:
@@ -2073,7 +2085,7 @@ def t3_loop():
     """Tight 1 main loop. Internal timers: dormancy rescan every 4h, awakening
     check on the watchlist every 5 min, awakened symbols processed every pass
     (60s). Fully respects the global API backoff."""
-    print("Tight 1 loop started - Dormant Awakening (dormancy -> 2x median awakening -> DELAYED higher-low+green day entry -> 8R TP + peak-2R trail)")
+    print("Tight 1 loop started - Dormant Awakening (dormancy -> 1.5x awakening -> DELAYED green+higher-low day entry -> STRUCTURE SL -> 8R TP)")
     all_symbols   = []
     last_dormancy = 0.0
     last_awake    = 0.0
@@ -2247,6 +2259,21 @@ def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
     risk = abs(sl - entry_px)
     if risk <= 0:
         return
+    # 2026-08-11 DRAWDOWN FILTER (Faisal's insight): for demand-LONG, skip coins deep below their
+    # 60-day high - heavy-downtrend coins hit SL (near) but never TP (far, at old price). Longs only;
+    # shorts are unaffected (they profit from downtrend).
+    if side == "BUY":
+        try:
+            dcandles = get_candles(symbol, limit=65, interval="1d")
+            if len(dcandles) >= 30:
+                hi60 = max(h(d) for d in dcandles[-61:-1])
+                if hi60 > 0:
+                    drawdown = (hi60 - entry_px) / hi60
+                    if drawdown > T2_MAX_DRAWDOWN_PCT:
+                        print(f"[T2 DD SKIP] {symbol} long skipped - {drawdown*100:.0f}% below 60d high (>{T2_MAX_DRAWDOWN_PCT*100:.0f}%)")
+                        return
+        except Exception as e:
+            print(f"[T2 DD CHECK {symbol}] error: {e}")
     label = "SHORT" if side == "SELL" else "LONG"
     kind  = "Trapped-block fade" if side == "SELL" else "Demand-block bounce"
     send_tg(

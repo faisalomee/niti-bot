@@ -1608,6 +1608,12 @@ def record_signal(symbol, side):
 def is_confluence(symbol, side):
     s = recent_signals.get(symbol)
     return bool(s) and s["side"] == side and (time.time() - s["ts"]) <= T3_CONF_WINDOW_SEC
+
+# 2026-08-11 TIME-STOP: no Tight-1/Tight-2 trade holds margin longer than this. Backtest: 100% of
+# T1 & T2 wins hit TP within 3 days (most within 1-2); a trade still open at 2 days won't reach TP
+# and just locks margin (e.g. ETHFI). Closing at 2d keeps win/PnL intact (verified: 2d-stop = same
+# sumR as no-stop) while freeing the slot. Longs/shorts both.
+TIGHT_MAX_HOLD_SECONDS   = int(os.environ.get("TIGHT_MAX_HOLD_SECONDS", 172800))   # 2 days
 T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 8.0))          # 2026-08-11: 6R->8R with STRUCTURE SL. Tight structure stop = small risk-dist = more R per win; backtest win 75% meanR +3.9 sumR1820 (vs TP6 win77%/+3.34). Visible reduce-only TP.
 T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))      # 2026-07-30: log+alert only (NO auto-skip yet) if entry fill is >this% from signal px. Collect 2-3wk live slip, then decide a skip threshold.
 
@@ -1951,6 +1957,7 @@ def place_t3_order(symbol, side, entry, sl, risk_usdt=None):
                 "risk_dist": risk_dist, "be_done": False, "be_price": None,
                 "trailed": False, "peak_r": 0.0, "risk_usdt": risk_usdt,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                "open_ts": time.time(),
             }
         return order_id
     except Exception as e:
@@ -2026,6 +2033,33 @@ def track_t3_trades(open_syms=None):
                     t3_open_trades.pop(oid, None)
                     continue
                 # SL still on exchange -> positions call lied, position is open.
+
+            # ---- 2026-08-11 TIME-STOP: close at market if held > 2 days (won't reach TP, frees margin) ----
+            held = time.time() - trade.get("open_ts", time.time())
+            if held >= TIGHT_MAX_HOLD_SECONDS:
+                exit_price = get_current_price(symbol)
+                if trade.get("total_qty", 0) > 0:
+                    close_oid = place_market_order(symbol, trade["close_side"], trade["total_qty"], trade["pos_side"])
+                    if close_oid and close_oid != "N/A":
+                        time.sleep(0.5)
+                        exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
+                if trade.get("sl_id"):
+                    cancel_order(symbol, trade["sl_id"])
+                if trade.get("tp_id") and trade["tp_id"] != "N/A":
+                    cancel_order(symbol, trade["tp_id"])
+                if trade["side"] == "BUY":
+                    leg_pnl = (exit_price - entry_ref) * trade["total_qty"]
+                else:
+                    leg_pnl = (entry_ref - exit_price) * trade["total_qty"]
+                trade["pnl"]    = round(leg_pnl, 2)
+                trade["result"] = "TimeExit"
+                trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T3_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
+                trade["label"]  = "Tight 1"
+                daily_trades.append(trade)
+                journal_closed_trade(trade)
+                t3_open_trades.pop(oid, None)
+                print(f"[T3 TIME-STOP] {symbol} closed after {held/86400:.1f}d pnl={trade['pnl']}")
+                continue
 
             if risk_dist <= 0:
                 continue
@@ -2337,6 +2371,7 @@ def place_t2_order(symbol, entry, sl, side="SELL"):
                 "total_qty": qty, "close_side": close_side, "pos_side": pos_side,
                 "risk_dist": rd, "risk_usdt": T2_RISK_USDT,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                "open_ts": time.time(),
             }
         return order_id
     except Exception as e:
@@ -2383,6 +2418,29 @@ def track_t2_trades(open_syms=None):
                 journal_closed_trade(trade)
                 t2_open_trades.pop(oid, None)
                 print(f"[T2 CLOSE] {symbol} SL pnl={trade['pnl']} R={trade['exit_r']}")
+                continue
+            # ---- 2026-08-11 TIME-STOP: close at market if held > 2 days (won't reach TP, frees margin) ----
+            held = time.time() - trade.get("open_ts", time.time())
+            if held >= TIGHT_MAX_HOLD_SECONDS:
+                exit_price = get_current_price(symbol)
+                if trade.get("total_qty", 0) > 0:
+                    close_oid = place_market_order(symbol, trade["close_side"], trade["total_qty"], trade["pos_side"])
+                    if close_oid and close_oid != "N/A":
+                        time.sleep(0.5)
+                        exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
+                if trade.get("sl_id"):
+                    cancel_order(symbol, trade["sl_id"])
+                if trade.get("tp_id") and trade["tp_id"] != "N/A":
+                    cancel_order(symbol, trade["tp_id"])
+                leg_pnl = (entry_ref - exit_price) * trade["total_qty"] if is_short else (exit_price - entry_ref) * trade["total_qty"]
+                trade["pnl"]    = round(leg_pnl, 2)
+                trade["result"] = "TimeExit"
+                trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T2_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
+                trade["label"]  = "Tight 2"
+                daily_trades.append(trade)
+                journal_closed_trade(trade)
+                t2_open_trades.pop(oid, None)
+                print(f"[T2 TIME-STOP] {symbol} closed after {held/86400:.1f}d pnl={trade['pnl']}")
                 continue
             # ---- liquidation (position gone, no TP/SL fill) ----
             if open_syms is not None and symbol not in open_syms:

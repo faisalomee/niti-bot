@@ -39,104 +39,10 @@ BTC_FILTER_CANDLES  = int(os.environ.get("BTC_FILTER_CANDLES", 4))
 def is_tokenized(sym):
     return sym.startswith("NCS") or sym.startswith("NCCO")
 
-# ==================== CRASH FADE CONFIG (Market-Breadth Crash Fade, replaces Fast) ====================
-# Backtest: n=922, win 77.3%, net +0.482R, all 3 months positive, 153/165 coins +ve.
-# Only fades sharp drops WHILE THE WHOLE SMALL-CAP MARKET IS CRASHING (breadth gate) -
-# in a panic, individual drops are forced/exaggerated selling that bounces; in calm
-# markets drops are real and don't bounce.
-CF_TIMEFRAME              = os.environ.get("CF_TIMEFRAME", "5m")
-CF_SCAN_INTERVAL_SECONDS  = int(os.environ.get("CF_SCAN_INTERVAL_SECONDS", 180))   # 5m candles - faster scanning is wasted API load
-CF_MIN_QUOTE_VOL          = float(os.environ.get("CF_MIN_QUOTE_VOL", 300_000))     # small-cap focus
-CF_MAX_SYMBOLS            = int(os.environ.get("CF_MAX_SYMBOLS", 150))             # breadth sample + candidate pool; bounds API load. Bigger = truer breadth but heavier polling.
-CF_EXCLUDE_TOP_N          = int(os.environ.get("CF_EXCLUDE_TOP_N", 75))            # drop the majors - the edge is small-cap only
-# ---- Market-breadth index (the winning mechanism) ----
-CF_BREADTH_RET_BARS       = int(os.environ.get("CF_BREADTH_RET_BARS", 12))         # each coin's 1h return = 12x 5m
-CF_BREADTH_SMOOTH_BARS    = int(os.environ.get("CF_BREADTH_SMOOTH_BARS", 12))      # smooth breadth over 1h
-CF_BREADTH_LAG_BARS       = int(os.environ.get("CF_BREADTH_LAG_BARS", 1))          # lag 1 bar = zero look-ahead
-CF_BREADTH_GATE           = float(os.environ.get("CF_BREADTH_GATE", -0.8))         # only trade when smoothed/lagged breadth < -0.8% (market actively falling). Sweet spot where all 3 months stay strong; <-1.2 boosts total but flips July negative.
-# ---- Signal ----
-CF_DROP_LOOKBACK_BARS     = int(os.environ.get("CF_DROP_LOOKBACK_BARS", 12))       # coin must drop over the last 1h...
-CF_DROP_MIN_PCT           = float(os.environ.get("CF_DROP_MIN_PCT", 4.0))          # ...by >=4%, then print ONE green candle (stabilising)
-CF_ATR_TF                 = os.environ.get("CF_ATR_TF", "15m")
-CF_ATR_LEN                = int(os.environ.get("CF_ATR_LEN", 14))
-CF_SL_ATR_MULT            = float(os.environ.get("CF_SL_ATR_MULT", 2.5))           # stop 2.5x ATR15 below entry
-CF_TARGET_RR              = float(os.environ.get("CF_TARGET_RR", 3.0))             # fixed 3R target (no trail)
-CF_MAX_HOLD_SECONDS       = int(os.environ.get("CF_MAX_HOLD_SECONDS", 14400))      # 4h max hold
-CF_COOLDOWN_SECONDS       = int(os.environ.get("CF_COOLDOWN_SECONDS", 7200))       # 24 bars/coin
-# ---- Entry (dip-buy at the green candle's close) ----
-# Backtest entered via a resting MAKER LIMIT bid at the green candle's close, filling
-# only if price traded CF_PIERCE_PCT through it (models adverse selection - you catch
-# the exact dip you wanted). LIVE we cannot rest/cancel a real exchange limit safely
-# (cancel_order is unverified - see its docstring), so we mirror the proven Fast-retest
-# pattern: ARM the bid, monitor price, and MARKET-fill on touch-through. Cost vs
-# backtest: we pay TAKER not maker (backtest taker was still +0.314R, so positive) and
-# a dip that wicks through and bounces inside one 30s poll gap is missed.
-CF_PIERCE_PCT             = float(os.environ.get("CF_PIERCE_PCT", 0.1))            # price must trade 0.1% THROUGH the bid to fill
-CF_PENDING_EXPIRY_SECONDS = int(os.environ.get("CF_PENDING_EXPIRY_SECONDS", 600))  # 2x 5m to get the dip, else skip
-CF_RISK_USDT              = float(os.environ.get("CF_RISK_USDT", 2.0))             # hardcoded $100-account sizing (matches Tight/Fast/T3)
-CF_MAX_MARGIN_USDT        = float(os.environ.get("CF_MAX_MARGIN_USDT", 25.0))
-CF_MAX_CONCURRENT_TRADES  = int(os.environ.get("CF_MAX_CONCURRENT_TRADES", 2))
-# ---- Progress-based exit (2026-07-29): CF previously had NO trailing/stagnation, only
-# fixed 3R TP / SL / 4h-market-close. That made almost every TimeExit a small loss.
-# Now: BE at 1R, trail from 1.5R (stop = peak_R - 1R), and a stagnation early-exit
-# that closes a flat/barely-green trade instead of holding the full 4h. Mirrors RSI.
-CF_BE_TRIGGER_R           = float(os.environ.get("CF_BE_TRIGGER_R", 1.0))
-CF_TRAIL_START_R          = float(os.environ.get("CF_TRAIL_START_R", 1.5))
-CF_TRAIL_GAP_R            = float(os.environ.get("CF_TRAIL_GAP_R", 1.0))
-CF_TRAIL_STEP_R           = float(os.environ.get("CF_TRAIL_STEP_R", 0.25))
-# Stagnation: after CF_STAGNATION_SECONDS, if the trade never reached CF_STAGNATION_MIN_R
-# of favorable progress, cut it at market rather than waiting for the 4h TimeExit.
-CF_STAGNATION_SECONDS     = int(os.environ.get("CF_STAGNATION_SECONDS", 5400))     # 1.5h
-CF_STAGNATION_MIN_R       = float(os.environ.get("CF_STAGNATION_MIN_R", 0.5))
-
-# ==================== RSI REVERSION CONFIG (RSI Oversold Reversion, replaces Tight 2) ====================
-# Backtest: n=1584, win 55.4%, net +0.114R, ALL SIX 2-week blocks positive (the only
-# Tight-2 candidate with no negative block). Coin-specific, NO breadth dependency.
-RSI_TIMEFRAME             = os.environ.get("RSI_TIMEFRAME", "5m")
-RSI_SCAN_INTERVAL_SECONDS = int(os.environ.get("RSI_SCAN_INTERVAL_SECONDS", 120))
-RSI_MIN_QUOTE_VOL         = float(os.environ.get("RSI_MIN_QUOTE_VOL", 1_000_000))
-RSI_MAX_SYMBOLS           = int(os.environ.get("RSI_MAX_SYMBOLS", 250))
-RSI_EXCLUDE_TOP_N         = int(os.environ.get("RSI_EXCLUDE_TOP_N", 75))           # small-cap set, like the backtest universe
-RSI_LEN                   = int(os.environ.get("RSI_LEN", 14))
-RSI_ENTRY                 = float(os.environ.get("RSI_ENTRY", 15.0))               # 2026-07-26: 20->15 (deep oversold). 8mo+concurrency backtest: RSI<20 is net-negative, RSI<15 is +$45/8mo positive & robust. Biggest Tight2 fix.
-RSI_ATR_TF                = os.environ.get("RSI_ATR_TF", "15m")
-RSI_ATR_LEN               = int(os.environ.get("RSI_ATR_LEN", 14))
-RSI_SL_ATR_MULT           = float(os.environ.get("RSI_SL_ATR_MULT", 2.5))          # 2026-07-26: 3.5->2.5 (tighter SL). Backtest: SL2.5 beats SL3.5 on 8mo. stop 2.5x ATR15
-# ---- Exit: BE at 1R, then trail from 1.5R (stop = peak_R minus 1R). No fixed TP. ----
-RSI_BE_TRIGGER_R          = float(os.environ.get("RSI_BE_TRIGGER_R", 1.0))
-RSI_TRAIL_START_R         = float(os.environ.get("RSI_TRAIL_START_R", 1.5))
-RSI_TRAIL_GAP_R           = float(os.environ.get("RSI_TRAIL_GAP_R", 1.0))          # trail stop R = live peak R - 1.0
-RSI_TRAIL_STEP_R          = float(os.environ.get("RSI_TRAIL_STEP_R", 0.25))        # only re-place the exchange SL when it improves >=0.25R
-RSI_MAX_HOLD_SECONDS      = int(os.environ.get("RSI_MAX_HOLD_SECONDS", 14400))     # 4h
-# Stagnation early-exit (2026-07-29): RSI already trails, but a trade that never gets
-# going still sat the full 4h. Cut it early if peak_R stays below the floor.
-RSI_STAGNATION_SECONDS    = int(os.environ.get("RSI_STAGNATION_SECONDS", 5400))    # 1.5h
-RSI_STAGNATION_MIN_R      = float(os.environ.get("RSI_STAGNATION_MIN_R", 0.5))
-RSI_COOLDOWN_SECONDS      = int(os.environ.get("RSI_COOLDOWN_SECONDS", 7200))      # 24 bars/coin
-RSI_DEDUP_SECONDS         = int(os.environ.get("RSI_DEDUP_SECONDS", 3600))         # skip if this coin took a Crash Fade entry within +/-12 bars - keeps the two strategies disjoint
-RSI_RISK_USDT             = float(os.environ.get("RSI_RISK_USDT", 2.0))
-RSI_LEVERAGE              = int(os.environ.get("RSI_LEVERAGE", 20))
-RSI_MAX_MARGIN_USDT       = float(os.environ.get("RSI_MAX_MARGIN_USDT", 25.0))
-RSI_MAX_CONCURRENT_TRADES = int(os.environ.get("RSI_MAX_CONCURRENT_TRADES", 2))
-
 # ==================== GLOBAL STATE ====================
-# Command mapping kept stable so existing Telegram habits / Render setup still work:
-#   /start /stop        -> RSI Reversion engine   (was Tight)
-#   /fast_start /fast_stop -> Crash Fade engine    (was Fast)
 #   /t1_start /t1_stop   -> Tight 1 (Dormant Awakening)
-rsi_auto_trade_enabled = AUTO_RESUME_ON_START
-cf_auto_trade_enabled  = False   # 2026-08-08: CrashFade PERMANENTLY OFF. It has no validated edge and it opened 1000BONK at the same time as Tight 2 (uncapped), causing a duplicate position + liquidation. /fast_start is also blocked below. Do not re-enable without a shared-cap-aware rewrite.
-CF_PERMANENTLY_DISABLED = True
 symbol_precision   = {}
 symbol_max_lev     = {}
-
-cf_open_trades   = {}   # symbol -> open Crash Fade trade
-cf_pending       = {}   # symbol -> armed dip-buy waiting for the pierce fill (cf_check_pending)
-cf_cooldown      = {}   # symbol -> unix ts until which no new Crash Fade entry
-cf_last_entry_ts = {}   # symbol -> ts of last Crash Fade entry (used for RSI dedup)
-
-rsi_open_trades  = {}   # order_id -> open RSI Reversion trade
-rsi_cooldown     = {}   # symbol -> unix ts until which no new RSI entry
 
 daily_trades       = []
 last_summary_date  = None
@@ -764,11 +670,8 @@ def adopt_positions_on_start():
     ORPHANS the old positions (their BE/trail management never runs again). This
     re-adopts what is actually open on BingX so the caps hold and management resumes.
 
-    Only LONG positions are adopted (CF and RSI are always long; T3 longs too). A LONG
-    that already has a TAKE_PROFIT order on the exchange is a Crash Fade bracket (SL+3R
-    TP both live on BingX regardless of restart) -> tracked by track_cf_trades. A LONG
-    with no TP is a trail-managed position (RSI / T3-long) -> tracked by track_rsi_trades
-    (BE at 1R, then trail). If a position has no SL at all, a protective SL is placed and
+    Only LONG positions are adopted here. Any adopted LONG is handed to the Tight 2
+    tracker (it manages BE/trail/TP for both long and short). If a position has no SL at all, a protective SL is placed and
     the user is alerted. SHORT positions keep their exchange SL and are only reported."""
     try:
         positions = get_open_positions()
@@ -778,8 +681,8 @@ def adopt_positions_on_start():
     if not positions:
         print("[ADOPT] no open positions on BingX to re-adopt")
         return
-    tracked = {t["symbol"] for t in cf_open_trades.values()} | {t["symbol"] for t in rsi_open_trades.values()}
-    adopted_cf = adopted_rsi = shorts = 0
+    tracked = {t["symbol"] for t in t2_open_trades.values()} | {t["symbol"] for t in t3_open_trades.values()}
+    adopted = shorts = 0
     lines = []
     for p in positions:
         sym, amt, avg = p["symbol"], p["amt"], p["avg"]
@@ -801,34 +704,35 @@ def adopt_positions_on_start():
                 send_tg("ADOPT - " + sym + " LONG had no SL - placed a protective 5% stop at " + str(fallback_sl) + " until trailing takes over.")
         now = time.time()
         if tp_id is not None:
-            # Crash Fade bracket (SL + 3R TP already live) -> let track_cf_trades watch it.
-            cf_open_trades[sym] = {
+            # Adopted LONG with a live TP bracket -> hand to Tight 2 tracker.
+            t2_open_trades["adopt-" + sym] = {
                 "symbol": sym, "side": "BUY", "entry": avg, "entry_fill": avg,
                 "sl": sl_price if sl_price else round(avg * 0.95, 6), "sl_id": sl_id,
                 "tp": tp_price, "tp_id": tp_id, "close_side": "SELL", "pos_side": "LONG",
-                "total_qty": amt, "remaining_qty": amt,
-                "risk_dist": abs(avg - (sl_price or avg * 0.95)),
-                "atr_at_entry": 0.0, "opened_ts": now,
-                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            }
-            adopted_cf += 1
-            lines.append(sym + " LONG -> Crash Fade (SL+TP bracket)")
-        else:
-            # Trail-managed (RSI / T3-long): no exchange TP, exit is bot-driven.
-            risk_dist = abs(avg - sl_price) if sl_price else avg * 0.05
-            rsi_open_trades["adopt-" + sym] = {
-                "symbol": sym, "side": "BUY", "entry": avg, "entry_fill": avg,
-                "sl": sl_price if sl_price else round(avg * 0.95, 6), "sl_id": sl_id,
-                "close_side": "SELL", "pos_side": "LONG",
-                "total_qty": amt, "remaining_qty": amt,
-                "risk_dist": risk_dist if risk_dist > 0 else avg * 0.05,
+                "total_qty": amt,
+                "risk_dist": abs(avg - (sl_price or avg * 0.95)), "risk_usdt": T2_RISK_USDT,
                 "atr_at_entry": 0.0, "opened_ts": now,
                 "peak_r": 0.0, "be_done": False, "stop_r": None,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             }
-            adopted_rsi += 1
-            lines.append(sym + " LONG -> trail-managed (BE@1R then trail)")
-    print(f"[ADOPT] re-adopted {adopted_cf} CF + {adopted_rsi} trail-managed, {shorts} short(s) left on their SL")
+            adopted += 1
+            lines.append(sym + " LONG -> Tight 2 (adopted SL+TP bracket)")
+        else:
+            # Adopted LONG with no exchange TP -> hand to Tight 2 tracker (bot-driven exit).
+            risk_dist = abs(avg - sl_price) if sl_price else avg * 0.05
+            t2_open_trades["adopt-" + sym] = {
+                "symbol": sym, "side": "BUY", "entry": avg, "entry_fill": avg,
+                "sl": sl_price if sl_price else round(avg * 0.95, 6), "sl_id": sl_id,
+                "tp": None, "tp_id": None, "close_side": "SELL", "pos_side": "LONG",
+                "total_qty": amt,
+                "risk_dist": risk_dist if risk_dist > 0 else avg * 0.05, "risk_usdt": T2_RISK_USDT,
+                "atr_at_entry": 0.0, "opened_ts": now,
+                "peak_r": 0.0, "be_done": False, "stop_r": None,
+                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+            }
+            adopted += 1
+            lines.append(sym + " LONG -> Tight 2 (adopted, trail-managed)")
+    print(f"[ADOPT] re-adopted {adopted} into Tight 2, {shorts} short(s) left on their SL")
     if lines:
         send_tg("STARTUP RE-ADOPT\n------------------------------\n" + "\n".join(lines) +
                 "\n------------------------------\nConcurrency caps and trailing now account for these.")
@@ -848,707 +752,8 @@ def place_sl_guarded(symbol, close_side, pos_side, sl_price, qty):
     return None
 
 
-
-
 # ==================== EXTRA INDICATOR: WILDER RSI ====================
-def rsi_series(closes, period=14):
-    """Wilder's RSI. Returns a list the same length as `closes`; indices before the
-    first real value are filled with 50.0 (neutral) - only the last CLOSED-candle
-    value is ever used, so the padding is irrelevant. Standard smoothed RSI, matching
-    the backtest definition (14-period RSI on 5m closes)."""
-    n = len(closes)
-    if n < period + 1:
-        return [50.0] * n
-    gains, losses = [], []
-    for i in range(1, n):
-        ch = closes[i] - closes[i - 1]
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    rsis = [50.0] * (period + 1)   # closes[0..period] have no defined RSI yet
-    def _rsi(ag, al):
-        if al == 0:
-            return 100.0
-        rs = ag / al
-        return 100.0 - (100.0 / (1.0 + rs))
-    rsis[period] = _rsi(avg_gain, avg_loss)
-    for i in range(period, n - 1):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rsis.append(_rsi(avg_gain, avg_loss))
-    if len(rsis) < n:
-        rsis += [rsis[-1]] * (n - len(rsis))
-    return rsis[:n]
 
-
-
-# ==================== CRASH FADE ENGINE (Market-Breadth Crash Fade) ====================
-def cf_in_cooldown(symbol):
-    return time.time() < cf_cooldown.get(symbol, 0)
-
-
-def cf_atr15(symbol):
-    """14-period ATR on the CLOSED 15m candles. Returns 0 on failure."""
-    candles = get_candles(symbol, limit=CF_ATR_LEN + 40, interval=CF_ATR_TF)
-    closed = candles[:-1] if len(candles) > 1 else candles
-    if len(closed) < CF_ATR_LEN + 1:
-        return 0.0
-    highs  = [h(c) for c in closed]
-    lows   = [l(c) for c in closed]
-    closes = [cl(c) for c in closed]
-    return atr_series(highs, lows, closes, CF_ATR_LEN)[-1]
-
-
-def cf_compute_breadth(candles_map):
-    """The winning mechanism. Across the whole small-cap sample, compute each coin's
-    1h return (12x 5m) at each of the last few CLOSED 5m bars, average CROSS-SECTIONALLY
-    per bar (= how the universe is moving), then smooth over the last 12 bars and LAG
-    by 1 (zero look-ahead). Returns the smoothed/lagged breadth in PERCENT.
-
-    Fully reconstructed each cycle from closed 5m candles only - stateless and
-    look-ahead-safe. All coins are fetched within one cycle so position -1 is the same
-    wall-clock 5m bar across the sample."""
-    ret_bars = CF_BREADTH_RET_BARS
-    raw = []   # one cross-sectional mean per lagged bar
-    # Skip the most recent CF_BREADTH_LAG_BARS bars (the lag), then take the next
-    # CF_BREADTH_SMOOTH_BARS bars going back, and average the universe at each.
-    for offset in range(CF_BREADTH_LAG_BARS, CF_BREADTH_LAG_BARS + CF_BREADTH_SMOOTH_BARS):
-        bar_returns = []
-        for candles in candles_map.values():
-            if len(candles) >= ret_bars + offset + 1:
-                c_now  = cl(candles[-1 - offset])
-                c_prev = cl(candles[-1 - offset - ret_bars])
-                if c_prev > 0:
-                    bar_returns.append((c_now / c_prev - 1.0) * 100.0)
-        if bar_returns:
-            raw.append(sum(bar_returns) / len(bar_returns))
-    if not raw:
-        return 0.0
-    return sum(raw) / len(raw)
-
-
-def check_cf(symbol, candles):
-    """Arm a Crash Fade dip-buy if this coin just dropped >=4% over the last 1h and
-    then printed one green candle. `candles` = CLOSED 5m candles (in-progress dropped).
-    The market-wide breadth gate is checked ONCE per cycle by the caller."""
-    if symbol in cf_open_trades or symbol in cf_pending or cf_in_cooldown(symbol):
-        return
-    n = CF_DROP_LOOKBACK_BARS
-    if len(candles) < n + 3:
-        return
-    green = candles[-1]
-    if cl(green) <= o(green):            # latest closed candle must be GREEN (stabilising)
-        return
-    start_close = cl(candles[-2 - n])    # n bars before the candle preceding the green one
-    end_close   = cl(candles[-2])        # the (red) candle just before the green stabiliser
-    if start_close <= 0:
-        return
-    drop_pct = (end_close / start_close - 1.0) * 100.0
-    if drop_pct > -CF_DROP_MIN_PCT:      # need a drop of at least CF_DROP_MIN_PCT
-        return
-
-    bid = cl(green)                      # resting maker bid = the green candle's close
-    atr15 = cf_atr15(symbol)
-    if atr15 <= 0:
-        print(f"[CF SKIP] {symbol} - no ATR15")
-        return
-    sl_price = bid - CF_SL_ATR_MULT * atr15
-    if sl_price <= 0 or bid - sl_price <= 0:
-        return
-    target = bid + CF_TARGET_RR * (bid - sl_price)
-    fill_trigger = bid * (1.0 - CF_PIERCE_PCT / 100.0)   # must trade 0.1% THROUGH the bid
-    now = time.time()
-    cf_pending[symbol] = {
-        "side": "BUY", "bid": bid, "sl": sl_price, "target": target,
-        "atr15": atr15, "fill_trigger": fill_trigger, "drop_pct": drop_pct,
-        "armed_ts": now, "expiry_ts": now + CF_PENDING_EXPIRY_SECONDS,
-        "risk_usdt": CF_RISK_USDT,
-    }
-    print(f"[CF ARM] {symbol} drop={drop_pct:.1f}% bid={bid} SL={round(sl_price,6)} "
-          f"TP(3R)={round(target,6)} fill<={round(fill_trigger,6)}")
-    send_tg(
-        "CRASH FADE ARMED - BUY - " + symbol + "\n------------------------------\n"
-        "1h drop: " + str(round(drop_pct, 1)) + "% then green candle (stabilising)\n"
-        "Bid: " + str(round(bid, 6)) + " (fills only on a " + str(CF_PIERCE_PCT) + "% dip through) | SL: " + str(round(sl_price, 6)) + "\n"
-        "TP (" + str(CF_TARGET_RR) + "R): " + str(round(target, 6)) + " | expires " + str(CF_PENDING_EXPIRY_SECONDS // 60) + "min\n"
-        "------------------------------\nNiti Crash Fade"
-    )
-
-
-def cf_check_pending():
-    """Fill monitor for armed Crash Fade dip-buys (called every 30s trailing pass).
-    LONG dip-buy: we want price to come DOWN to our bid.
-      1. price falls to the SL zone first -> the crash kept going, breakout of the
-         fade failed, NO entry (loss avoided)
-      2. price dips through the bid       -> fill at market (catches the dip)
-      3. neither within the window        -> skip"""
-    now_ts = time.time()
-    for symbol in list(cf_pending.keys()):
-        try:
-            p = cf_pending[symbol]
-            if now_ts >= p["expiry_ts"]:
-                del cf_pending[symbol]
-                print(f"[CF EXPIRED] {symbol} - no dip to {round(p['fill_trigger'],6)}")
-                send_tg("CRASH FADE EXPIRED - " + symbol + "\nNo dip to the bid within " +
-                        str(CF_PENDING_EXPIRY_SECONDS // 60) + "min - skipped")
-                continue
-            px = get_current_price(symbol)
-            if px <= 0:
-                continue
-            if px <= p["sl"]:
-                del cf_pending[symbol]
-                print(f"[CF INVALIDATED] {symbol} price {px} hit SL zone {round(p['sl'],6)} before fill")
-                send_tg("CRASH FADE INVALIDATED - " + symbol +
-                        "\nPrice reached the SL zone (" + str(round(p["sl"], 6)) +
-                        ") before the dip filled - crash continued, no entry taken")
-                continue
-            if px > p["fill_trigger"]:
-                continue   # not dipped enough yet
-            del cf_pending[symbol]
-            if symbol in cf_open_trades or symbol in all_open_symbols():
-                continue   # cross-engine: never open a coin another engine holds
-            trade_status = ""
-            if cf_auto_trade_enabled and t2_total_open() >= SHARED_MAX_CONCURRENT:
-                trade_status = "\nSkipped - shared cap (" + str(SHARED_MAX_CONCURRENT) + ") reached"
-            elif cf_auto_trade_enabled and len(cf_open_trades) >= CF_MAX_CONCURRENT_TRADES:
-                trade_status = "\nSkipped - max concurrent trades (" + str(CF_MAX_CONCURRENT_TRADES) + ") reached"
-            elif cf_auto_trade_enabled:
-                oid = place_cf_order(symbol, p["bid"], p["sl"], p["target"], p["atr15"], p["risk_usdt"])
-                if oid == "MARGIN_SKIP":
-                    trade_status = "\nSkipped - insufficient margin"
-                elif oid and oid != "N/A":
-                    trade_status = "\nOrder: " + str(oid)
-                    cf_last_entry_ts[symbol] = time.time()
-                    cf_cooldown[symbol] = time.time() + CF_COOLDOWN_SECONDS
-                else:
-                    trade_status = "\nOrder failed"
-            else:
-                trade_status = "\nAuto-trade OFF"
-                cf_cooldown[symbol] = time.time() + CF_COOLDOWN_SECONDS
-            print(f"[CF FILL] {symbol} dip filled @ {px} (bid {p['bid']}){trade_status}")
-            send_tg(
-                "CRASH FADE FILLED - BUY - " + symbol + "\n------------------------------\n"
-                "Entry: " + str(round(p["bid"], 6)) + " (dip fill @ " + str(round(px, 6)) + ") | SL: " + str(round(p["sl"], 6)) + "\n"
-                "TP (" + str(CF_TARGET_RR) + "R): " + str(round(p["target"], 6)) + " | max hold " + str(CF_MAX_HOLD_SECONDS // 3600) + "h\n"
-                "1h drop: " + str(round(p["drop_pct"], 1)) + "% | Risk: $" + str(p["risk_usdt"]) +
-                trade_status + "\n------------------------------\nNiti Crash Fade"
-            )
-        except Exception as e:
-            print(f"[CF PENDING {symbol}] error: {e}")
-
-
-def place_cf_order(symbol, entry, sl_price, target, atr15, risk_usdt):
-    """Full-size LONG with a structural SL and a single fixed 3R TP (no half/trail).
-    Mirrors the proven Tight/Fast sizing, margin pre-check and SL/TP guards."""
-    try:
-        lev = get_fast_leverage(symbol)
-        set_leverage_api(symbol, lev)
-        precision = symbol_precision.get(symbol, 4)
-        risk_dist = abs(entry - sl_price)
-        if risk_dist <= 0:
-            return None
-        risk_qty       = risk_usdt / risk_dist
-        margin_cap_qty = (CF_MAX_MARGIN_USDT * lev) / entry
-        total_qty      = round(min(risk_qty, margin_cap_qty), precision)
-        if total_qty <= 0:
-            return None
-        pos_side, close_side = "LONG", "SELL"
-
-        required_margin = total_qty * entry / lev
-        avail = get_available_margin()
-        if avail is not None and avail < required_margin * 1.05:
-            print(f"[CF MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f}")
-            return "MARGIN_SKIP"
-
-        order_id = place_market_order(symbol, "BUY", total_qty, pos_side)
-        print(f"[CF ORDER] {symbol} BUY lev={lev}x qty={total_qty} risk=${risk_usdt}: {order_id}")
-        if order_id != "N/A":
-            time.sleep(0.5)
-            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
-            risk_dist  = abs(entry_fill - sl_price)
-            if risk_dist <= 0:
-                risk_dist = abs(entry - sl_price)
-            tp_price = round(entry_fill + risk_dist * CF_TARGET_RR, 6)   # price precision, not qty precision
-
-            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl_price, total_qty)
-            if sl_id is None:
-                print(f"[CF SL GUARD] {symbol} SL failed twice - emergency closing")
-                place_market_order(symbol, close_side, total_qty, pos_side)
-                send_tg(f"⚠️ CRASH FADE {symbol}: SL placement failed - position emergency-closed for safety")
-                return None
-            tp_id = place_tp_guarded(symbol, close_side, pos_side, tp_price, total_qty, label="TP-3R")
-            cf_open_trades[symbol] = {
-                "symbol": symbol, "side": "BUY", "entry": entry, "entry_fill": entry_fill,
-                "sl": sl_price, "sl_id": sl_id, "tp": tp_price, "tp_id": tp_id,
-                "close_side": close_side, "pos_side": pos_side,
-                "total_qty": total_qty, "remaining_qty": total_qty,
-                "risk_dist": risk_dist, "atr_at_entry": atr15, "opened_ts": time.time(),
-                "risk_usdt": risk_usdt, "peak_r": 0.0, "be_done": False, "stop_r": None,
-                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            }
-        return order_id
-    except Exception as e:
-        print(f"[CF ORDER ERROR] {symbol}: {e}")
-        return None
-
-
-def close_cf_position(symbol, reason=""):
-    if symbol not in cf_open_trades:
-        return
-    trade = cf_open_trades[symbol]
-    try:
-        remaining  = trade.get("remaining_qty", 0)
-        exit_price = get_current_price(symbol)
-        if remaining > 0 and cf_auto_trade_enabled:
-            close_oid = place_market_order(symbol, trade["close_side"], remaining, trade["pos_side"])
-            if close_oid and close_oid != "N/A":
-                time.sleep(0.5)
-                exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
-        if trade.get("sl_id"):
-            cancel_order(symbol, trade["sl_id"])
-        if trade.get("tp_id"):
-            cancel_order(symbol, trade["tp_id"])
-        entry_ref = trade.get("entry_fill", trade["entry"])
-        leg_pnl = (exit_price - entry_ref) * remaining   # LONG only
-        trade["pnl"]    = round(leg_pnl, 2)
-        trade["result"] = reason
-        trade["label"]  = "CrashFade"
-        daily_trades.append(trade)
-        journal_closed_trade(trade)
-        del cf_open_trades[symbol]
-        print(f"[CF CLOSE] {symbol} {reason}")
-    except Exception as e:
-        print(f"[CF CLOSE ERROR] {symbol}: {e}")
-
-
-def track_cf_trades(open_syms=None):
-    for symbol in list(cf_open_trades.keys()):
-        try:
-            trade = cf_open_trades[symbol]
-            entry_ref = trade.get("entry_fill", trade["entry"])
-
-            # TP (3R) filled
-            if trade.get("tp_id"):
-                if check_order_status(trade["tp_id"], symbol) == "FILLED":
-                    if trade.get("sl_id"):
-                        cancel_order(symbol, trade["sl_id"])
-                    tp_fill = get_fill_price(trade["tp_id"], symbol, fallback=trade["tp"])
-                    trade["pnl"]    = round((tp_fill - entry_ref) * trade["remaining_qty"], 2)
-                    trade["result"] = "TP"
-                    trade["label"]  = "CrashFade"
-                    daily_trades.append(trade)
-                    journal_closed_trade(trade)
-                    del cf_open_trades[symbol]
-                    continue
-
-            # SL filled
-            if trade.get("sl_id"):
-                if check_order_status(trade["sl_id"], symbol) == "FILLED":
-                    if trade.get("tp_id"):
-                        cancel_order(symbol, trade["tp_id"])
-                    sl_fill = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
-                    trade["pnl"]    = round((sl_fill - entry_ref) * trade["remaining_qty"], 2)
-                    trade["result"] = "SL"
-                    trade["label"]  = "CrashFade"
-                    daily_trades.append(trade)
-                    journal_closed_trade(trade)
-                    del cf_open_trades[symbol]
-                    continue
-
-            # ---- Liquidation detect: position gone from exchange, no TP/SL fill ----
-            # Only trust the open-set when we actually fetched it this cycle (open_syms
-            # is a set); if the position-fetch failed (None) we skip and try next cycle,
-            # never guessing a liquidation from a failed API call.
-            if open_syms is not None and symbol not in open_syms:
-                if confirm_liquidated(symbol, trade):
-                    journal_liquidation(trade, "CrashFade")
-                    del cf_open_trades[symbol]
-                    continue
-                # SL/TP still on exchange -> positions call lied, position is open.
-
-            # ---- Progress management: BE at 1R, trail from 1.5R (peak-1R) ----
-            risk_dist = trade.get("risk_dist", 0)
-            current   = get_current_price(symbol)
-            if current > 0 and risk_dist > 0:
-                favorable_r = (current - entry_ref) / risk_dist   # LONG
-                if favorable_r > trade.get("peak_r", 0.0):
-                    trade["peak_r"] = favorable_r
-                peak_r = trade.get("peak_r", 0.0)
-
-                target_stop_r = None
-                if peak_r >= CF_TRAIL_START_R:
-                    target_stop_r = peak_r - CF_TRAIL_GAP_R
-                elif peak_r >= CF_BE_TRIGGER_R:
-                    target_stop_r = 0.0
-
-                if target_stop_r is not None:
-                    cur_stop_r = trade.get("stop_r")
-                    if cur_stop_r is None or target_stop_r >= cur_stop_r + CF_TRAIL_STEP_R:
-                        new_sl = round(entry_ref + target_stop_r * risk_dist, 6)
-                        if new_sl > trade["sl"] and new_sl < current:
-                            new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
-                            if new_id:
-                                if trade.get("sl_id"):
-                                    cancel_order(symbol, trade["sl_id"])
-                                trade["sl_id"]  = new_id
-                                trade["sl"]     = new_sl
-                                trade["stop_r"] = target_stop_r
-                                tag = "BE" if target_stop_r <= 0.0001 else f"+{target_stop_r:.2f}R"
-                                print(f"[CF TRAIL] {symbol} peak {peak_r:.2f}R -> SL {new_sl} ({tag})")
-                            else:
-                                print(f"[CF TRAIL FAIL] {symbol} SL re-placement failed - keeping SL {trade['sl']}")
-
-            # ---- Stagnation early-exit: flat too long, cut before the 4h TimeExit ----
-            held = time.time() - trade.get("opened_ts", time.time())
-            if held >= CF_STAGNATION_SECONDS and trade.get("peak_r", 0.0) < CF_STAGNATION_MIN_R:
-                print(f"[CF STAGNATION] {symbol} peak {trade.get('peak_r',0):.2f}R < {CF_STAGNATION_MIN_R}R after {held/3600:.1f}h")
-                close_cf_position(symbol, "Stagnation")
-                continue
-
-            # 4h max hold
-            if held >= CF_MAX_HOLD_SECONDS:
-                print(f"[CF MAX HOLD] {symbol}")
-                close_cf_position(symbol, "TimeExit")
-                continue
-        except Exception as e:
-            print(f"[CF TRACK ERROR] {symbol}: {e}")
-
-
-def cf_diagnostic_check(breadth, gate_on, universe_n):
-    print(f"[CF DIAG] breadth(smoothed,lagged)={breadth:+.3f}% | gate(<{CF_BREADTH_GATE}%)={'ON' if gate_on else 'off'} | "
-          f"sample={universe_n} | open={len(cf_open_trades)} | pending={len(cf_pending)} | auto={cf_auto_trade_enabled}")
-
-
-def cf_scan_loop():
-    print(f"Crash Fade loop started - {CF_TIMEFRAME} | market-breadth gate <{CF_BREADTH_GATE}% -> fade 4% drops on a green candle -> dip-buy -> 3R")
-    all_symbols = []
-    need = CF_BREADTH_RET_BARS + CF_BREADTH_SMOOTH_BARS + CF_BREADTH_LAG_BARS + 5
-    while True:
-        try:
-            if api_backoff_active():
-                time.sleep(30)
-                continue
-            if not all_symbols:
-                all_symbols = get_futures_symbols() or []
-            universe = get_liquid_symbols(all_symbols, min_quote_vol=CF_MIN_QUOTE_VOL,
-                                          max_n=CF_MAX_SYMBOLS, exclude_top_n=CF_EXCLUDE_TOP_N)
-            universe = [s for s in universe if not is_tokenized(s)]
-
-            candles_map = {}
-            for sym in universe:
-                if api_backoff_active():
-                    break
-                c = get_candles(sym, limit=need + 5, interval=CF_TIMEFRAME)
-                if len(c) > 1:
-                    candles_map[sym] = c[:-1]   # drop the in-progress candle
-                time.sleep(0.15)
-
-            if len(candles_map) < 10:
-                print(f"[CF SCAN] only {len(candles_map)} coins with candles - skipping this pass")
-                time.sleep(CF_SCAN_INTERVAL_SECONDS)
-                continue
-
-            breadth = cf_compute_breadth(candles_map)
-            gate_on = breadth < CF_BREADTH_GATE
-            cf_diagnostic_check(breadth, gate_on, len(candles_map))
-
-            if gate_on:
-                armed = 0
-                for sym, c in candles_map.items():
-                    check_cf(sym, c)
-                    if sym in cf_pending:
-                        armed += 1
-                print(f"[CF SCAN] gate OPEN (breadth {breadth:+.2f}%) - {armed} dip-buy(s) armed")
-            else:
-                print(f"[CF SCAN] gate closed (breadth {breadth:+.2f}% >= {CF_BREADTH_GATE}%) - market not crashing, no fades")
-        except Exception as e:
-            print(f"[CF LOOP ERROR] {e}")
-        time.sleep(CF_SCAN_INTERVAL_SECONDS)
-
-
-
-# ==================== RSI REVERSION ENGINE (RSI Oversold Reversion) ====================
-def rsi_in_cooldown(symbol):
-    return time.time() < rsi_cooldown.get(symbol, 0)
-
-
-def rsi_symbol_open(symbol):
-    return any(t["symbol"] == symbol for t in rsi_open_trades.values())
-
-
-def rsi_atr15(symbol):
-    candles = get_candles(symbol, limit=RSI_ATR_LEN + 40, interval=RSI_ATR_TF)
-    closed = candles[:-1] if len(candles) > 1 else candles
-    if len(closed) < RSI_ATR_LEN + 1:
-        return 0.0
-    highs  = [h(c) for c in closed]
-    lows   = [l(c) for c in closed]
-    closes = [cl(c) for c in closed]
-    return atr_series(highs, lows, closes, RSI_ATR_LEN)[-1]
-
-
-def check_rsi(symbol):
-    """RSI(14) < 20 on 5m AND a green candle -> buy the reversion. Deduped against
-    Crash Fade so the two engines never fire on the same coin within +/-12 bars."""
-    if rsi_symbol_open(symbol) or rsi_in_cooldown(symbol):
-        return
-    # Dedup vs Crash Fade (+/-12 bars ~ 1h): CF and RSI stay disjoint.
-    last_cf = cf_last_entry_ts.get(symbol, 0)
-    if last_cf and (time.time() - last_cf) < RSI_DEDUP_SECONDS:
-        return
-    if symbol in cf_pending or symbol in cf_open_trades:
-        return
-
-    candles = get_candles(symbol, limit=RSI_LEN + 60, interval=RSI_TIMEFRAME)
-    closed = candles[:-1] if len(candles) > 1 else candles
-    if len(closed) < RSI_LEN + 2:
-        return
-    closes = [cl(c) for c in closed]
-    rsi_val = rsi_series(closes, RSI_LEN)[-1]
-    last = closed[-1]
-    if rsi_val >= RSI_ENTRY:
-        return
-    if cl(last) <= o(last):          # candle must be green (turning up)
-        return
-
-    entry = cl(last)
-    atr15 = rsi_atr15(symbol)
-    if atr15 <= 0:
-        print(f"[RSI SKIP] {symbol} - no ATR15")
-        return
-    sl_price = entry - RSI_SL_ATR_MULT * atr15
-    if sl_price <= 0 or entry - sl_price <= 0:
-        return
-
-    trade_status = ""
-    if rsi_auto_trade_enabled and len(rsi_open_trades) >= RSI_MAX_CONCURRENT_TRADES:
-        trade_status = "\nSkipped - max concurrent trades (" + str(RSI_MAX_CONCURRENT_TRADES) + ") reached"
-    elif rsi_auto_trade_enabled:
-        oid = place_rsi_order(symbol, entry, sl_price, atr15)
-        if oid == "MARGIN_SKIP":
-            trade_status = "\nSkipped - insufficient margin"
-        elif oid and oid != "N/A":
-            trade_status = "\nOrder: " + str(oid)
-            rsi_cooldown[symbol] = time.time() + RSI_COOLDOWN_SECONDS
-        else:
-            trade_status = "\nOrder failed"
-    else:
-        trade_status = "\nAuto-trade OFF"
-        rsi_cooldown[symbol] = time.time() + RSI_COOLDOWN_SECONDS
-
-    print(f"[RSI ENTRY] {symbol} BUY @ {entry} RSI={rsi_val:.1f} SL={round(sl_price,6)}{trade_status}")
-    send_tg(
-        "RSI REVERSION - BUY - " + symbol + "\n------------------------------\n"
-        "RSI(14): " + str(round(rsi_val, 1)) + " (<" + str(RSI_ENTRY) + ", oversold) + green candle\n"
-        "Entry: " + str(round(entry, 6)) + " | SL (" + str(RSI_SL_ATR_MULT) + "x ATR15): " + str(round(sl_price, 6)) + "\n"
-        "Exit: BE at " + str(RSI_BE_TRIGGER_R) + "R, then trail from " + str(RSI_TRAIL_START_R) + "R (peak-" + str(RSI_TRAIL_GAP_R) + "R) | max hold " + str(RSI_MAX_HOLD_SECONDS // 3600) + "h\n"
-        "Risk: $" + str(RSI_RISK_USDT) + trade_status + "\n------------------------------\nNiti RSI Reversion"
-    )
-
-
-def place_rsi_order(symbol, entry, sl_price, atr15):
-    """Full-size LONG, structural SL, NO exchange TP - the exit is trail-managed
-    (BE at 1R, then trail from 1.5R). Mirrors the proven sizing / margin / SL guard."""
-    try:
-        set_leverage_api(symbol, RSI_LEVERAGE)
-        precision = symbol_precision.get(symbol, 4)
-        risk_dist = abs(entry - sl_price)
-        if risk_dist <= 0:
-            return None
-        risk_qty       = RSI_RISK_USDT / risk_dist
-        margin_cap_qty = (RSI_MAX_MARGIN_USDT * RSI_LEVERAGE) / entry
-        total_qty      = round(min(risk_qty, margin_cap_qty), precision)
-        if total_qty <= 0:
-            return None
-        if risk_qty > margin_cap_qty:
-            print(f"[RSI SIZE CAP] {symbol} SL too wide for full risk qty, margin-capped at ${RSI_MAX_MARGIN_USDT}")
-        pos_side, close_side = "LONG", "SELL"
-
-        required_margin = total_qty * entry / RSI_LEVERAGE
-        avail = get_available_margin()
-        if avail is not None and avail < required_margin * 1.05:
-            print(f"[RSI MARGIN SKIP] {symbol} need ~${required_margin:.2f}, available ${avail:.2f}")
-            return "MARGIN_SKIP"
-
-        order_id = place_market_order(symbol, "BUY", total_qty, pos_side)
-        print(f"[RSI ORDER] {symbol} BUY qty={total_qty} risk=${RSI_RISK_USDT}: {order_id}")
-        if order_id != "N/A":
-            time.sleep(0.5)
-            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
-            risk_dist  = abs(entry_fill - sl_price)
-            if risk_dist <= 0:
-                risk_dist = abs(entry - sl_price)
-
-            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl_price, total_qty)
-            if sl_id is None:
-                print(f"[RSI SL GUARD] {symbol} SL failed twice - emergency closing")
-                place_market_order(symbol, close_side, total_qty, pos_side)
-                send_tg(f"⚠️ RSI {symbol}: SL placement failed - position emergency-closed for safety")
-                return None
-            rsi_open_trades[str(order_id)] = {
-                "symbol": symbol, "side": "BUY", "entry": entry, "entry_fill": entry_fill,
-                "sl": sl_price, "sl_id": sl_id, "close_side": close_side, "pos_side": pos_side,
-                "total_qty": total_qty, "remaining_qty": total_qty,
-                "risk_dist": risk_dist, "atr_at_entry": atr15, "opened_ts": time.time(),
-                "peak_r": 0.0, "be_done": False, "stop_r": None, "risk_usdt": RSI_RISK_USDT,
-                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            }
-        return order_id
-    except Exception as e:
-        print(f"[RSI ORDER ERROR] {symbol}: {e}")
-        return None
-
-
-def close_rsi_position(oid, reason=""):
-    trade = rsi_open_trades.get(oid)
-    if not trade:
-        return
-    try:
-        symbol = trade["symbol"]
-        qty    = trade.get("remaining_qty", 0)
-        entry_ref  = trade.get("entry_fill", trade["entry"])
-        exit_price = get_current_price(symbol)
-        if qty > 0 and rsi_auto_trade_enabled:
-            close_oid = place_market_order(symbol, trade["close_side"], qty, trade["pos_side"])
-            if close_oid and close_oid != "N/A":
-                time.sleep(0.5)
-                exit_price = get_fill_price(close_oid, symbol, fallback=exit_price)
-        if trade.get("sl_id"):
-            cancel_order(symbol, trade["sl_id"])
-        trade["pnl"]    = round((exit_price - entry_ref) * qty, 2)   # LONG only
-        trade["result"] = reason
-        trade["label"]  = "Adopted"
-        daily_trades.append(trade)
-        journal_closed_trade(trade)
-        rsi_open_trades.pop(oid, None)
-        print(f"[RSI CLOSE] {symbol} {reason}")
-    except Exception as e:
-        print(f"[RSI CLOSE ERROR] {oid}: {e}")
-
-
-def track_rsi_trades(open_syms=None):
-    for oid in list(rsi_open_trades.keys()):
-        trade = rsi_open_trades.get(oid)
-        if not trade:
-            continue
-        try:
-            symbol    = trade["symbol"]
-            risk_dist = trade.get("risk_dist", 0)
-            entry_ref = trade.get("entry_fill", trade["entry"])
-
-            # SL fill first (BE / Trail / SL depending on where the stop was sitting).
-            if trade.get("sl_id") and check_order_status(trade["sl_id"], symbol) == "FILLED":
-                sl_fill = get_fill_price(trade["sl_id"], symbol, fallback=trade["sl"])
-                stop_r  = trade.get("stop_r")
-                if stop_r is None:
-                    result = "SL"
-                elif stop_r <= 0.0001:
-                    result = "BE"
-                else:
-                    result = "Trail"
-                trade["pnl"]    = round((sl_fill - entry_ref) * trade["remaining_qty"], 2)
-                trade["result"] = result
-                trade["label"]  = "Adopted"
-                daily_trades.append(trade)
-                journal_closed_trade(trade)
-                rsi_open_trades.pop(oid, None)
-                continue
-
-            # ---- Liquidation detect: position gone from exchange, SL didn't fill ----
-            if open_syms is not None and symbol not in open_syms:
-                if confirm_liquidated(symbol, trade):
-                    journal_liquidation(trade, "Adopted")
-                    rsi_open_trades.pop(oid, None)
-                    continue
-                # SL still on exchange -> positions call lied, position is open.
-
-            current = get_current_price(symbol)
-            if current > 0 and risk_dist > 0:
-                favorable_r = (current - entry_ref) / risk_dist   # LONG
-                if favorable_r > trade.get("peak_r", 0.0):
-                    trade["peak_r"] = favorable_r
-                peak_r = trade.get("peak_r", 0.0)
-
-                # Target stop level in R: trail from 1.5R (peak-1R); BE covers 1R-1.5R.
-                target_stop_r = None
-                if peak_r >= RSI_TRAIL_START_R:
-                    target_stop_r = peak_r - RSI_TRAIL_GAP_R
-                elif peak_r >= RSI_BE_TRIGGER_R:
-                    target_stop_r = 0.0
-
-                if target_stop_r is not None:
-                    cur_stop_r = trade.get("stop_r")
-                    if cur_stop_r is None or target_stop_r >= cur_stop_r + RSI_TRAIL_STEP_R:
-                        new_sl = round(entry_ref + target_stop_r * risk_dist, 6)
-                        # ratchet UP only, never place a sell-stop above market
-                        if new_sl > trade["sl"] and new_sl < current:
-                            new_id = place_sl_guarded(symbol, trade["close_side"], trade["pos_side"], new_sl, trade["remaining_qty"])
-                            if new_id:
-                                if trade.get("sl_id"):
-                                    cancel_order(symbol, trade["sl_id"])
-                                trade["sl_id"]  = new_id
-                                trade["sl"]     = new_sl
-                                trade["stop_r"] = target_stop_r
-                                tag = "BE" if target_stop_r <= 0.0001 else f"+{target_stop_r:.2f}R"
-                                print(f"[RSI TRAIL] {symbol} peak {peak_r:.2f}R -> SL {new_sl} ({tag})")
-                            else:
-                                print(f"[RSI TRAIL FAIL] {symbol} SL re-placement failed - keeping SL {trade['sl']}")
-
-            # ---- Stagnation early-exit: flat too long, cut before the 4h TimeExit ----
-            held = time.time() - trade.get("opened_ts", time.time())
-            if held >= RSI_STAGNATION_SECONDS and trade.get("peak_r", 0.0) < RSI_STAGNATION_MIN_R:
-                print(f"[RSI STAGNATION] {symbol} peak {trade.get('peak_r',0):.2f}R < {RSI_STAGNATION_MIN_R}R after {held/3600:.1f}h")
-                close_rsi_position(oid, "Stagnation")
-                continue
-
-            # 4h max hold
-            if held >= RSI_MAX_HOLD_SECONDS:
-                print(f"[RSI MAX HOLD] {symbol}")
-                close_rsi_position(oid, "TimeExit")
-                continue
-        except Exception as e:
-            print(f"[RSI TRACK ERROR] {oid}: {e}")
-
-
-def rsi_diagnostic_check():
-    try:
-        candles = get_candles("BTC-USDT", limit=RSI_LEN + 60, interval=RSI_TIMEFRAME)
-        closed = candles[:-1] if len(candles) > 1 else candles
-        if len(closed) < RSI_LEN + 2:
-            print(f"[RSI DIAG] BTC-USDT - only {len(closed)} closed candles")
-            return
-        closes = [cl(c) for c in closed]
-        rv = rsi_series(closes, RSI_LEN)[-1]
-        print(f"[RSI DIAG] BTC-USDT RSI(14)={rv:.1f} close={closes[-1]} (pipeline alive)")
-    except Exception as e:
-        print(f"[RSI DIAG ERROR] {e}")
-
-
-def rsi_scan_loop():
-    print(f"RSI Reversion loop started - {RSI_TIMEFRAME} | RSI(14)<{RSI_ENTRY} + green candle -> BE1R+trail-from-1.5R")
-    all_symbols = []
-    while True:
-        try:
-            if api_backoff_active():
-                time.sleep(30)
-                continue
-            if not all_symbols:
-                all_symbols = get_futures_symbols() or []
-            universe = get_liquid_symbols(all_symbols, min_quote_vol=RSI_MIN_QUOTE_VOL,
-                                          max_n=RSI_MAX_SYMBOLS, exclude_top_n=RSI_EXCLUDE_TOP_N)
-            universe = [s for s in universe if not is_tokenized(s)]
-            print(f"[RSI SCAN] scanning {len(universe)} pairs (small caps, majors excluded)")
-            rsi_diagnostic_check()
-            for sym in universe:
-                if api_backoff_active():
-                    break
-                check_rsi(sym)
-                time.sleep(0.15)
-            print(f"[RSI SCAN] done. open={len(rsi_open_trades)} | sleeping {RSI_SCAN_INTERVAL_SECONDS}s")
-        except Exception as e:
-            print(f"[RSI LOOP ERROR] {e}")
-        time.sleep(RSI_SCAN_INTERVAL_SECONDS)
 
 # ==================== TIGHT 1: DORMANT AWAKENING (added 2026-07-19) ====================
 # Catches BANK-USDT-class multi-day runners at the START of the move, which Tight 2
@@ -1618,7 +823,7 @@ T3_FIXED_TP_R             = float(os.environ.get("T3_FIXED_TP_R", 8.0))         
 T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))      # 2026-07-30: log+alert only (NO auto-skip yet) if entry fill is >this% from signal px. Collect 2-3wk live slip, then decide a skip threshold.
 
 # ==================== TIGHT 2 (Trapped-Block Fade, SHORT) ====================
-# 2026-08-02: replaces retired RSI Reversion on the /start /stop commands.
+# /start /stop controls this engine (Tight 2). 2026-08-12: Crash Fade + RSI fully removed.
 # Concept (only survivor of 4 discretionary docs): SHORT a prior high-volume
 # "trapped block" resistance when price returns up into it on declining volume
 # (demand exhaustion). Backtest (15m 8mo, band5/dump18, TP4/buf1.0/exh0.8):
@@ -1630,7 +835,7 @@ T2_VOL_SPIKE              = 1.3    # 2026-08-11: 1.3 (with 3M floor + drawdown f
 T2_MAX_DRAWDOWN_PCT       = float(os.environ.get("T2_MAX_DRAWDOWN_PCT", 0.30))   # 2026-08-11 FAISAL'S INSIGHT: skip demand-long if coin is >30% below its 60-day high. Heavy-downtrend coins have TP far above (old price) but SL near -> hit SL, never TP. Backtest by drawdown bucket: 0-20%below win73%, 20-40% win47%, 40%+ win45%. DD<=30% filter: win 60->62%, meanR +1.59, holdout robust, TP hits faster (less margin lock).
 T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
-T2_TP_R                   = 8.0    # 2026-08-10 PnL: 4R->8R, sumR 518->711 (+37%), win UNCHANGED 52% (demand-bounce trades are big runners). TP12 tested even better (1350) but Faisal chose 8R for shorter holds; 12R is a future lever.
+T2_TP_R                   = 5.0    # 2026-08-12: 8R->5R. 8R almost never hit within the 2-day time-stop (MFE: only 29% ever reach 8R, median 2.6d; TP8+2d-stop = ~5% actually close at TP). TP5 same win (45%), PnL >=8R at cap2, medHold 1.7d frees margin faster. Faisal chose 5R.
 T2_BLOCK_MAX_AGE_DAYS     = 30     # HARDCODED. only trade blocks formed within last 30d (fresh = active trapped holders). fixes dry spells.
 T2_LONG_SIDE              = True   # HARDCODED. both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
 T2_ATR_LEN                = 14
@@ -1643,11 +848,16 @@ T2_LEVERAGE               = 10     # HARDCODED
 T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk
 T2_MAX_SYMBOLS            = 250    # HARDCODED
 T2_EXCLUDE_TOP_N          = 0      # HARDCODED. INCLUDE majors - they form clean blocks too
-T2_MIN_QUOTE_VOL          = 3_000_000  # 2026-08-11: 1.5M->3M (verified). At 1.5M, RIF (med $2.71M daily qvol)/ON/HOME slipped SL to -2.66R/-1.8R live (planned -1R). Backtest: 13% of SL-hits fill worse than -1.5R on thin coins. 3M floor excludes RIF-tier; verified win 56->59%, 11.4 trades/wk kept, top3 19%, holdout A+1.44/B+1.10 robust (5M was win60% but only 5.9/wk & top3 27% concentrated). Slippage fix.
+T2_MIN_QUOTE_VOL          = 2_000_000  # 2026-08-12: 3M->2M. Backtest: 2M recovers ~$120 vs 3M ($825 vs $704 cap2) with holdout still robust (A+1.09/B+0.89) and still excludes RIF-tier thin coins that slipped SL live. 3M was over-conservative; 2M is the sweet spot between live-slippage safety and PnL.
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
 SHARED_MAX_CONCURRENT     = 2      # HARDCODED. T1+T2 together = max 2 open on $100 acct
+CONFLUENCE_EXTRA_SLOTS    = 1      # 2026-08-12: a CONFLUENCE trade (T1+T2 agree same coin+dir within 5d)
+                                   # may open ONE dedicated slot BEYOND the 2 normal slots, so the bot's
+                                   # highest-conviction trades are never dropped by the cap. Backtest cap2+1conf:
+                                   # $966->$2285, win 42->46%, holdout A+$1030/B+$1320. Keep conf risk $10 (not higher)
+                                   # on a small account - 3 open positions is the max margin exposure.
 
 t2_auto_trade_enabled = AUTO_RESUME_ON_START
 t2_blocks       = {}    # symbol -> list of (resistance_level, formed_day_ms)
@@ -1802,10 +1012,10 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
     conf = is_confluence(symbol, side)                # True if T2 signalled same coin/dir within 5d
     risk_usdt = T3_CONF_RISK_USDT if conf else T3_RISK_USDT
     trade_status = ""
-    if t3_auto_trade_enabled and t2_total_open() >= SHARED_MAX_CONCURRENT:
+    if t3_auto_trade_enabled and not slot_available_for(conf):
         trade_status = "\nSkipped - shared T1+T2 cap (" + str(SHARED_MAX_CONCURRENT) + ") reached"
     elif t3_auto_trade_enabled:
-        oid = place_t3_order(symbol, side, entry_px, sl, risk_usdt)
+        oid = place_t3_order(symbol, side, entry_px, sl, risk_usdt, conf)
         if oid == "MARGIN_SKIP":
             trade_status = "\nSkipped - insufficient margin"
         elif oid and oid != "N/A":
@@ -1814,7 +1024,7 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
             trade_status = "\nOrder failed"
     else:
         trade_status = "\nAuto-trade OFF"
-    conf_tag = " [CONFLUENCE $10]" if conf else ""
+    conf_tag = " [CONFLUENCE $" + str(int(T3_CONF_RISK_USDT)) + "]" if conf else ""
     print(f"[T3 ENTRY]{conf_tag} {symbol} {side} @ {entry_px} SL {sl} risk=${risk_usdt} vol_ratio={st.get('vol_ratio', 0):.1f}x{trade_status}")
     send_tg(
         "TIGHT 1 ENTRY" + conf_tag + " - " + side + " - " + symbol + "\n------------------------------\n"
@@ -1894,7 +1104,7 @@ def t3_check_awakened(symbol):
         print(f"[T3 AWAKENED {symbol}] error: {e}")
 
 
-def place_t3_order(symbol, side, entry, sl, risk_usdt=None):
+def place_t3_order(symbol, side, entry, sl, risk_usdt=None, conf=False):
     """Market entry + guarded SL only - deliberately NO exchange TP orders (the exit
     is the trail). Same risk-based sizing, margin pre-check and naked-position
     emergency-close discipline as Tight/Fast. risk_usdt defaults to T3_RISK_USDT;
@@ -1955,7 +1165,7 @@ def place_t3_order(symbol, side, entry, sl, risk_usdt=None):
                 "sl": sl, "sl_id": sl_id, "tp": tp_price, "tp_id": tp_id,
                 "total_qty": total_qty, "close_side": close_side, "pos_side": pos_side,
                 "risk_dist": risk_dist, "be_done": False, "be_price": None,
-                "trailed": False, "peak_r": 0.0, "risk_usdt": risk_usdt,
+                "trailed": False, "peak_r": 0.0, "risk_usdt": risk_usdt, "confluence": conf,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
                 "open_ts": time.time(),
             }
@@ -2162,7 +1372,7 @@ def all_open_symbols():
     engine opens a coin another engine already holds — this is the guard that was
     missing when CF + Tight 2 both opened 1000BONK at once and one got liquidated."""
     syms = set()
-    for d in (t3_open_trades, t2_open_trades, cf_open_trades):
+    for d in (t3_open_trades, t2_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
@@ -2170,10 +1380,34 @@ def all_open_symbols():
     return syms
 
 def t2_total_open():
-    """Shared open count across ALL THREE engines for the shared concurrency cap.
-    2026-08-08: was T1+T2 only — CF was uncapped, so CF+T2 could both open and the
-    account carried 3-4 positions at once. Now counts CF too."""
-    return len(t3_open_trades) + len(t2_open_trades) + len(cf_open_trades)
+    """Shared open count across T1 + T2 for the shared concurrency cap.
+    CONFLUENCE trades are counted here too (they hold a slot), but a confluence trade
+    is ALLOWED to open a dedicated extra slot beyond SHARED_MAX_CONCURRENT — see
+    slot_available_for() below."""
+    return len(t3_open_trades) + len(t2_open_trades)
+
+def confluence_open_count():
+    """How many currently-open trades (T1+T2) were opened as CONFLUENCE trades."""
+    n = 0
+    for d in (t3_open_trades, t2_open_trades):
+        for t in d.values():
+            if t.get("confluence"):
+                n += 1
+    return n
+
+def slot_available_for(is_conf):
+    """Shared-slot gate with a CONFLUENCE dedicated slot (2026-08-12).
+    - Normal trades: allowed only while total_open < SHARED_MAX_CONCURRENT.
+    - Confluence trades: allowed while total_open < SHARED_MAX_CONCURRENT, OR (when the
+      normal slots are full) while fewer than CONFLUENCE_EXTRA_SLOTS confluence trades
+      are already open. This means a high-conviction T1+T2-agreement trade is never
+      dropped just because the 2 normal slots are busy. Backtest-verified best lever."""
+    total = t2_total_open()
+    if total < SHARED_MAX_CONCURRENT:
+        return True
+    if is_conf and confluence_open_count() < CONFLUENCE_EXTRA_SLOTS:
+        return True
+    return False
 
 def t2_in_cooldown(symbol):
     last = t2_last_fire.get(symbol, 0)
@@ -2283,10 +1517,6 @@ def t2_check_entry(symbol, blocks):
     except Exception as e:
         print(f"[T2 ENTRY {symbol}] error: {e}")
 
-def t2_fire_entry(symbol, entry_px, sl):
-    if t2_symbol_has_open_trade(symbol):
-        return
-    risk = sl - entry_px       # short: SL above entry
 def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
     if t2_symbol_has_open_trade(symbol):
         return
@@ -2308,25 +1538,34 @@ def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
                         return
         except Exception as e:
             print(f"[T2 DD CHECK {symbol}] error: {e}")
+    record_signal(symbol, side)                # log for confluence (T1 can see this)
+    conf = is_confluence(symbol, side)         # True if T1 signalled same coin/dir within 5d
+    # Final shared-slot gate WITH the confluence dedicated slot: a normal trade needs a
+    # free normal slot; a confluence trade may also use the 1 dedicated confluence slot.
+    if not slot_available_for(conf):
+        print(f"[T2 SLOT] {symbol} skipped - shared cap reached (conf={conf})")
+        return
     label = "SHORT" if side == "SELL" else "LONG"
     kind  = "Trapped-block fade" if side == "SELL" else "Demand-block bounce"
+    risk_usdt = T3_CONF_RISK_USDT if conf else T2_RISK_USDT
+    conf_tag = " [CONFLUENCE $" + str(int(T3_CONF_RISK_USDT)) + "]" if conf else ""
     send_tg(
-        "TIGHT 2 " + label + " - " + symbol + "\n"
-        "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(T2_RISK_USDT) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
+        "TIGHT 2 " + label + conf_tag + " - " + symbol + "\n"
+        "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(risk_usdt) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
         + kind + " | TP " + str(T2_TP_R) + "R\n"
     )
-    record_signal(symbol, side)                # log for confluence (T1 can see this)
-    place_t2_order(symbol, entry_px, sl, side)
+    place_t2_order(symbol, entry_px, sl, side, conf)
     t2_last_fire[symbol] = time.time()
 
-def place_t2_order(symbol, entry, sl, side="SELL"):
+def place_t2_order(symbol, entry, sl, side="SELL", conf=False):
     try:
         set_leverage_api(symbol, T2_LEVERAGE)
         precision = symbol_precision.get(symbol, 4)
         risk_dist = abs(sl - entry)
         if risk_dist <= 0:
             return None
-        risk_qty       = T2_RISK_USDT / risk_dist
+        risk_usdt      = T3_CONF_RISK_USDT if conf else T2_RISK_USDT
+        risk_qty       = risk_usdt / risk_dist
         margin_cap_qty = (T2_MAX_MARGIN_USDT * T2_LEVERAGE) / entry
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
@@ -2343,7 +1582,7 @@ def place_t2_order(symbol, entry, sl, side="SELL"):
             return "MARGIN_SKIP"
 
         order_id = place_market_order(symbol, side, qty, pos_side)
-        print(f"[T2 ORDER] {symbol} {pos_side} qty={qty} risk=${T2_RISK_USDT}: {order_id}")
+        print(f"[T2 ORDER] {symbol} {pos_side} qty={qty} risk=${risk_usdt}: {order_id}")
         if order_id != "N/A" and order_id != "MARGIN_SKIP":
             time.sleep(0.5)
             entry_fill = get_fill_price(order_id, symbol, fallback=entry)
@@ -2369,7 +1608,7 @@ def place_t2_order(symbol, entry, sl, side="SELL"):
                 "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
                 "sl": sl, "sl_id": sl_id, "tp": tp_price, "tp_id": tp_id,
                 "total_qty": qty, "close_side": close_side, "pos_side": pos_side,
-                "risk_dist": rd, "risk_usdt": T2_RISK_USDT,
+                "risk_dist": rd, "risk_usdt": risk_usdt, "confluence": conf,
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
                 "open_ts": time.time(),
             }
@@ -2474,7 +1713,8 @@ def t2_loop():
                         break
                     if not t2_auto_trade_enabled:
                         break
-                    if t2_total_open() >= SHARED_MAX_CONCURRENT:   # shared T1+T2 cap
+                    # shared cap: stop only if even a confluence trade couldn't open a slot
+                    if not slot_available_for(True):
                         break
                     if t2_symbol_has_open_trade(sym) or t2_in_cooldown(sym):
                         continue
@@ -2521,9 +1761,6 @@ def send_daily_summary():
 def trailing_loop():
     while True:
         try:
-            if cf_pending:
-                cf_check_pending()
-
             # ---- Liquidation detection (2026-07-29, refined) ----
             # ONE positions fetch per cycle, shared by all three trackers -> the only
             # extra API call, replaces any per-position polling, so it does NOT worsen
@@ -2535,7 +1772,7 @@ def trailing_loop():
             # tracker still checks whether its SL/TP survived on the exchange. If the
             # fetch itself errored we pass open_syms=None so trackers skip entirely.
             open_syms = None
-            have_open = bool(cf_open_trades or rsi_open_trades or t3_open_trades or t2_open_trades)
+            have_open = bool(t3_open_trades or t2_open_trades)
             if have_open:
                 positions = get_open_positions()
                 # get_open_positions returns [] on genuine flat AND on API failure. We
@@ -2544,10 +1781,6 @@ def trailing_loop():
                 # so an API glitch that also drops the open-orders call cannot liquidate.
                 open_syms = {p["symbol"] for p in positions}
 
-            if cf_open_trades:
-                track_cf_trades(open_syms)
-            if rsi_open_trades:
-                track_rsi_trades(open_syms)
             if t3_open_trades:
                 track_t3_trades(open_syms)
             if t2_open_trades:
@@ -2560,7 +1793,7 @@ def trailing_loop():
 
 # ==================== TELEGRAM COMMANDS ====================
 def handle_telegram_commands():
-    global rsi_auto_trade_enabled, cf_auto_trade_enabled, t3_auto_trade_enabled, t2_auto_trade_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2601,13 +1834,6 @@ def handle_telegram_commands():
                 elif text == "/t1_stop":
                     t3_auto_trade_enabled = False
                     send_tg("Tight 1 (Dormant Awakening) Auto-trade OFF.")
-                # ---- Crash Fade: /fast_start /fast_stop ----
-                elif text == "/fast_start":
-                    # 2026-08-08: CrashFade is permanently disabled (no edge + caused the BONK duplicate/liquidation)
-                    send_tg("Crash Fade is permanently disabled (no validated edge, caused duplicate-position liquidation). Ignored.")
-                elif text == "/fast_stop":
-                    cf_auto_trade_enabled = False
-                    send_tg("Crash Fade Auto-trade OFF.")
                 # ---- /status : everything at a glance ----
                 elif text == "/status":
                     backoff = ""
@@ -2619,9 +1845,8 @@ def handle_telegram_commands():
                         " | Open: " + str(len(t3_open_trades)) + " | Watchlist: " + str(len(t3_watchlist)) + " | Awakened: " + str(len(t3_watch)) + "\n"
                         "Tight 2 (Fade): " + ("ON" if t2_auto_trade_enabled else "OFF") +
                         " | Open: " + str(len(t2_open_trades)) + " | Blocks: " + str(len(t2_blocks)) + "\n"
-                        "Crash Fade: " + ("ON" if cf_auto_trade_enabled else "OFF") +
-                        " | Open: " + str(len(cf_open_trades)) + " | Pending: " + str(len(cf_pending)) + "\n"
-                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + backoff
+                        "Confluence open: " + str(confluence_open_count()) + " (dedicated slots: " + str(CONFLUENCE_EXTRA_SLOTS) + ", risk $" + str(int(T3_CONF_RISK_USDT)) + ")\n"
+                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + " (+conf slot)" + backoff
                     )
                 # ---- per-strategy detail ----
                 elif text == "/t2_status":
@@ -2642,14 +1867,6 @@ def handle_telegram_commands():
                         lines3 += ("\n" + t3t["symbol"] + " " + t3t["side"] + " open | peak " +
                                    str(round(t3t.get("peak_r", 0), 1)) + "R | SL " + str(t3t["sl"]))
                     send_tg(lines3)
-                elif text == "/fast_status":
-                    cf = "ON" if cf_auto_trade_enabled else "OFF"
-                    pend = ""
-                    for s, p in list(cf_pending.items()):
-                        mins_left = max(0, int((p["expiry_ts"] - time.time()) / 60))
-                        pend += "\n" + s + " dip-buy @ " + str(round(p["bid"], 6)) + " (" + str(mins_left) + "min left)"
-                    send_tg("Crash Fade: " + cf + " | Open: " + str(len(cf_open_trades)) +
-                            " | Pending: " + str(len(cf_pending)) + pend)
         except Exception as e:
             print(f"[TG CMD] error: {e}")
         time.sleep(1)
@@ -2657,11 +1874,8 @@ def handle_telegram_commands():
 
 @app.route("/")
 def health():
-    return ("Niti combined - Crash Fade (market-breadth gate + 4% drop fade + dip-buy + 3R) "
-            "+ RSI Reversion (RSI<20 + green + BE1R/trail-from-1.5R) "
-            "+ Tight 1 (Dormant Awakening) + consolidated journal"), 200
-
-
+    return ("Niti combined - Tight 1 (Dormant Awakening) + Tight 2 (Trapped-Block Fade, both sides) "
+            "+ Confluence dedicated slot + OI collector + consolidated journal"), 200
 
 
 # ============================================================================
@@ -2751,7 +1965,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[STARTUP ADOPT ERROR] {e}")
 
-    Thread(target=cf_scan_loop,             daemon=True).start()
     Thread(target=t2_loop,                  daemon=True).start()   # Tight 2 fade (replaces retired RSI on /start /stop)
     Thread(target=trailing_loop,            daemon=True).start()
     Thread(target=t3_loop,                  daemon=True).start()

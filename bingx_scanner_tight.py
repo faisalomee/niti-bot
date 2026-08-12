@@ -43,6 +43,21 @@ def is_tokenized(sym):
 #   /t1_start /t1_stop   -> Tight 1 (Dormant Awakening)
 symbol_precision   = {}
 symbol_max_lev     = {}
+symbol_launch_time = {}   # {symbol: launchTime_ms} from contracts endpoint (2026-08-12 coin-age filter)
+
+# 2026-08-12 COIN-AGE FILTER: skip coins younger than this many days. Root cause: VELVET/HOME
+# (listed after the backtest window) passed the 2M liquidity floor on current volume but are
+# thin-book NEW coins that slip (VELVET slipped 1.03% live) and were never backtested. The
+# liquidity floor sees VOLUME not AGE. launchTime comes free from the contracts endpoint.
+MIN_COIN_AGE_DAYS  = int(os.environ.get("MIN_COIN_AGE_DAYS", 30))
+
+# 2026-08-12 ORDER-BOOK DEPTH CHECK: before entry, fetch the live book and require that the
+# liquidity sitting between entry and the SL price is at least this multiple of our position
+# qty. If not, the SL market-order would eat too deep into a thin book and slip badly (this is
+# exactly what gave PROM -$13.1 and VELVET -$8.6 when $5-risk SLs filled far past trigger).
+# The coin that would slip is caught at ENTRY regardless of its age or 24h volume.
+DEPTH_LIQUIDITY_MULT = float(os.environ.get("DEPTH_LIQUIDITY_MULT", 3.0))
+DEPTH_CHECK_ENABLED  = os.environ.get("DEPTH_CHECK_ENABLED", "1") == "1"
 
 daily_trades       = []
 last_summary_date  = None
@@ -112,6 +127,12 @@ def get_futures_symbols():
                 symbol_max_lev[sym] = int(float(c.get("maxLongLeverage", 20)))
             except Exception:
                 symbol_max_lev[sym] = 20
+            try:
+                lt = int(c.get("launchTime", 0) or 0)
+                if lt > 0:
+                    symbol_launch_time[sym] = lt
+            except Exception:
+                pass
     return symbols
 
 
@@ -168,6 +189,67 @@ def _resolve_gain_scale(entries):
 _gain_field_logged = False
 
 
+def coin_too_young(sym):
+    """True if the coin was listed less than MIN_COIN_AGE_DAYS ago. If launchTime is
+    unknown (not in the contracts response) we DO NOT block it - unknown-age coins are
+    usually long-established pairs whose launchTime the API omits, and blocking on
+    missing data would silently starve the universe. Only a KNOWN-recent launchTime blocks."""
+    if MIN_COIN_AGE_DAYS <= 0:
+        return False
+    lt = symbol_launch_time.get(sym, 0)
+    if lt <= 0:
+        return False
+    age_days = (time.time() * 1000 - lt) / 86400000.0
+    return age_days < MIN_COIN_AGE_DAYS
+
+
+def get_order_book(symbol, limit=100):
+    """Fetch live order book. Returns dict with 'bids' and 'asks' as [[price, qty], ...]
+    lists, or None on any failure."""
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/depth"
+        r = requests.get(url, params={"symbol": symbol, "limit": limit}, timeout=8).json()
+        data = r.get("data", {})
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        if not bids or not asks:
+            return None
+        return {"bids": bids, "asks": asks}
+    except Exception as e:
+        print(f"[DEPTH FETCH {symbol}] error: {e}")
+        return None
+
+
+def depth_ok(symbol, entry, sl, qty, side):
+    """True if the book has enough liquidity between entry and SL to absorb our position's
+    SL market-order without excessive slippage. For a SHORT the SL is ABOVE entry, so the
+    stop closes by BUYING -> it walks the ASKS from entry up to SL; sum ask-qty in that band.
+    For a LONG the SL is BELOW entry, stop closes by SELLING -> walk the BIDS from entry down
+    to SL; sum bid-qty. Require summed liquidity >= qty * DEPTH_LIQUIDITY_MULT. If depth can't
+    be fetched we DO NOT block (fail-open) - a missing book shouldn't silently kill all trading,
+    and the coin-age + liquidity floors are still guarding. Only a KNOWN-thin book blocks."""
+    if not DEPTH_CHECK_ENABLED:
+        return True
+    ob = get_order_book(symbol)
+    if ob is None:
+        return True   # fail-open: don't block on a fetch failure
+    try:
+        if side == "SELL":
+            lo_p, hi_p = min(entry, sl), max(entry, sl)   # SL above entry
+            avail = sum(float(q) for p, q in ob["asks"] if lo_p <= float(p) <= hi_p)
+        else:
+            lo_p, hi_p = min(entry, sl), max(entry, sl)   # SL below entry
+            avail = sum(float(q) for p, q in ob["bids"] if lo_p <= float(p) <= hi_p)
+        need = qty * DEPTH_LIQUIDITY_MULT
+        if avail < need:
+            print(f"[DEPTH SKIP] {symbol} {side} thin book: {avail:.2f} in entry->SL band < need {need:.2f} (qty {qty} x{DEPTH_LIQUIDITY_MULT})")
+            return False
+        return True
+    except Exception as e:
+        print(f"[DEPTH CHECK {symbol}] error: {e}")
+        return True   # fail-open on parse error
+
+
 def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
                        rank_by_gain=0, gain_min=None, gain_max=None):
     """rank_by_gain (added 2026-07-23, default 0 = OFF): when > 0, the surviving
@@ -180,7 +262,8 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
         r = requests.get(url, timeout=10).json()
         tickers = r.get("data", [])
         if not isinstance(tickers, list):
-            return symbols[:max_n] if max_n else symbols
+            fb = [s for s in symbols if not coin_too_young(s)]
+            return fb[:max_n] if max_n else fb
         sym_set = set(symbols)
         liquid = []
         for t in tickers:
@@ -191,7 +274,7 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
                 qvol = float(t.get("quoteVolume", 0))
             except Exception:
                 qvol = 0
-            if qvol >= min_quote_vol:
+            if qvol >= min_quote_vol and not coin_too_young(sym):
                 liquid.append((sym, qvol, _ticker_gain_raw(t)))
         liquid.sort(key=lambda x: x[1], reverse=True)
         if exclude_top_n > 0:
@@ -251,7 +334,8 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
         return [x[0] for x in liquid]
     except Exception as e:
         print(f"[LIQUID SYMBOLS ERROR] {e}")
-        return symbols[:max_n] if max_n else symbols
+        fb = [s for s in symbols if not coin_too_young(s)]
+        return fb[:max_n] if max_n else fb
 
 
 def get_candles(symbol, limit=350, interval="15m", end_time=None):
@@ -832,10 +916,10 @@ T2_RET_BAND_PCT           = 6.0    # HARDCODED. wider retest zone raises win 50-
 T2_DUMP_PCT               = 18.0   # HARDCODED. block qualifies if price moved >= this % within lookahead
 T2_DUMP_LOOKAHEAD_DAYS    = 5      # HARDCODED
 T2_VOL_SPIKE              = 1.3    # 2026-08-11: 1.3 (with 3M floor + drawdown filter now guarding quality). More trades (9.9/wk) AND high win because the DD filter removes the deep-downtrend losers that 1.3 alone pulled in. Verified vol1.3+DD30 = win 62% meanR +1.59 holdout A+1.41/B+1.84.
-T2_MAX_DRAWDOWN_PCT       = float(os.environ.get("T2_MAX_DRAWDOWN_PCT", 0.30))   # 2026-08-11 FAISAL'S INSIGHT: skip demand-long if coin is >30% below its 60-day high. Heavy-downtrend coins have TP far above (old price) but SL near -> hit SL, never TP. Backtest by drawdown bucket: 0-20%below win73%, 20-40% win47%, 40%+ win45%. DD<=30% filter: win 60->62%, meanR +1.59, holdout robust, TP hits faster (less margin lock).
+T2_MAX_DRAWDOWN_PCT       = float(os.environ.get("T2_MAX_DRAWDOWN_PCT", 0.15))   # 2026-08-12: 0.30->0.15. Demand-LONG only works on STRONG coins near their 60d high. Feature analysis: coin 5-15% below high = win 74%, but 15-30% below = win 45% (support breaks on downtrend coins). Tightening to 15% raises LONG win 47->62% and overall win 52->62%, PnL $669->$1054, 9/9 months+, holdout A67%/B66%. Keeps both-sides (bull-run safe). SHORT unaffected.
 T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
-T2_TP_R                   = 5.0    # 2026-08-12: 8R->5R. 8R almost never hit within the 2-day time-stop (MFE: only 29% ever reach 8R, median 2.6d; TP8+2d-stop = ~5% actually close at TP). TP5 same win (45%), PnL >=8R at cap2, medHold 1.7d frees margin faster. Faisal chose 5R.
+T2_TP_R                   = 2.0    # 2026-08-12: 5R->2R. VISIBILITY fix - at TP5 only 11% of cap2 trades close at TP so Faisal (6mo) almost never saw a win. TP2 = 37% TP-hit (3x more visible wins), win 47->62% (with DD15), PnL $866->$1054, 9/9 months+, faster slot recycle. Backtest-verified holdout-robust.
 T2_BLOCK_MAX_AGE_DAYS     = 30     # HARDCODED. only trade blocks formed within last 30d (fresh = active trapped holders). fixes dry spells.
 T2_LONG_SIDE              = True   # HARDCODED. both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
 T2_ATR_LEN                = 14
@@ -1018,6 +1102,8 @@ def t3_fire_entry(symbol, st, entry_px, atr_now):
         oid = place_t3_order(symbol, side, entry_px, sl, risk_usdt, conf)
         if oid == "MARGIN_SKIP":
             trade_status = "\nSkipped - insufficient margin"
+        elif oid == "DEPTH_SKIP":
+            trade_status = "\nSkipped - order book too thin (slippage guard)"
         elif oid and oid != "N/A":
             trade_status = "\nOrder: " + str(oid)
         else:
@@ -1122,6 +1208,10 @@ def place_t3_order(symbol, side, entry, sl, risk_usdt=None, conf=False):
         total_qty = round(min(risk_qty, margin_cap_qty), precision)
         if total_qty <= 0:
             return None
+        # 2026-08-12 DEPTH CHECK: skip if the book is too thin between entry and SL (would slip badly)
+        if not depth_ok(symbol, entry, sl, total_qty, side):
+            send_tg("TIGHT 1 " + symbol + " " + side + " skipped - order book too thin (slippage guard)")
+            return "DEPTH_SKIP"
         pos_side   = "LONG" if side == "BUY" else "SHORT"
         close_side = "SELL" if side == "BUY" else "BUY"
 
@@ -1554,7 +1644,9 @@ def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
         "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(risk_usdt) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
         + kind + " | TP " + str(T2_TP_R) + "R\n"
     )
-    place_t2_order(symbol, entry_px, sl, side, conf)
+    oid = place_t2_order(symbol, entry_px, sl, side, conf)
+    if oid == "DEPTH_SKIP":
+        return   # thin book - don't set cooldown, let it retry when the book fills
     t2_last_fire[symbol] = time.time()
 
 def place_t2_order(symbol, entry, sl, side="SELL", conf=False):
@@ -1570,6 +1662,10 @@ def place_t2_order(symbol, entry, sl, side="SELL", conf=False):
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
+        # 2026-08-12 DEPTH CHECK: skip if the book is too thin between entry and SL (would slip badly)
+        if not depth_ok(symbol, entry, sl, qty, side):
+            send_tg("TIGHT 2 " + symbol + " " + side + " skipped - order book too thin (slippage guard)")
+            return "DEPTH_SKIP"
         if side == "SELL":
             pos_side, close_side = "SHORT", "BUY"
         else:

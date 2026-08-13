@@ -716,6 +716,7 @@ def journal_liquidation(trade, label):
         trade["label"]  = label
         daily_trades.append(trade)
         journal_closed_trade(trade)
+        t2_loss_until[symbol] = time.time() + T2_LOSS_COOLDOWN_DAYS * 86400  # liquidation = a loss: ban this coin for N days (applies to any engine; harmless for non-T2)
         send_tg(f"⚠️ {label} {symbol}: position LIQUIDATED on exchange (no TP/SL fill). "
                 f"Logged as Liquidated, realized ~{trade['pnl']} USDT. Check margin.")
         print(f"[LIQUIDATION] {label} {symbol} pnl={trade['pnl']}")
@@ -927,6 +928,7 @@ T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline me
 T2_BLOCK_SCAN_SECONDS     = 14400  # HARDCODED. rebuild block map every 4h
 T2_ENTRY_CHECK_SECONDS    = 300    # HARDCODED. check entries every 5min
 T2_COOLDOWN_SECONDS       = int(os.environ.get("T2_COOLDOWN_SECONDS", 21600))  # 2026-08-12: 24h->6h. 24h was over-strict - a coin returning to its block band 6h later is another valid fade being skipped. Backtest (TP2,DD15,cap2): 24h=10.9/wk $1088 -> 6h=15.6/wk $1666 (+43% trades, +53% PnL, win 63->60% ~unchanged, holdout A67%/B66% robust, 8/9 months+). Margin-safe (shared cap-2+conf still caps at 3 open). Do NOT go below 6h (untested).
+T2_LOSS_COOLDOWN_DAYS     = int(os.environ.get("T2_LOSS_COOLDOWN_DAYS", 5))  # 2026-08-13: after a coin closes SL/Liquidated, ban THAT coin this many days (winners keep the 6h cooldown). Fixes the "same 2-3 losing coins on repeat" loop (PROM kept getting re-shorted every 6h and losing). Backtest same-pool: 6h-only win58%/$1477 -> +5d-loss-cd win71%/$2029, holdout A+0.742/B+0.727. A losing coin returns in 6h and loses again; a 5d ban forces the bot onto other coins.
 T2_RISK_USDT              = 5.0    # 2026-08-05: 2->5 per Faisal (~5% risk on $100). SL stays at block level; size scales up, margin follows (~$6-10 typical).
 T2_LEVERAGE               = 10     # HARDCODED
 T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk
@@ -946,7 +948,8 @@ CONFLUENCE_EXTRA_SLOTS    = 1      # 2026-08-12: a CONFLUENCE trade (T1+T2 agree
 t2_auto_trade_enabled = AUTO_RESUME_ON_START
 t2_blocks       = {}    # symbol -> list of (resistance_level, formed_day_ms)
 t2_open_trades  = {}    # order_id -> open Tight 2 fade trade
-t2_last_fire    = {}    # symbol -> ts of last fired fade (cooldown)
+t2_last_fire    = {}    # symbol -> ts of last fired fade (normal 6h cooldown)
+t2_loss_until   = {}    # symbol -> ts until which the coin is banned after an SL/Liquidation (loss cooldown)
 
 t3_auto_trade_enabled = AUTO_RESUME_ON_START
 t3_watchlist   = {}   # symbol -> dormancy info (dormant range + median vol), rebuilt every 4h
@@ -1500,8 +1503,11 @@ def slot_available_for(is_conf):
     return False
 
 def t2_in_cooldown(symbol):
+    now = time.time()
+    if now < t2_loss_until.get(symbol, 0):      # coin is loss-banned (recent SL/Liquidation)
+        return True
     last = t2_last_fire.get(symbol, 0)
-    return (time.time() - last) < T2_COOLDOWN_SECONDS
+    return (now - last) < T2_COOLDOWN_SECONDS
 
 def t2_symbol_has_open_trade(symbol):
     # cross-engine: block if ANY engine holds this symbol, not just Tight 2
@@ -1752,7 +1758,8 @@ def track_t2_trades(open_syms=None):
                 daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t2_open_trades.pop(oid, None)
-                print(f"[T2 CLOSE] {symbol} SL pnl={trade['pnl']} R={trade['exit_r']}")
+                t2_loss_until[symbol] = time.time() + T2_LOSS_COOLDOWN_DAYS * 86400  # loss ban: don't re-trade this coin for N days
+                print(f"[T2 CLOSE] {symbol} SL pnl={trade['pnl']} R={trade['exit_r']} -> loss-cooldown {T2_LOSS_COOLDOWN_DAYS}d")
                 continue
             # ---- 2026-08-11 TIME-STOP: close at market if held > 2 days (won't reach TP, frees margin) ----
             held = time.time() - trade.get("open_ts", time.time())

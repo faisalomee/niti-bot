@@ -926,7 +926,7 @@ T2_ATR_LEN                = 14
 T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline median volume
 T2_BLOCK_SCAN_SECONDS     = 14400  # HARDCODED. rebuild block map every 4h
 T2_ENTRY_CHECK_SECONDS    = 300    # HARDCODED. check entries every 5min
-T2_COOLDOWN_SECONDS       = 86400  # HARDCODED. 1 day per coin after a fire
+T2_COOLDOWN_SECONDS       = int(os.environ.get("T2_COOLDOWN_SECONDS", 21600))  # 2026-08-12: 24h->6h. 24h was over-strict - a coin returning to its block band 6h later is another valid fade being skipped. Backtest (TP2,DD15,cap2): 24h=10.9/wk $1088 -> 6h=15.6/wk $1666 (+43% trades, +53% PnL, win 63->60% ~unchanged, holdout A67%/B66% robust, 8/9 months+). Margin-safe (shared cap-2+conf still caps at 3 open). Do NOT go below 6h (untested).
 T2_RISK_USDT              = 5.0    # 2026-08-05: 2->5 per Faisal (~5% risk on $100). SL stays at block level; size scales up, margin follows (~$6-10 typical).
 T2_LEVERAGE               = 10     # HARDCODED
 T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk

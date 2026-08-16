@@ -51,6 +51,58 @@ symbol_launch_time = {}   # {symbol: launchTime_ms} from contracts endpoint (202
 # liquidity floor sees VOLUME not AGE. launchTime comes free from the contracts endpoint.
 MIN_COIN_AGE_DAYS  = int(os.environ.get("MIN_COIN_AGE_DAYS", 30))
 
+# 2026-08-16 COIN WHITELIST (Faisal's fix for the new-coin problem — VELVET/HOME/ON/AIO/CYS
+# repeatedly drained the account and slipped past coin_too_young() because launchTime is
+# unknown for brand-new coins => that filter fails OPEN. This is an ABSOLUTE allow-list:
+# ONLY these backtested coins can ever be scanned/traded. New/unlisted coins can never enter.
+# Bound to the dataset: REGENERATE from the new symbol list whenever fresh candle data is uploaded.
+BACKTESTED_COINS = {
+    "1000000BABYDOGE-USDT", "1000000MOG-USDT", "10000SATS-USDT", "1000BONK-USDT", "1000CAT-USDT", "1000CHEEMS-USDT",
+    "1000PEPE-USDT", "1INCH-USDT", "AAVE-USDT", "ACE-USDT", "ACH-USDT", "ACT-USDT",
+    "ADA-USDT", "AERO-USDT", "AEVO-USDT", "AGLD-USDT", "AIXBT-USDT", "AKT-USDT",
+    "ALGO-USDT", "ALICE-USDT", "ALT-USDT", "ANKR-USDT", "APE-USDT", "API3-USDT",
+    "APT-USDT", "AR-USDT", "ARB-USDT", "ARK-USDT", "ARKM-USDT", "ARPA-USDT",
+    "ASTR-USDT", "ATH-USDT", "ATOM-USDT", "AUCTION-USDT", "AVA-USDT", "AVAX-USDT",
+    "AXL-USDT", "AXS-USDT", "BANANA-USDT", "BAT-USDT", "BB-USDT", "BCH-USDT",
+    "BEAM-USDT", "BICO-USDT", "BIGTIME-USDT", "BLUR-USDT", "BNB-USDT", "BOME-USDT",
+    "BRETT-USDT", "BSV-USDT", "BTC-USDT", "CAKE-USDT", "CARV-USDT", "CATI-USDT",
+    "CELO-USDT", "CETUS-USDT", "CFX-USDT", "CGPT-USDT", "CHILLGUY-USDT", "CHR-USDT",
+    "CHZ-USDT", "CKB-USDT", "COMP-USDT", "COTI-USDT", "COW-USDT", "CRO-USDT",
+    "CRV-USDT", "CTK-USDT", "CYBER-USDT", "DASH-USDT", "DIA-USDT", "DOGE-USDT",
+    "DOGS-USDT", "DOT-USDT", "DRIFT-USDT", "DUSK-USDT", "DYDX-USDT", "DYM-USDT",
+    "EDU-USDT", "EGLD-USDT", "EIGEN-USDT", "ENA-USDT", "ENJ-USDT", "ENS-USDT",
+    "ETC-USDT", "ETH-USDT", "ETHFI-USDT", "FARTCOIN-USDT", "FET-USDT", "FIDA-USDT",
+    "FIL-USDT", "FLOKI-USDT", "FLOW-USDT", "FLUX-USDT", "G-USDT", "GALA-USDT",
+    "GAS-USDT", "GLM-USDT", "GMT-USDT", "GMX-USDT", "GOAT-USDT", "GRASS-USDT",
+    "GRT-USDT", "HBAR-USDT", "HIVE-USDT", "HMSTR-USDT", "HYPE-USDT", "ICP-USDT",
+    "ID-USDT", "ILV-USDT", "IMX-USDT", "INJ-USDT", "IO-USDT", "IOST-USDT",
+    "IOTA-USDT", "JASMY-USDT", "JST-USDT", "JTO-USDT", "JUP-USDT", "KAIA-USDT",
+    "KAS-USDT", "KAVA-USDT", "KMNO-USDT", "KNC-USDT", "KSM-USDT", "LDO-USDT",
+    "LINK-USDT", "LISTA-USDT", "LPT-USDT", "LQTY-USDT", "LSK-USDT", "LTC-USDT",
+    "LUMIA-USDT", "LUNA-USDT", "LUNC-USDT", "MAGIC-USDT", "MANA-USDT", "MANTA-USDT",
+    "MASK-USDT", "MAV-USDT", "MAVIA-USDT", "ME-USDT", "MEME-USDT", "MERL-USDT",
+    "METIS-USDT", "MEW-USDT", "MINA-USDT", "MOODENG-USDT", "MORPHO-USDT", "MOVE-USDT",
+    "MOVR-USDT", "MTL-USDT", "NEAR-USDT", "NEIROCTO-USDT", "NEO-USDT", "NMR-USDT",
+    "NOT-USDT", "OKB-USDT", "ONDO-USDT", "ONE-USDT", "ONG-USDT", "ONT-USDT",
+    "OP-USDT", "ORDER-USDT", "ORDI-USDT", "PENDLE-USDT", "PENGU-USDT", "PEOPLE-USDT",
+    "PHA-USDT", "PIXEL-USDT", "PNUT-USDT", "POL-USDT", "POLYX-USDT", "POPCAT-USDT",
+    "PORTAL-USDT", "PYTH-USDT", "QNT-USDT", "QTUM-USDT", "RARE-USDT", "RATS-USDT",
+    "RAY-USDT", "RENDER-USDT", "REZ-USDT", "RIF-USDT", "RLC-USDT", "RON-USDT",
+    "ROSE-USDT", "RPL-USDT", "RSR-USDT", "RUNE-USDT", "RVN-USDT", "SAFE-USDT",
+    "SAGA-USDT", "SAND-USDT", "SANTOS-USDT", "SCRT-USDT", "SEI-USDT", "SFP-USDT",
+    "SKL-USDT", "SLP-USDT", "SNX-USDT", "SOL-USDT", "SPX-USDT", "SSV-USDT",
+    "STG-USDT", "STORJ-USDT", "STRK-USDT", "STX-USDT", "SUI-USDT", "SUN-USDT",
+    "SUPER-USDT", "SUSHI-USDT", "SYN-USDT", "TAO-USDT", "THE-USDT", "THETA-USDT",
+    "TIA-USDT", "TLM-USDT", "TNSR-USDT", "TRB-USDT", "TRX-USDT", "TURBO-USDT",
+    "TWT-USDT", "UMA-USDT", "UNI-USDT", "USUAL-USDT", "VANA-USDT", "VANRY-USDT",
+    "VELODROME-USDT", "VET-USDT", "VIRTUAL-USDT", "W-USDT", "WAVES-USDT", "WIF-USDT",
+    "WLD-USDT", "WOO-USDT", "XAI-USDT", "XCN-USDT", "XLM-USDT", "XMR-USDT",
+    "XRP-USDT", "YFI-USDT", "YGG-USDT", "ZEC-USDT", "ZEN-USDT", "ZETA-USDT",
+    "ZK-USDT", "ZRO-USDT", "ZRX-USDT",
+}
+WHITELIST_ONLY = os.environ.get("WHITELIST_ONLY", "1") == "1"   # 1 = trade only BACKTESTED_COINS
+
+
 # 2026-08-12 ORDER-BOOK DEPTH CHECK: before entry, fetch the live book and require that the
 # liquidity sitting between entry and the SL price is at least this multiple of our position
 # qty. If not, the SL market-order would eat too deep into a thin book and slip badly (this is
@@ -267,6 +319,11 @@ def get_liquid_symbols(symbols, min_quote_vol, max_n=None, exclude_top_n=0,
     re-sorted by today's % gain and cut to that many. Tight and Tight 1 do not pass
     any of these, so their universe selection is byte-for-byte unchanged."""
     global _gain_field_logged
+    # 2026-08-16 WHITELIST GATE: restrict the entire universe to backtested coins only.
+    # This is the single choke point feeding block-build + both engines, so new/unlisted
+    # coins (VELVET/HOME/ON-type) can never be scanned or traded.
+    if WHITELIST_ONLY:
+        symbols = [s for s in symbols if s in BACKTESTED_COINS]
     try:
         url = BASE_URL + "/openApi/swap/v2/quote/ticker"
         r = requests.get(url, timeout=10).json()
@@ -1606,6 +1663,9 @@ def t2_check_entry(symbol, blocks):
         print(f"[T2 ENTRY {symbol}] error: {e}")
 
 def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
+    if WHITELIST_ONLY and symbol not in BACKTESTED_COINS:
+        print(f"[WHITELIST BLOCK] {symbol} not in backtested set - skipped")
+        return
     if t2_symbol_has_open_trade(symbol):
         return
     risk = abs(sl - entry_px)

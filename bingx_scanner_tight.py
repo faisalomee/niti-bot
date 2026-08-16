@@ -1005,7 +1005,7 @@ T2_MIN_QUOTE_VOL          = 2_000_000  # 2026-08-12: 3M->2M. Backtest: 2M recove
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
-SHARED_MAX_CONCURRENT     = 2      # HARDCODED. T1+T2 together = max 2 open on $100 acct
+SHARED_MAX_CONCURRENT     = 4      # 2026-08-16: 2->4 (account grown to $50). Backtest (no-lookahead fresh-block, flat $5, 10x): cap2 165tr/win41%/+$242 -> cap4 291tr/win54%/+$915, maxDD -$82, holdout hA+0.80/hB+0.74. Margin: ~$13/trade, 4 open = ~$20 (~half a $50 acct). Risk STAYS flat $5 - do NOT scale risk% with balance.
 CONFLUENCE_EXTRA_SLOTS    = 1      # 2026-08-12: a CONFLUENCE trade (T1+T2 agree same coin+dir within 5d)
                                    # may open ONE dedicated slot BEYOND the 2 normal slots, so the bot's
                                    # highest-conviction trades are never dropped by the cap. Backtest cap2+1conf:

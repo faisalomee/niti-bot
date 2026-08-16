@@ -59,6 +59,16 @@ MIN_COIN_AGE_DAYS  = int(os.environ.get("MIN_COIN_AGE_DAYS", 30))
 DEPTH_LIQUIDITY_MULT = float(os.environ.get("DEPTH_LIQUIDITY_MULT", 3.0))
 DEPTH_CHECK_ENABLED  = os.environ.get("DEPTH_CHECK_ENABLED", "1") == "1"
 
+# 2026-08-16 THIN/NEW-COIN GUARDS (shared by Tight 1 LONG + Tight 2 SHORT):
+# - MIN_ENTRY_PRICE: skip micro-price coins (thin, high tick-slippage). Backtest-verified thin-coin
+#   blocker + PnL booster (price>=0.001 recent-bear best). Note: alone it does NOT catch AIO/HOME-type
+#   new coins (they pass) - the real new-coin catch is SL_DIST_CAP + coin-age + depth together.
+# - SL_DIST_CAP: skip a trade whose SL sits >5% from entry. 10x isolated liquidates ~9.1% adverse,
+#   so a wider SL liquidates BEFORE the SL (this is exactly how AIO liquidated: entry 0.0544, ~9.5% away).
+#   Wide-SL trades are also the volatile/downtrend losers; skipping raises meanR +0.28->+0.32, liq=0.
+MIN_ENTRY_PRICE      = float(os.environ.get("MIN_ENTRY_PRICE", 0.001))
+SL_DIST_CAP          = float(os.environ.get("SL_DIST_CAP", 0.05))
+
 daily_trades       = []
 last_summary_date  = None
 
@@ -917,17 +927,17 @@ T2_RET_BAND_PCT           = 6.0    # HARDCODED. wider retest zone raises win 50-
 T2_DUMP_PCT               = 18.0   # HARDCODED. block qualifies if price moved >= this % within lookahead
 T2_DUMP_LOOKAHEAD_DAYS    = 5      # HARDCODED
 T2_VOL_SPIKE              = 1.3    # 2026-08-11: 1.3 (with 3M floor + drawdown filter now guarding quality). More trades (9.9/wk) AND high win because the DD filter removes the deep-downtrend losers that 1.3 alone pulled in. Verified vol1.3+DD30 = win 62% meanR +1.59 holdout A+1.41/B+1.84.
-T2_MAX_DRAWDOWN_PCT       = float(os.environ.get("T2_MAX_DRAWDOWN_PCT", 0.15))   # 2026-08-12: 0.30->0.15. Demand-LONG only works on STRONG coins near their 60d high. Feature analysis: coin 5-15% below high = win 74%, but 15-30% below = win 45% (support breaks on downtrend coins). Tightening to 15% raises LONG win 47->62% and overall win 52->62%, PnL $669->$1054, 9/9 months+, holdout A67%/B66%. Keeps both-sides (bull-run safe). SHORT unaffected.
+T2_MAX_DRAWDOWN_PCT       = float(os.environ.get("T2_MAX_DRAWDOWN_PCT", 0.35))   # 2026-08-16: 0.15->0.35 (bear-trap fix). DD15 killed ~100% of longs in a downtrend (every coin >15% below 60d high) -> short-only -> account $80->$40. DD35 restores long/short balance; holdout A+0.20/B+0.16, recent-bear positive.  [was 0.30->0.15.] Demand-LONG only works on STRONG coins near their 60d high. Feature analysis: coin 5-15% below high = win 74%, but 15-30% below = win 45% (support breaks on downtrend coins). Tightening to 15% raises LONG win 47->62% and overall win 52->62%, PnL $669->$1054, 9/9 months+, holdout A67%/B66%. Keeps both-sides (bull-run safe). SHORT unaffected.
 T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
-T2_TP_R                   = 2.0    # 2026-08-12: 5R->2R. VISIBILITY fix - at TP5 only 11% of cap2 trades close at TP so Faisal (6mo) almost never saw a win. TP2 = 37% TP-hit (3x more visible wins), win 47->62% (with DD15), PnL $866->$1054, 9/9 months+, faster slot recycle. Backtest-verified holdout-robust.
-T2_BLOCK_MAX_AGE_DAYS     = 30     # HARDCODED. only trade blocks formed within last 30d (fresh = active trapped holders). fixes dry spells.
+T2_TP_R                   = 3.0    # 2026-08-16: 2R->3R. With fresh<7d blocks the fade edge is big (meanR+1.1); TP3R captures the runners. Sweet spot: TP2.5 win higher but meanR lower, TP4 meanR ~same but win 39%. RR = 3:1.
+T2_BLOCK_MAX_AGE_DAYS     = 7      # 2026-08-16: 30->7. THE REAL EDGE LEVER. A trapped-block fade only works while trapped holders are still trapped; after ~7d they've bailed and the level is dead. fresh<7d: meanR +0.27->+1.1, win 28->48%, holdout A+1.04/B+1.01, 9/9 months. Most old trades were on STALE blocks = the losers.  [was 30]
 T2_LONG_SIDE              = True   # HARDCODED. both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
 T2_ATR_LEN                = 14
 T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline median volume
 T2_BLOCK_SCAN_SECONDS     = 14400  # HARDCODED. rebuild block map every 4h
 T2_ENTRY_CHECK_SECONDS    = 300    # HARDCODED. check entries every 5min
-T2_COOLDOWN_SECONDS       = int(os.environ.get("T2_COOLDOWN_SECONDS", 21600))  # 2026-08-12: 24h->6h. 24h was over-strict - a coin returning to its block band 6h later is another valid fade being skipped. Backtest (TP2,DD15,cap2): 24h=10.9/wk $1088 -> 6h=15.6/wk $1666 (+43% trades, +53% PnL, win 63->60% ~unchanged, holdout A67%/B66% robust, 8/9 months+). Margin-safe (shared cap-2+conf still caps at 3 open). Do NOT go below 6h (untested).
+T2_COOLDOWN_SECONDS       = int(os.environ.get("T2_COOLDOWN_SECONDS", 14400))  # 2026-08-16: 6h->4h (ceiling push). fresh<7d+losscd5+cd4h = meanR+1.225 win50% vs cd6h +1.19/49%. Good coins recycle faster. Do NOT go below 4h (untested).  [was 24h->6h at 21600] 24h was over-strict - a coin returning to its block band 6h later is another valid fade being skipped. Backtest (TP2,DD15,cap2): 24h=10.9/wk $1088 -> 6h=15.6/wk $1666 (+43% trades, +53% PnL, win 63->60% ~unchanged, holdout A67%/B66% robust, 8/9 months+). Margin-safe (shared cap-2+conf still caps at 3 open). Do NOT go below 6h (untested).
 T2_LOSS_COOLDOWN_DAYS     = int(os.environ.get("T2_LOSS_COOLDOWN_DAYS", 5))  # 2026-08-13: after a coin closes SL/Liquidated, ban THAT coin this many days (winners keep the 6h cooldown). Fixes the "same 2-3 losing coins on repeat" loop (PROM kept getting re-shorted every 6h and losing). Backtest same-pool: 6h-only win58%/$1477 -> +5d-loss-cd win71%/$2029, holdout A+0.742/B+0.727. A losing coin returns in 6h and loses again; a 5d ban forces the bot onto other coins.
 T2_RISK_USDT              = 5.0    # 2026-08-05: 2->5 per Faisal (~5% risk on $100). SL stays at block level; size scales up, margin follows (~$6-10 typical).
 T2_LEVERAGE               = 10     # HARDCODED
@@ -1419,43 +1429,16 @@ def track_t3_trades(open_syms=None):
 
 
 def t3_loop():
-    """Tight 1 main loop. Internal timers: dormancy rescan every 4h, awakening
-    check on the watchlist every 5 min, awakened symbols processed every pass
-    (60s). Fully respects the global API backoff."""
-    print("Tight 1 loop started - Dormant Awakening (dormancy -> 1.5x awakening -> DELAYED green+higher-low day entry -> STRUCTURE SL -> 8R TP)")
-    all_symbols   = []
-    last_dormancy = 0.0
-    last_awake    = 0.0
+    """RETIRED 2026-08-16. The old dormancy->awakening Tight 1 was backtested DEAD
+    (116 sig/8mo, ALL TP variants NEGATIVE meanR -0.37..-0.75). Tight 1 is now the
+    LONG side of the fresh demand-block fade (meanR +0.9, holdout A+1.02/B+0.75,
+    9/9 months) and is generated INSIDE t2_loop / t2_check_entry, gated by
+    t3_auto_trade_enabled. This thread stays alive only so /t1_start /t1_stop still
+    have something to toggle and so the process shape is unchanged; it does no
+    scanning of its own. All the dormancy funcs below are dead code kept for history."""
+    print("Tight 1 = LONG fresh-demand-block (runs inside the Tight 2 loop). Dormancy engine retired.")
     while True:
-        try:
-            if api_backoff_active():
-                time.sleep(30)
-                continue
-            if time.time() - last_dormancy >= T3_DORMANCY_SCAN_SECONDS or last_dormancy == 0:
-                if not all_symbols:
-                    all_symbols = get_futures_symbols() or []
-                t3_build_watchlist(all_symbols)
-                last_dormancy = time.time()
-
-            for sym in list(t3_watch.keys()):
-                t3_check_awakened(sym)
-                time.sleep(0.2)
-
-            if time.time() - last_awake >= T3_AWAKE_CHECK_SECONDS:
-                checked = 0
-                for sym, info in list(t3_watchlist.items()):
-                    if api_backoff_active():
-                        break
-                    if sym in t3_watch or t3_symbol_has_open_trade(sym) or t3_in_cooldown(sym):
-                        continue
-                    t3_check_awakening(sym, info)
-                    checked += 1
-                    time.sleep(0.2)
-                last_awake = time.time()
-                print(f"[T3 SCAN] watchlist={len(t3_watchlist)} checked={checked} awakened={len(t3_watch)} open={len(t3_open_trades)} auto={t3_auto_trade_enabled}")
-        except Exception as e:
-            print(f"[T3 LOOP ERROR] {e}")
-        time.sleep(60)
+        time.sleep(3600)
 # ==================== END TIGHT 1 ====================
 
 
@@ -1581,12 +1564,17 @@ def t2_check_entry(symbol, blocks):
         atr_now = atr_series(highs, lows, closes, T2_ATR_LEN)[-1]
         if atr_now <= 0:
             return
+        if price < MIN_ENTRY_PRICE:   # 2026-08-16: block micro-price coins (thin, high tick-slippage)
+            return
         vol_window = vols[-21:-1] if len(vols) >= 21 else vols[:-1]
         vmed = sorted(vol_window)[len(vol_window) // 2] if vol_window else cur_vol
         if T2_VOL_EXHAUSTION > 0 and cur_vol > T2_VOL_EXHAUSTION * vmed:   # 0 = filter disabled
             return
         now_ms = int(c_last["time"])
         max_age_ms = T2_BLOCK_MAX_AGE_DAYS * 86400000
+        # 2026-08-16: TWO engines share ONE fresh-block edge, opposite sides:
+        #   Tight 2 (t2_auto_trade_enabled) = SHORT resistance-block retest
+        #   Tight 1 (t3_auto_trade_enabled) = LONG  demand-block  retest
         for blk in blocks:
             lvl, formed_ms = blk[0], blk[1]
             side = blk[2] if len(blk) > 2 else "S"
@@ -1594,19 +1582,23 @@ def t2_check_entry(symbol, blocks):
                 continue
             if T2_BLOCK_MAX_AGE_DAYS > 0 and (now_ms - formed_ms) > max_age_ms:
                 continue   # stale block - trapped holders already exited, level dead
-            if side == "S":
+            if side == "S" and t2_auto_trade_enabled:
                 # price returning UP into resistance from below (band), close still below → SHORT
                 if price < lvl and hi >= lvl * (1 - T2_RET_BAND_PCT / 100) and hi <= lvl * (1 + T2_RET_BAND_PCT / 100):
                     sl = round(lvl + atr_now * T2_SL_ATR_BUF, 6)
                     if sl <= price:
                         continue
+                    if (sl - price) / price > SL_DIST_CAP:   # SLcap - skip wide-SL that would liquidate before SL
+                        continue
                     t2_fire_entry(symbol, price, sl, "SELL")
                     return
-            else:
-                # price returning DOWN into demand from above (band), close still above → LONG
+            elif side == "L" and t3_auto_trade_enabled:
+                # price returning DOWN into demand from above (band), close still above → LONG (Tight 1)
                 if price > lvl and lo <= lvl * (1 + T2_RET_BAND_PCT / 100) and lo >= lvl * (1 - T2_RET_BAND_PCT / 100):
                     sl = round(lvl - atr_now * T2_SL_ATR_BUF, 6)
                     if sl >= price:
+                        continue
+                    if (price - sl) / price > SL_DIST_CAP:
                         continue
                     t2_fire_entry(symbol, price, sl, "BUY")
                     return
@@ -1634,23 +1626,22 @@ def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
                         return
         except Exception as e:
             print(f"[T2 DD CHECK {symbol}] error: {e}")
-    record_signal(symbol, side)                # log for confluence (T1 can see this)
-    conf = is_confluence(symbol, side)         # True if T1 signalled same coin/dir within 5d
-    # Final shared-slot gate WITH the confluence dedicated slot: a normal trade needs a
-    # free normal slot; a confluence trade may also use the 1 dedicated confluence slot.
-    if not slot_available_for(conf):
-        print(f"[T2 SLOT] {symbol} skipped - shared cap reached (conf={conf})")
+    # 2026-08-16: ALL trades flat $5 risk (Faisal: "shob risk $5, er beshi na"). Confluence
+    # sizing-up DROPPED (it was backtest-worse anyway). No dedicated conf slot -> plain cap gate.
+    if not slot_available_for(False):
+        print(f"[SLOT] {symbol} skipped - shared cap ({SHARED_MAX_CONCURRENT}) reached")
         return
-    label = "SHORT" if side == "SELL" else "LONG"
-    kind  = "Trapped-block fade" if side == "SELL" else "Demand-block bounce"
-    risk_usdt = T3_CONF_RISK_USDT if conf else T2_RISK_USDT
-    conf_tag = " [CONFLUENCE $" + str(int(T3_CONF_RISK_USDT)) + "]" if conf else ""
+    if side == "SELL":
+        engine = "TIGHT 2"; label = "SHORT"; kind = "Trapped-block fade"
+    else:
+        engine = "TIGHT 1"; label = "LONG";  kind = "Demand-block bounce"
+    risk_usdt = T2_RISK_USDT   # flat $5
     send_tg(
-        "TIGHT 2 " + label + conf_tag + " - " + symbol + "\n"
+        engine + " " + label + " - " + symbol + "\n"
         "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(risk_usdt) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
-        + kind + " | TP " + str(T2_TP_R) + "R\n"
+        + kind + " | TP " + str(T2_TP_R) + "R (fresh<" + str(T2_BLOCK_MAX_AGE_DAYS) + "d)\n"
     )
-    oid = place_t2_order(symbol, entry_px, sl, side, conf)
+    oid = place_t2_order(symbol, entry_px, sl, side, False)
     if oid == "DEPTH_SKIP":
         return   # thin book - don't set cooldown, let it retry when the book fills
     t2_last_fire[symbol] = time.time()
@@ -1814,10 +1805,10 @@ def t2_loop():
                 for sym, blocks in list(t2_blocks.items()):
                     if api_backoff_active():
                         break
-                    if not t2_auto_trade_enabled:
+                    # run the scan if EITHER engine is on (T2=short side, T1=long side; both fresh-block)
+                    if not (t2_auto_trade_enabled or t3_auto_trade_enabled):
                         break
-                    # shared cap: stop only if even a confluence trade couldn't open a slot
-                    if not slot_available_for(True):
+                    if not slot_available_for(False):   # plain shared cap, no conf slot
                         break
                     if t2_symbol_has_open_trade(sym) or t2_in_cooldown(sym):
                         continue
@@ -1825,7 +1816,7 @@ def t2_loop():
                     checked += 1
                     time.sleep(0.2)
                 last_entry = time.time()
-                print(f"[T2 SCAN] blocks={len(t2_blocks)} checked={checked} open={len(t2_open_trades)} auto={t2_auto_trade_enabled}")
+                print(f"[SCAN] blocks={len(t2_blocks)} checked={checked} open={len(t2_open_trades)} T2(short)={t2_auto_trade_enabled} T1(long)={t3_auto_trade_enabled}")
         except Exception as e:
             print(f"[T2 LOOP ERROR] {e}")
         time.sleep(60)
@@ -1930,26 +1921,26 @@ def handle_telegram_commands():
                 elif text in ("/t2_stop", "/stop"):
                     t2_auto_trade_enabled = False
                     send_tg("Tight 2 (Trapped-Block Fade) Auto-trade OFF.")
-                # ---- Tight 1 Dormant Awakening (chase): /t1_start /t1_stop ----
+                # ---- Tight 1 = LONG fresh demand-block: /t1_start /t1_stop ----
                 elif text == "/t1_start":
                     t3_auto_trade_enabled = True
-                    send_tg("Tight 1 (Dormant Awakening) Auto-trade ON.")
+                    send_tg("Tight 1 (LONG demand-block) Auto-trade ON.")
                 elif text == "/t1_stop":
                     t3_auto_trade_enabled = False
-                    send_tg("Tight 1 (Dormant Awakening) Auto-trade OFF.")
+                    send_tg("Tight 1 (LONG demand-block) Auto-trade OFF.")
                 # ---- /status : everything at a glance ----
                 elif text == "/status":
                     backoff = ""
                     if api_backoff_active():
                         backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
+                    longs  = sum(1 for t in t2_open_trades.values() if t.get("side") == "BUY")
+                    shorts = sum(1 for t in t2_open_trades.values() if t.get("side") == "SELL")
                     send_tg(
                         "===== NITI BOT STATUS =====\n"
-                        "Tight 1 (Awakening): " + ("ON" if t3_auto_trade_enabled else "OFF") +
-                        " | Open: " + str(len(t3_open_trades)) + " | Watchlist: " + str(len(t3_watchlist)) + " | Awakened: " + str(len(t3_watch)) + "\n"
-                        "Tight 2 (Fade): " + ("ON" if t2_auto_trade_enabled else "OFF") +
-                        " | Open: " + str(len(t2_open_trades)) + " | Blocks: " + str(len(t2_blocks)) + "\n"
-                        "Confluence open: " + str(confluence_open_count()) + " (dedicated slots: " + str(CONFLUENCE_EXTRA_SLOTS) + ", risk $" + str(int(T3_CONF_RISK_USDT)) + ")\n"
-                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + " (+conf slot)" + backoff
+                        "Tight 1 (LONG demand-block): " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open longs: " + str(longs) + "\n"
+                        "Tight 2 (SHORT resistance-block): " + ("ON" if t2_auto_trade_enabled else "OFF") + " | Open shorts: " + str(shorts) + "\n"
+                        "Fresh-block <" + str(T2_BLOCK_MAX_AGE_DAYS) + "d | TP " + str(T2_TP_R) + "R | risk $" + str(int(T2_RISK_USDT)) + " flat | Blocks: " + str(len(t2_blocks)) + "\n"
+                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + backoff
                     )
                 # ---- per-strategy detail ----
                 elif text == "/t2_status":

@@ -1005,7 +1005,7 @@ T2_MIN_QUOTE_VOL          = 2_000_000  # 2026-08-12: 3M->2M. Backtest: 2M recove
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
-SHARED_MAX_CONCURRENT     = 4      # 2026-08-16: 2->4 (account grown to $50). Backtest (no-lookahead fresh-block, flat $5, 10x): cap2 165tr/win41%/+$242 -> cap4 291tr/win54%/+$915, maxDD -$82, holdout hA+0.80/hB+0.74. Margin: ~$13/trade, 4 open = ~$20 (~half a $50 acct). Risk STAYS flat $5 - do NOT scale risk% with balance.
+SHARED_MAX_CONCURRENT     = 4      # 2026-08-16: 2->4 ($50+ acct). T1+T2 (swing) share these 4 slots. T3 scalp has its OWN separate cap (T3_MAX_CONCURRENT).
 CONFLUENCE_EXTRA_SLOTS    = 1      # 2026-08-12: a CONFLUENCE trade (T1+T2 agree same coin+dir within 5d)
                                    # may open ONE dedicated slot BEYOND the 2 normal slots, so the bot's
                                    # highest-conviction trades are never dropped by the cap. Backtest cap2+1conf:
@@ -1947,7 +1947,7 @@ def trailing_loop():
 
 # ==================== TELEGRAM COMMANDS ====================
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -1988,6 +1988,25 @@ def handle_telegram_commands():
                 elif text == "/t1_stop":
                     t3_auto_trade_enabled = False
                     send_tg("Tight 1 (LONG demand-block) Auto-trade OFF.")
+                # ---- Tight 3 = VWAP-revert scalp: /t3_start /t3_stop ----
+                elif text == "/t3_start":
+                    if not T3_SCALP_ENABLED:
+                        send_tg("Tight 3 scalp is disabled at build level (T3_SCALP_ENABLED=0).")
+                    else:
+                        t3_scalp_auto_enabled = True
+                        send_tg("Tight 3 (VWAP-Revert Scalp) Auto-trade ON.")
+                elif text == "/t3_stop":
+                    t3_scalp_auto_enabled = False
+                    send_tg("Tight 3 (VWAP-Revert Scalp) Auto-trade OFF.")
+                elif text == "/t3_status":
+                    lines_s = ("Tight 3 (VWAP-Revert Scalp): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
+                               " | Open scalps: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
+                               " | Coins: " + str(len(T3_SCALP_COINS)) +
+                               " | TP " + str(round(T3_TP_PCT*100,1)) + "% SL " + str(round(T3_SL_PCT*100,1)) + "% | risk $" + str(int(T3_RISK_USDT)) + " flat")
+                    for _oid, ts in list(t3s_open_trades.items()):
+                        lines_s += ("\n" + ts["symbol"] + " " + ts["side"] + " | entry " + str(ts["entry"]) +
+                                    " | SL " + str(ts["sl"]) + " | TP " + str(ts["tp"]))
+                    send_tg(lines_s)
                 # ---- /status : everything at a glance ----
                 elif text == "/status":
                     backoff = ""
@@ -2000,7 +2019,8 @@ def handle_telegram_commands():
                         "Tight 1 (LONG demand-block): " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open longs: " + str(longs) + "\n"
                         "Tight 2 (SHORT resistance-block): " + ("ON" if t2_auto_trade_enabled else "OFF") + " | Open shorts: " + str(shorts) + "\n"
                         "Fresh-block <" + str(T2_BLOCK_MAX_AGE_DAYS) + "d | TP " + str(T2_TP_R) + "R | risk $" + str(int(T2_RISK_USDT)) + " flat | Blocks: " + str(len(t2_blocks)) + "\n"
-                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + backoff
+                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + "\n"
+                        "Tight 3 (VWAP Scalp): " + ("ON" if t3_scalp_auto_enabled else "OFF") + " | Open scalps: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) + backoff
                     )
                 # ---- per-strategy detail ----
                 elif text == "/t2_status":
@@ -2024,6 +2044,277 @@ def handle_telegram_commands():
         except Exception as e:
             print(f"[TG CMD] error: {e}")
         time.sleep(1)
+
+
+
+# ============================================================================
+# ==================== TIGHT 3 = VWAP-REVERT SCALP (2026-08-16) ==============
+# Independent high-frequency scalp engine. SEPARATE from the swing fresh-block
+# edge (T1/T2). Own coin whitelist, own margin cap, own /t3_start /t3_stop.
+# SIGNAL (5m): LONG when close is >= T3_VWAP_DEV below the rolling 48-bar VWAP
+#   AND volume >= T3_VOL_MULT x 20-bar avg (capitulation) -> fade back to mean.
+#   SHORT = mirror (>= dev ABOVE vwap). Exit: TP +T3_TP_PCT / SL -T3_SL_PCT /
+#   max-hold T3_MAX_HOLD_BARS bars. Backtest (5m, 2.7mo, cap2, $5 flat, fee
+#   0.05%/side): win 49%, +$1102 combined, ~25/day, holdout robust, random
+#   control strongly negative (real edge). Reuses the same safe order infra
+#   (place_market_order / place_sl_guarded / place_tp_guarded).
+# WHITELIST = the 246 coins with >10k 5m bars in bingx_5m_max_csv.gz. Only these
+#   are ever scanned/traded by T3 (new/untested coins can never enter).
+# LIVE RISK: at ~25 trades/day fee+slippage is the main threat -> keep risk $5
+#   flat and prefer that fills are near signal (slip alert logs loudly).
+# ============================================================================
+T3_SCALP_COINS = {
+    "1000000BABYDOGE-USDT", "1000000MOG-USDT", "10000SATS-USDT", "1000BONK-USDT", "1000CAT-USDT", "1000CHEEMS-USDT",
+    "1000PEPE-USDT", "1INCH-USDT", "AAVE-USDT", "ACE-USDT", "ACH-USDT", "ACT-USDT",
+    "ADA-USDT", "AERO-USDT", "AEVO-USDT", "AGLD-USDT", "AIXBT-USDT", "AKT-USDT",
+    "ALGO-USDT", "ALICE-USDT", "ALT-USDT", "ANKR-USDT", "APE-USDT", "API3-USDT",
+    "APT-USDT", "AR-USDT", "ARB-USDT", "ARK-USDT", "ARKM-USDT", "ARPA-USDT",
+    "ASTR-USDT", "ATH-USDT", "ATOM-USDT", "AUCTION-USDT", "AVA-USDT", "AVAX-USDT",
+    "AXL-USDT", "AXS-USDT", "BANANA-USDT", "BAT-USDT", "BB-USDT", "BCH-USDT",
+    "BEAM-USDT", "BIGTIME-USDT", "BLUR-USDT", "BNB-USDT", "BOME-USDT", "BRETT-USDT",
+    "BSV-USDT", "BTC-USDT", "CAKE-USDT", "CARV-USDT", "CATI-USDT", "CELO-USDT",
+    "CETUS-USDT", "CFX-USDT", "CGPT-USDT", "CHILLGUY-USDT", "CHR-USDT", "CHZ-USDT",
+    "CKB-USDT", "COMP-USDT", "COTI-USDT", "COW-USDT", "CRO-USDT", "CRV-USDT",
+    "CTK-USDT", "CYBER-USDT", "DASH-USDT", "DIA-USDT", "DOGE-USDT", "DOGS-USDT",
+    "DOT-USDT", "DRIFT-USDT", "DUSK-USDT", "DYDX-USDT", "DYM-USDT", "EDU-USDT",
+    "EGLD-USDT", "EIGEN-USDT", "ENA-USDT", "ENJ-USDT", "ENS-USDT", "ETC-USDT",
+    "ETH-USDT", "ETHFI-USDT", "FARTCOIN-USDT", "FET-USDT", "FIDA-USDT", "FIL-USDT",
+    "FLOKI-USDT", "FLOW-USDT", "FLUX-USDT", "G-USDT", "GALA-USDT", "GAS-USDT",
+    "GLM-USDT", "GMT-USDT", "GMX-USDT", "GOAT-USDT", "GRASS-USDT", "GRT-USDT",
+    "HBAR-USDT", "HIVE-USDT", "HMSTR-USDT", "HYPE-USDT", "ICP-USDT", "ID-USDT",
+    "ILV-USDT", "IMX-USDT", "INJ-USDT", "IO-USDT", "IOST-USDT", "IOTA-USDT",
+    "JASMY-USDT", "JTO-USDT", "JUP-USDT", "KAIA-USDT", "KAS-USDT", "KAVA-USDT",
+    "KMNO-USDT", "KNC-USDT", "KSM-USDT", "LDO-USDT", "LINK-USDT", "LISTA-USDT",
+    "LPT-USDT", "LQTY-USDT", "LSK-USDT", "LTC-USDT", "LUMIA-USDT", "LUNA-USDT",
+    "LUNC-USDT", "MAGIC-USDT", "MANA-USDT", "MANTA-USDT", "MASK-USDT", "MAV-USDT",
+    "MAVIA-USDT", "ME-USDT", "MEME-USDT", "MERL-USDT", "METIS-USDT", "MEW-USDT",
+    "MINA-USDT", "MOODENG-USDT", "MORPHO-USDT", "MOVE-USDT", "MOVR-USDT", "MTL-USDT",
+    "NEAR-USDT", "NEIROCTO-USDT", "NEO-USDT", "NMR-USDT", "NOT-USDT", "OKB-USDT",
+    "ONDO-USDT", "ONE-USDT", "ONG-USDT", "ONT-USDT", "OP-USDT", "ORDER-USDT",
+    "ORDI-USDT", "PENDLE-USDT", "PENGU-USDT", "PEOPLE-USDT", "PHA-USDT", "PIXEL-USDT",
+    "PNUT-USDT", "POL-USDT", "POLYX-USDT", "POPCAT-USDT", "PORTAL-USDT", "PYTH-USDT",
+    "QNT-USDT", "QTUM-USDT", "RARE-USDT", "RATS-USDT", "RAY-USDT", "RENDER-USDT",
+    "REZ-USDT", "RLC-USDT", "RON-USDT", "ROSE-USDT", "RPL-USDT", "RSR-USDT",
+    "RUNE-USDT", "RVN-USDT", "SAFE-USDT", "SAGA-USDT", "SAND-USDT", "SANTOS-USDT",
+    "SCRT-USDT", "SEI-USDT", "SFP-USDT", "SKL-USDT", "SLP-USDT", "SNX-USDT",
+    "SOL-USDT", "SPX-USDT", "SSV-USDT", "STG-USDT", "STORJ-USDT", "STRK-USDT",
+    "STX-USDT", "SUI-USDT", "SUN-USDT", "SUPER-USDT", "SUSHI-USDT", "SYN-USDT",
+    "TAO-USDT", "THE-USDT", "THETA-USDT", "TIA-USDT", "TLM-USDT", "TNSR-USDT",
+    "TRB-USDT", "TRX-USDT", "TURBO-USDT", "TWT-USDT", "UMA-USDT", "UNI-USDT",
+    "USUAL-USDT", "VANA-USDT", "VANRY-USDT", "VELODROME-USDT", "VET-USDT", "VIRTUAL-USDT",
+    "W-USDT", "WAVES-USDT", "WIF-USDT", "WLD-USDT", "WOO-USDT", "XAI-USDT",
+    "XCN-USDT", "XLM-USDT", "XMR-USDT", "XRP-USDT", "YFI-USDT", "YGG-USDT",
+    "ZEC-USDT", "ZEN-USDT", "ZETA-USDT", "ZK-USDT", "ZRO-USDT", "ZRX-USDT",
+}
+
+T3_SCALP_ENABLED      = os.environ.get("T3_SCALP_ENABLED", "1") == "1"   # master build flag
+t3_scalp_auto_enabled = AUTO_RESUME_ON_START     # runtime on/off via /t3_start /t3_stop (off until Faisal sends /t3_start, like T1/T2)
+
+T3_VWAP_LEN         = 48         # rolling VWAP window (48 x 5m = 4h)
+T3_VWAP_DEV         = float(os.environ.get("T3_VWAP_DEV", 0.05))   # 2026-08-16 SLIPPAGE-ROBUST: 5% stretch (bigger dislocation clears slippage; 3% died at 0.1% slip)
+T3_VOL_MULT         = float(os.environ.get("T3_VOL_MULT", 2.0))    # volume spike vs 20-bar avg
+T3_TP_PCT           = float(os.environ.get("T3_TP_PCT", 0.04))     # +4% TP (scaled up with DEV so edge > slippage)
+T3_SL_PCT           = float(os.environ.get("T3_SL_PCT", 0.025))    # -2.5% stop (also halves margin: $20/trade vs $42)
+T3_MAX_HOLD_BARS    = int(os.environ.get("T3_MAX_HOLD_BARS", 30))  # 30 x 5m = 2.5h time-stop
+T3_MAX_CONCURRENT   = int(os.environ.get("T3_MAX_CONCURRENT", 3))  # OWN slot cap (SL2.5% => ~$20 margin/trade; peak $60 at cap3)
+T3_RISK_USDT        = float(os.environ.get("T3_RISK_USDT", 5.0))   # flat $5, NEVER scale with balance
+T3_LEVERAGE         = int(os.environ.get("T3_LEVERAGE", 10))
+T3_COOLDOWN_SECONDS = int(os.environ.get("T3_COOLDOWN_SECONDS", 7200))    # 2h per-coin between scalps
+T3_LOSS_COOLDOWN_S  = int(os.environ.get("T3_LOSS_COOLDOWN_S", 86400))    # 1d ban after an SL
+T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 120))         # scan cadence
+T3_MAX_MARGIN_USDT  = float(os.environ.get("T3_MAX_MARGIN_USDT", 50))     # per-trade margin cap safety
+
+t3s_open_trades   = {}    # order_id -> open scalp trade
+t3s_last_fire     = {}    # symbol -> ts of last scalp entry
+t3s_loss_until    = {}    # symbol -> ts until which coin is banned (after SL)
+
+def t3s_in_cooldown(symbol):
+    now = time.time()
+    if now < t3s_last_fire.get(symbol, 0) + T3_COOLDOWN_SECONDS:
+        return True
+    if now < t3s_loss_until.get(symbol, 0):
+        return True
+    return False
+
+def t3s_symbol_has_open(symbol):
+    return any(t.get("symbol") == symbol for t in t3s_open_trades.values())
+
+def t3s_scalp_signal(symbol):
+    """Return ('BUY'|'SELL', entry_price) or None. Uses only CONFIRMED closed 5m bars."""
+    try:
+        candles = get_candles(symbol, limit=80, interval="5m")
+        if not candles or len(candles) < T3_VWAP_LEN + 22:
+            return None
+        confirmed = candles[:-1]              # drop the still-forming bar
+        window = confirmed[-T3_VWAP_LEN:]
+        closes = [cl(c) for c in window]
+        vols   = [v(c)  for c in window]
+        pv = sum(closes[i] * vols[i] for i in range(len(window)))
+        vsum = sum(vols)
+        if vsum <= 0:
+            return None
+        vwap = pv / vsum
+        if vwap <= 0:
+            return None
+        last = confirmed[-1]
+        price = cl(last)
+        if price < MIN_ENTRY_PRICE:
+            return None
+        dev = (price - vwap) / vwap
+        # 20-bar avg volume (excluding the entry bar) for the spike test
+        vol20 = vols[-21:-1] if len(vols) >= 21 else vols[:-1]
+        vavg = (sum(vol20) / len(vol20)) if vol20 else 0
+        if vavg <= 0 or v(last) < T3_VOL_MULT * vavg:
+            return None
+        if dev <= -T3_VWAP_DEV:
+            return ("BUY", price)             # stretched below VWAP -> long the revert
+        if dev >= T3_VWAP_DEV:
+            return ("SELL", price)            # stretched above VWAP -> short the revert
+        return None
+    except Exception as e:
+        print(f"[T3 SCALP SIGNAL {symbol}] error: {e}")
+        return None
+
+def place_t3_scalp_order(symbol, entry, side="BUY"):
+    """Percent-based scalp entry. TP/SL are fixed % (not R). Reuses safe infra."""
+    try:
+        set_leverage_api(symbol, T3_LEVERAGE)
+        precision = symbol_precision.get(symbol, 4)
+        if side == "BUY":
+            sl = round(entry * (1 - T3_SL_PCT), 6)
+            tp = round(entry * (1 + T3_TP_PCT), 6)
+            pos_side, close_side = "LONG", "SELL"
+        else:
+            sl = round(entry * (1 + T3_SL_PCT), 6)
+            tp = round(entry * (1 - T3_TP_PCT), 6)
+            pos_side, close_side = "SHORT", "BUY"
+        risk_dist = abs(sl - entry)
+        if risk_dist <= 0:
+            return None
+        risk_qty = T3_RISK_USDT / risk_dist
+        margin_cap_qty = (T3_MAX_MARGIN_USDT * T3_LEVERAGE) / entry
+        qty = round(min(risk_qty, margin_cap_qty), precision)
+        if qty <= 0:
+            return None
+        if not depth_ok(symbol, entry, sl, qty, side):
+            send_tg("TIGHT 3 " + symbol + " " + side + " skipped - order book too thin (slippage guard)")
+            return "DEPTH_SKIP"
+        required_margin = qty * entry / T3_LEVERAGE
+        avail = get_available_margin()
+        if avail is not None and avail < required_margin * 1.05:
+            print(f"[T3 MARGIN SKIP] {symbol} need ~${required_margin:.2f}, avail ${avail:.2f}")
+            return "MARGIN_SKIP"
+        order_id = place_market_order(symbol, side, qty, pos_side)
+        print(f"[T3 SCALP ORDER] {symbol} {pos_side} qty={qty} risk=${T3_RISK_USDT}: {order_id}")
+        if order_id not in ("N/A", "MARGIN_SKIP") and order_id is not None:
+            time.sleep(0.5)
+            entry_fill = get_fill_price(order_id, symbol, fallback=entry)
+            slip_pct = abs(entry_fill - entry) / entry * 100 if entry > 0 else 0.0
+            print(f"[T3 SLIP] {symbol} signal={entry} fill={entry_fill} slip={slip_pct:.3f}%")
+            if slip_pct > T3_SLIP_ALERT_PCT:
+                send_tg(f"⚠️ TIGHT 3 {symbol}: fill slipped {slip_pct:.2f}% (scalp). Kept - logging.")
+            # recompute TP/SL off the actual fill so the % is honoured
+            if side == "BUY":
+                sl = round(entry_fill * (1 - T3_SL_PCT), 6)
+                tp = round(entry_fill * (1 + T3_TP_PCT), 6)
+            else:
+                sl = round(entry_fill * (1 + T3_SL_PCT), 6)
+                tp = round(entry_fill * (1 - T3_TP_PCT), 6)
+            sl_id = place_sl_guarded(symbol, close_side, pos_side, sl, qty)
+            if sl_id is None:
+                print(f"[T3 SL GUARD] {symbol} SL failed twice - emergency close")
+                place_market_order(symbol, close_side, qty, pos_side)
+                send_tg(f"⚠️ TIGHT 3 {symbol}: SL placement failed - position emergency-closed")
+                return None
+            tp_id = place_tp_guarded(symbol, close_side, pos_side, tp, qty, label="T3-scalp")
+            t3s_open_trades[str(order_id)] = {
+                "symbol": symbol, "side": side, "entry": entry, "entry_fill": entry_fill,
+                "sl": sl, "sl_id": sl_id, "tp": tp, "tp_id": tp_id,
+                "total_qty": qty, "close_side": close_side, "pos_side": pos_side,
+                "risk_usdt": T3_RISK_USDT, "engine": "T3_SCALP",
+                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                "open_ts": time.time(),
+            }
+        return order_id
+    except Exception as e:
+        print(f"[T3 SCALP ORDER ERROR] {symbol}: {e}")
+        return None
+
+def track_t3_scalp_trades():
+    """Reconcile open scalp trades: detect TP/SL fills (position gone) + enforce time-stop."""
+    if not t3s_open_trades:
+        return
+    try:
+        open_syms = all_open_symbols()
+    except Exception as e:
+        print(f"[T3 TRACK] open-symbol fetch error: {e}")
+        return
+    now = time.time()
+    for oid, t in list(t3s_open_trades.items()):
+        sym = t["symbol"]
+        # time-stop: force-close if held past max-hold
+        if now - t.get("open_ts", now) > T3_MAX_HOLD_BARS * 300:
+            try:
+                place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
+                send_tg(f"TIGHT 3 {sym} time-stop closed ({T3_MAX_HOLD_BARS} bars)")
+            except Exception as e:
+                print(f"[T3 TIMESTOP {sym}] {e}")
+            t3s_last_fire[sym] = now
+            t3s_open_trades.pop(oid, None)
+            continue
+        # position closed on the exchange (TP or SL hit) -> free the slot
+        if sym not in open_syms:
+            # infer result from last price vs tp/sl for the loss-cooldown
+            result = "closed"
+            try:
+                px = get_current_price(sym)
+                if px:
+                    if t["side"] == "BUY":
+                        result = "SL" if px <= t["sl"] * 1.001 else "TP"
+                    else:
+                        result = "SL" if px >= t["sl"] * 0.999 else "TP"
+            except Exception:
+                pass
+            if result == "SL":
+                t3s_loss_until[sym] = now + T3_LOSS_COOLDOWN_S
+            t3s_last_fire[sym] = now
+            print(f"[T3 SCALP CLOSED] {sym} {result}")
+            t3s_open_trades.pop(oid, None)
+
+def t3_scalp_loop():
+    print("Tight 3 loop started - VWAP-Revert Scalp (5m, own whitelist, own cap, /t3_start /t3_stop)")
+    if not T3_SCALP_ENABLED:
+        print("[T3 SCALP] disabled by env T3_SCALP_ENABLED=0 - loop idle")
+        while True:
+            time.sleep(3600)
+    scan_list = sorted(T3_SCALP_COINS)
+    while True:
+        try:
+            if api_backoff_active():
+                time.sleep(30)
+                continue
+            track_t3_scalp_trades()
+            if t3_scalp_auto_enabled:
+                for sym in scan_list:
+                    if api_backoff_active():
+                        break
+                    if not t3_scalp_auto_enabled:
+                        break
+                    if len(t3s_open_trades) >= T3_MAX_CONCURRENT:
+                        break
+                    if t3s_symbol_has_open(sym) or t3s_in_cooldown(sym):
+                        continue
+                    sig = t3s_scalp_signal(sym)
+                    if sig:
+                        side, entry = sig
+                        res = place_t3_scalp_order(sym, entry, side)
+                        if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP", "N/A"):
+                            t3s_last_fire[sym] = time.time()
+                    time.sleep(0.2)
+            print(f"[T3 SCAN] scalp_open={len(t3s_open_trades)}/{T3_MAX_CONCURRENT} on={t3_scalp_auto_enabled} coins={len(scan_list)}")
+        except Exception as e:
+            print(f"[T3 SCALP LOOP ERROR] {e}")
+        time.sleep(T3_SCAN_SECONDS)
 
 
 @app.route("/")
@@ -2124,4 +2415,5 @@ if __name__ == "__main__":
     Thread(target=t3_loop,                  daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()
     Thread(target=oi_collector_loop,        daemon=True).start()   # OI logger -> Supabase (2026-08-10)
+    Thread(target=t3_scalp_loop,            daemon=True).start()   # T3 VWAP-revert scalp (2026-08-16)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -2063,48 +2063,37 @@ def handle_telegram_commands():
 # LIVE RISK: at ~25 trades/day fee+slippage is the main threat -> keep risk $5
 #   flat and prefer that fills are near signal (slip alert logs loudly).
 # ============================================================================
-T3_SCALP_COINS = {
-    "1000000BABYDOGE-USDT", "1000000MOG-USDT", "10000SATS-USDT", "1000BONK-USDT", "1000CAT-USDT", "1000CHEEMS-USDT",
-    "1000PEPE-USDT", "1INCH-USDT", "AAVE-USDT", "ACE-USDT", "ACH-USDT", "ACT-USDT",
-    "ADA-USDT", "AERO-USDT", "AEVO-USDT", "AGLD-USDT", "AIXBT-USDT", "AKT-USDT",
-    "ALGO-USDT", "ALICE-USDT", "ALT-USDT", "ANKR-USDT", "APE-USDT", "API3-USDT",
-    "APT-USDT", "AR-USDT", "ARB-USDT", "ARK-USDT", "ARKM-USDT", "ARPA-USDT",
-    "ASTR-USDT", "ATH-USDT", "ATOM-USDT", "AUCTION-USDT", "AVA-USDT", "AVAX-USDT",
-    "AXL-USDT", "AXS-USDT", "BANANA-USDT", "BAT-USDT", "BB-USDT", "BCH-USDT",
-    "BEAM-USDT", "BIGTIME-USDT", "BLUR-USDT", "BNB-USDT", "BOME-USDT", "BRETT-USDT",
-    "BSV-USDT", "BTC-USDT", "CAKE-USDT", "CARV-USDT", "CATI-USDT", "CELO-USDT",
-    "CETUS-USDT", "CFX-USDT", "CGPT-USDT", "CHILLGUY-USDT", "CHR-USDT", "CHZ-USDT",
-    "CKB-USDT", "COMP-USDT", "COTI-USDT", "COW-USDT", "CRO-USDT", "CRV-USDT",
-    "CTK-USDT", "CYBER-USDT", "DASH-USDT", "DIA-USDT", "DOGE-USDT", "DOGS-USDT",
-    "DOT-USDT", "DRIFT-USDT", "DUSK-USDT", "DYDX-USDT", "DYM-USDT", "EDU-USDT",
-    "EGLD-USDT", "EIGEN-USDT", "ENA-USDT", "ENJ-USDT", "ENS-USDT", "ETC-USDT",
-    "ETH-USDT", "ETHFI-USDT", "FARTCOIN-USDT", "FET-USDT", "FIDA-USDT", "FIL-USDT",
-    "FLOKI-USDT", "FLOW-USDT", "FLUX-USDT", "G-USDT", "GALA-USDT", "GAS-USDT",
-    "GLM-USDT", "GMT-USDT", "GMX-USDT", "GOAT-USDT", "GRASS-USDT", "GRT-USDT",
-    "HBAR-USDT", "HIVE-USDT", "HMSTR-USDT", "HYPE-USDT", "ICP-USDT", "ID-USDT",
-    "ILV-USDT", "IMX-USDT", "INJ-USDT", "IO-USDT", "IOST-USDT", "IOTA-USDT",
+T3_SCALP_COINS = {  # 166 LIQUID coins only (>=$5k median $vol/bar). Thin coins like ONG
+                    # REMOVED 2026-08-16 - they slip ~1% on market fills and lose. This is
+                    # the slippage fix: thin coins can never enter the scalp engine.
+    "10000SATS-USDT", "1000BONK-USDT", "1000PEPE-USDT", "AAVE-USDT", "ADA-USDT", "AGLD-USDT",
+    "AIXBT-USDT", "ALGO-USDT", "APE-USDT", "API3-USDT", "APT-USDT", "AR-USDT",
+    "ARB-USDT", "ARK-USDT", "ARKM-USDT", "ASTR-USDT", "ATOM-USDT", "AUCTION-USDT",
+    "AVAX-USDT", "AXL-USDT", "AXS-USDT", "BANANA-USDT", "BCH-USDT", "BEAM-USDT",
+    "BIGTIME-USDT", "BLUR-USDT", "BNB-USDT", "BOME-USDT", "BSV-USDT", "BTC-USDT",
+    "CAKE-USDT", "CATI-USDT", "CELO-USDT", "CFX-USDT", "CHZ-USDT", "COMP-USDT",
+    "COW-USDT", "CRO-USDT", "CRV-USDT", "CYBER-USDT", "DASH-USDT", "DIA-USDT",
+    "DOGE-USDT", "DOT-USDT", "DRIFT-USDT", "DYDX-USDT", "EDU-USDT", "EGLD-USDT",
+    "ENA-USDT", "ENJ-USDT", "ENS-USDT", "ETC-USDT", "ETH-USDT", "ETHFI-USDT",
+    "FARTCOIN-USDT", "FET-USDT", "FIL-USDT", "GALA-USDT", "GAS-USDT", "GMX-USDT",
+    "GOAT-USDT", "GRASS-USDT", "GRT-USDT", "HBAR-USDT", "HYPE-USDT", "ICP-USDT",
+    "ID-USDT", "ILV-USDT", "IMX-USDT", "INJ-USDT", "IOST-USDT", "IOTA-USDT",
     "JASMY-USDT", "JTO-USDT", "JUP-USDT", "KAIA-USDT", "KAS-USDT", "KAVA-USDT",
-    "KMNO-USDT", "KNC-USDT", "KSM-USDT", "LDO-USDT", "LINK-USDT", "LISTA-USDT",
-    "LPT-USDT", "LQTY-USDT", "LSK-USDT", "LTC-USDT", "LUMIA-USDT", "LUNA-USDT",
-    "LUNC-USDT", "MAGIC-USDT", "MANA-USDT", "MANTA-USDT", "MASK-USDT", "MAV-USDT",
-    "MAVIA-USDT", "ME-USDT", "MEME-USDT", "MERL-USDT", "METIS-USDT", "MEW-USDT",
-    "MINA-USDT", "MOODENG-USDT", "MORPHO-USDT", "MOVE-USDT", "MOVR-USDT", "MTL-USDT",
-    "NEAR-USDT", "NEIROCTO-USDT", "NEO-USDT", "NMR-USDT", "NOT-USDT", "OKB-USDT",
-    "ONDO-USDT", "ONE-USDT", "ONG-USDT", "ONT-USDT", "OP-USDT", "ORDER-USDT",
-    "ORDI-USDT", "PENDLE-USDT", "PENGU-USDT", "PEOPLE-USDT", "PHA-USDT", "PIXEL-USDT",
-    "PNUT-USDT", "POL-USDT", "POLYX-USDT", "POPCAT-USDT", "PORTAL-USDT", "PYTH-USDT",
-    "QNT-USDT", "QTUM-USDT", "RARE-USDT", "RATS-USDT", "RAY-USDT", "RENDER-USDT",
-    "REZ-USDT", "RLC-USDT", "RON-USDT", "ROSE-USDT", "RPL-USDT", "RSR-USDT",
-    "RUNE-USDT", "RVN-USDT", "SAFE-USDT", "SAGA-USDT", "SAND-USDT", "SANTOS-USDT",
-    "SCRT-USDT", "SEI-USDT", "SFP-USDT", "SKL-USDT", "SLP-USDT", "SNX-USDT",
-    "SOL-USDT", "SPX-USDT", "SSV-USDT", "STG-USDT", "STORJ-USDT", "STRK-USDT",
-    "STX-USDT", "SUI-USDT", "SUN-USDT", "SUPER-USDT", "SUSHI-USDT", "SYN-USDT",
-    "TAO-USDT", "THE-USDT", "THETA-USDT", "TIA-USDT", "TLM-USDT", "TNSR-USDT",
-    "TRB-USDT", "TRX-USDT", "TURBO-USDT", "TWT-USDT", "UMA-USDT", "UNI-USDT",
-    "USUAL-USDT", "VANA-USDT", "VANRY-USDT", "VELODROME-USDT", "VET-USDT", "VIRTUAL-USDT",
-    "W-USDT", "WAVES-USDT", "WIF-USDT", "WLD-USDT", "WOO-USDT", "XAI-USDT",
-    "XCN-USDT", "XLM-USDT", "XMR-USDT", "XRP-USDT", "YFI-USDT", "YGG-USDT",
-    "ZEC-USDT", "ZEN-USDT", "ZETA-USDT", "ZK-USDT", "ZRO-USDT", "ZRX-USDT",
+    "KNC-USDT", "KSM-USDT", "LDO-USDT", "LINK-USDT", "LPT-USDT", "LTC-USDT",
+    "LUNA-USDT", "MAGIC-USDT", "MANA-USDT", "MASK-USDT", "MEME-USDT", "MERL-USDT",
+    "METIS-USDT", "MINA-USDT", "MOODENG-USDT", "MOVE-USDT", "MOVR-USDT", "NEAR-USDT",
+    "NEIROCTO-USDT", "NEO-USDT", "NMR-USDT", "NOT-USDT", "OKB-USDT", "ONDO-USDT",
+    "ONT-USDT", "OP-USDT", "ORDI-USDT", "PENDLE-USDT", "PENGU-USDT", "PEOPLE-USDT",
+    "PNUT-USDT", "POL-USDT", "POLYX-USDT", "POPCAT-USDT", "PYTH-USDT", "QNT-USDT",
+    "QTUM-USDT", "RENDER-USDT", "REZ-USDT", "RON-USDT", "ROSE-USDT", "RSR-USDT",
+    "RUNE-USDT", "SAFE-USDT", "SAND-USDT", "SEI-USDT", "SKL-USDT", "SNX-USDT",
+    "SOL-USDT", "SPX-USDT", "SSV-USDT", "STORJ-USDT", "STRK-USDT", "STX-USDT",
+    "SUI-USDT", "SUN-USDT", "SUPER-USDT", "SUSHI-USDT", "TAO-USDT", "THE-USDT",
+    "THETA-USDT", "TIA-USDT", "TNSR-USDT", "TRB-USDT", "TRX-USDT", "TURBO-USDT",
+    "TWT-USDT", "UMA-USDT", "UNI-USDT", "VANA-USDT", "VET-USDT", "VIRTUAL-USDT",
+    "W-USDT", "WIF-USDT", "WLD-USDT", "WOO-USDT", "XAI-USDT", "XLM-USDT",
+    "XMR-USDT", "XRP-USDT", "YFI-USDT", "YGG-USDT", "ZEC-USDT", "ZEN-USDT",
+    "ZETA-USDT", "ZK-USDT", "ZRO-USDT", "ZRX-USDT",
 }
 
 T3_SCALP_ENABLED      = os.environ.get("T3_SCALP_ENABLED", "1") == "1"   # master build flag
@@ -2123,6 +2112,7 @@ T3_COOLDOWN_SECONDS = int(os.environ.get("T3_COOLDOWN_SECONDS", 7200))    # 2h p
 T3_LOSS_COOLDOWN_S  = int(os.environ.get("T3_LOSS_COOLDOWN_S", 86400))    # 1d ban after an SL
 T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 120))         # scan cadence
 T3_MAX_MARGIN_USDT  = float(os.environ.get("T3_MAX_MARGIN_USDT", 50))     # per-trade margin cap safety
+T3_DEPTH_MULT       = float(os.environ.get("T3_DEPTH_MULT", 5.0))          # scalp depth guard: need 5x qty in book (stricter than swing's 3x; scalp's small TP can't absorb slippage)
 
 t3s_open_trades   = {}    # order_id -> open scalp trade
 t3s_last_fire     = {}    # symbol -> ts of last scalp entry
@@ -2196,8 +2186,18 @@ def place_t3_scalp_order(symbol, entry, side="BUY"):
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
-        if not depth_ok(symbol, entry, sl, qty, side):
-            send_tg("TIGHT 3 " + symbol + " " + side + " skipped - order book too thin (slippage guard)")
+        # STRICTER depth for scalp: temporarily raise the multiplier (scalp's small TP
+        # cannot absorb the ~1% slip that thin books cause, e.g. ONG). The 166-coin
+        # liquid whitelist is the primary guard; this is the second layer.
+        global DEPTH_LIQUIDITY_MULT
+        _saved_mult = DEPTH_LIQUIDITY_MULT
+        DEPTH_LIQUIDITY_MULT = T3_DEPTH_MULT
+        try:
+            _depth_pass = depth_ok(symbol, entry, sl, qty, side)
+        finally:
+            DEPTH_LIQUIDITY_MULT = _saved_mult
+        if not _depth_pass:
+            send_tg("TIGHT 3 " + symbol + " " + side + " skipped - order book too thin (scalp slippage guard)")
             return "DEPTH_SKIP"
         required_margin = qty * entry / T3_LEVERAGE
         avail = get_available_margin()
@@ -2256,7 +2256,8 @@ def track_t3_scalp_trades():
         if now - t.get("open_ts", now) > T3_MAX_HOLD_BARS * 300:
             try:
                 place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
-                send_tg(f"TIGHT 3 {sym} time-stop closed ({T3_MAX_HOLD_BARS} bars)")
+                ef = t.get("entry_fill", t.get("entry", 0))
+                send_tg(f"\u23f1\ufe0f TIGHT 3 {sym} {t.get('side','')} time-stop closed ({T3_MAX_HOLD_BARS} bars) | entry {ef}")
             except Exception as e:
                 print(f"[T3 TIMESTOP {sym}] {e}")
             t3s_last_fire[sym] = now
@@ -2279,6 +2280,22 @@ def track_t3_scalp_trades():
                 t3s_loss_until[sym] = now + T3_LOSS_COOLDOWN_S
             t3s_last_fire[sym] = now
             print(f"[T3 SCALP CLOSED] {sym} {result}")
+            # Telegram journal for the scalp close (entry, exit, approx PnL, hold time)
+            try:
+                ef = t.get("entry_fill", t.get("entry", 0))
+                held_min = int((now - t.get("open_ts", now)) / 60)
+                if result == "TP":
+                    approx = "+$" + str(round(T3_TP_PCT * (T3_RISK_USDT / T3_SL_PCT), 2))
+                    emoji = "\u2705"
+                elif result == "SL":
+                    approx = "-$" + str(round(T3_RISK_USDT, 2))
+                    emoji = "\u274c"
+                else:
+                    approx = "~"
+                    emoji = "\u2139\ufe0f"
+                send_tg(f"{emoji} TIGHT 3 {sym} {t.get('side','')} {result} | entry {ef} | ~{approx} | held {held_min}m")
+            except Exception as _e:
+                print(f"[T3 JOURNAL {sym}] {_e}")
             t3s_open_trades.pop(oid, None)
 
 def t3_scalp_loop():

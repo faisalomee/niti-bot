@@ -296,15 +296,23 @@ def depth_ok(symbol, entry, sl, qty, side):
     if ob is None:
         return True   # fail-open: don't block on a fetch failure
     try:
+        # An SL market-close sweeps the book from the BEST price outward until qty is filled;
+        # it is NOT confined to the entry->SL band. The old code summed only the thin slice
+        # between entry and SL, which is almost always < qty*3 -> it silently killed ~every
+        # trade (the "no trades in 24h across all 3 engines" bug). Correct check: is there
+        # at least qty*DEPTH_LIQUIDITY_MULT resting on the side we'd sweep, within a sane
+        # slippage cap (2x the entry->SL distance) of entry.
+        risk_dist = abs(sl - entry)
+        cap = entry + (2 * risk_dist if side == "SELL" else -2 * risk_dist)
         if side == "SELL":
-            lo_p, hi_p = min(entry, sl), max(entry, sl)   # SL above entry
+            lo_p, hi_p = entry, max(entry, cap)          # buy back -> walk asks up
             avail = sum(float(q) for p, q in ob["asks"] if lo_p <= float(p) <= hi_p)
         else:
-            lo_p, hi_p = min(entry, sl), max(entry, sl)   # SL below entry
+            lo_p, hi_p = min(entry, cap), entry          # sell out -> walk bids down
             avail = sum(float(q) for p, q in ob["bids"] if lo_p <= float(p) <= hi_p)
         need = qty * DEPTH_LIQUIDITY_MULT
         if avail < need:
-            print(f"[DEPTH SKIP] {symbol} {side} thin book: {avail:.2f} in entry->SL band < need {need:.2f} (qty {qty} x{DEPTH_LIQUIDITY_MULT})")
+            print(f"[DEPTH SKIP] {symbol} {side} thin book: {avail:.2f} within 2xSL of entry < need {need:.2f} (qty {qty} x{DEPTH_LIQUIDITY_MULT})")
             return False
         return True
     except Exception as e:
@@ -1642,20 +1650,24 @@ def t2_check_entry(symbol, blocks):
             if side == "S" and t2_auto_trade_enabled:
                 # price returning UP into resistance from below (band), close still below → SHORT
                 if price < lvl and hi >= lvl * (1 - T2_RET_BAND_PCT / 100) and hi <= lvl * (1 + T2_RET_BAND_PCT / 100):
+                    globals()["_t2_band_hits"] = globals().get("_t2_band_hits", 0) + 1
                     sl = round(lvl + atr_now * T2_SL_ATR_BUF, 6)
                     if sl <= price:
                         continue
                     if (sl - price) / price > SL_DIST_CAP:   # SLcap - skip wide-SL that would liquidate before SL
+                        globals()["_t2_slcap_skips"] = globals().get("_t2_slcap_skips", 0) + 1
                         continue
                     t2_fire_entry(symbol, price, sl, "SELL")
                     return
             elif side == "L" and t3_auto_trade_enabled:
                 # price returning DOWN into demand from above (band), close still above → LONG (Tight 1)
                 if price > lvl and lo <= lvl * (1 + T2_RET_BAND_PCT / 100) and lo >= lvl * (1 - T2_RET_BAND_PCT / 100):
+                    globals()["_t2_band_hits"] = globals().get("_t2_band_hits", 0) + 1
                     sl = round(lvl - atr_now * T2_SL_ATR_BUF, 6)
                     if sl >= price:
                         continue
                     if (price - sl) / price > SL_DIST_CAP:
+                        globals()["_t2_slcap_skips"] = globals().get("_t2_slcap_skips", 0) + 1
                         continue
                     t2_fire_entry(symbol, price, sl, "BUY")
                     return
@@ -1696,14 +1708,23 @@ def t2_fire_entry(symbol, entry_px, sl, side="SELL"):
     else:
         engine = "TIGHT 1"; label = "LONG";  kind = "Demand-block bounce"
     risk_usdt = T2_RISK_USDT   # flat $5
-    send_tg(
+    header = (
         engine + " " + label + " - " + symbol + "\n"
         "Entry: " + str(round(entry_px, 6)) + " | SL: " + str(sl) + " | Risk: $" + str(risk_usdt) + " | Lev: " + str(T2_LEVERAGE) + "x\n"
-        + kind + " | TP " + str(T2_TP_R) + "R (fresh<" + str(T2_BLOCK_MAX_AGE_DAYS) + "d)\n"
+        + kind + " | TP " + str(T2_TP_R) + "R (fresh<" + str(T2_BLOCK_MAX_AGE_DAYS) + "d)"
     )
+    # place FIRST, then send ONE alert whose last line states the real outcome
     oid = place_t2_order(symbol, entry_px, sl, side, False)
     if oid == "DEPTH_SKIP":
+        send_tg(header + "\n\u26a0\ufe0f TRADE SKIPPED - order book too thin (slippage guard)")
         return   # thin book - don't set cooldown, let it retry when the book fills
+    if oid == "MARGIN_SKIP":
+        send_tg(header + "\n\u26a0\ufe0f TRADE SKIPPED - not enough margin")
+        return
+    if oid is None or oid == "N/A":
+        send_tg(header + "\n\u26a0\ufe0f TRADE SKIPPED - order failed")
+        return
+    send_tg(header + "\n\u2705 TRADE EXECUTED")
     t2_last_fire[symbol] = time.time()
 
 def place_t2_order(symbol, entry, sl, side="SELL", conf=False):
@@ -1876,7 +1897,11 @@ def t2_loop():
                     checked += 1
                     time.sleep(0.2)
                 last_entry = time.time()
-                print(f"[SCAN] blocks={len(t2_blocks)} checked={checked} open={len(t2_open_trades)} T2(short)={t2_auto_trade_enabled} T1(long)={t3_auto_trade_enabled}")
+                _bh = globals().get("_t2_band_hits", 0)
+                _sc = globals().get("_t2_slcap_skips", 0)
+                print(f"[SCAN] blocks={len(t2_blocks)} checked={checked} open={len(t2_open_trades)} band_hits={_bh} slcap_skips={_sc} T2(short)={t2_auto_trade_enabled} T1(long)={t3_auto_trade_enabled}")
+                globals()["_t2_band_hits"] = 0
+                globals()["_t2_slcap_skips"] = 0
         except Exception as e:
             print(f"[T2 LOOP ERROR] {e}")
         time.sleep(60)
@@ -2151,9 +2176,15 @@ def t3s_scalp_signal(symbol):
         if price < MIN_ENTRY_PRICE:
             return None
         dev = (price - vwap) / vwap
+        # DIAGNOSTIC: record the largest |dev| seen this scan (with and without vol-spike)
+        # so [T3 SCAN] can show whether signals are simply not forming (calm market) vs a bug.
+        if abs(dev) > globals().get("_t3_max_dev", 0.0):
+            globals()["_t3_max_dev"] = abs(dev)
         # 20-bar avg volume (excluding the entry bar) for the spike test
         vol20 = vols[-21:-1] if len(vols) >= 21 else vols[:-1]
         vavg = (sum(vol20) / len(vol20)) if vol20 else 0
+        if vavg > 0 and v(last) >= T3_VOL_MULT * vavg and abs(dev) > globals().get("_t3_max_dev_volok", 0.0):
+            globals()["_t3_max_dev_volok"] = abs(dev)   # max |dev| among bars that PASSED the vol-spike test
         if vavg <= 0 or v(last) < T3_VOL_MULT * vavg:
             return None
         if dev <= -T3_VWAP_DEV:
@@ -2197,12 +2228,13 @@ def place_t3_scalp_order(symbol, entry, side="BUY"):
         finally:
             DEPTH_LIQUIDITY_MULT = _saved_mult
         if not _depth_pass:
-            send_tg("TIGHT 3 " + symbol + " " + side + " skipped - order book too thin (scalp slippage guard)")
+            send_tg("\u26a0\ufe0f TIGHT 3 " + symbol + " " + side + " TRADE SKIPPED - order book too thin (scalp slippage guard)")
             return "DEPTH_SKIP"
         required_margin = qty * entry / T3_LEVERAGE
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
             print(f"[T3 MARGIN SKIP] {symbol} need ~${required_margin:.2f}, avail ${avail:.2f}")
+            send_tg("\u26a0\ufe0f TIGHT 3 " + symbol + " " + side + " TRADE SKIPPED - not enough margin")
             return "MARGIN_SKIP"
         order_id = place_market_order(symbol, side, qty, pos_side)
         print(f"[T3 SCALP ORDER] {symbol} {pos_side} qty={qty} risk=${T3_RISK_USDT}: {order_id}")
@@ -2235,6 +2267,8 @@ def place_t3_scalp_order(symbol, entry, side="BUY"):
                 "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
                 "open_ts": time.time(),
             }
+            send_tg("\u2705 TIGHT 3 " + symbol + " " + side + " TRADE EXECUTED\n"
+                    "Entry: " + str(round(entry_fill, 6)) + " | SL: " + str(sl) + " | TP: " + str(tp) + " | Risk: $" + str(T3_RISK_USDT))
         return order_id
     except Exception as e:
         print(f"[T3 SCALP ORDER ERROR] {symbol}: {e}")
@@ -2328,7 +2362,11 @@ def t3_scalp_loop():
                         if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP", "N/A"):
                             t3s_last_fire[sym] = time.time()
                     time.sleep(0.2)
-            print(f"[T3 SCAN] scalp_open={len(t3s_open_trades)}/{T3_MAX_CONCURRENT} on={t3_scalp_auto_enabled} coins={len(scan_list)}")
+            _md = globals().get("_t3_max_dev", 0.0)
+            _mdv = globals().get("_t3_max_dev_volok", 0.0)
+            print(f"[T3 SCAN] scalp_open={len(t3s_open_trades)}/{T3_MAX_CONCURRENT} on={t3_scalp_auto_enabled} coins={len(scan_list)} max_dev={_md*100:.1f}% max_dev_volok={_mdv*100:.1f}% (need>={T3_VWAP_DEV*100:.0f}%)")
+            globals()["_t3_max_dev"] = 0.0
+            globals()["_t3_max_dev_volok"] = 0.0
         except Exception as e:
             print(f"[T3 SCALP LOOP ERROR] {e}")
         time.sleep(T3_SCAN_SECONDS)

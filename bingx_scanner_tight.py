@@ -989,14 +989,14 @@ T3_SLIP_ALERT_PCT         = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))     
 # (demand exhaustion). Backtest (15m 8mo, band5/dump18, TP4/buf1.0/exh0.8):
 # max2 win 52% $144 DD -$8; holdout A+1.51/B+1.09; random -0.445; 8/9 months+.
 T2_RET_BAND_PCT           = 6.0    # HARDCODED. wider retest zone raises win 50->54%
-T2_DUMP_PCT               = 18.0   # HARDCODED. block qualifies if price moved >= this % within lookahead
-T2_DUMP_LOOKAHEAD_DAYS    = 5      # HARDCODED
-T2_VOL_SPIKE              = 1.3    # 2026-08-11: 1.3 (with 3M floor + drawdown filter now guarding quality). More trades (9.9/wk) AND high win because the DD filter removes the deep-downtrend losers that 1.3 alone pulled in. Verified vol1.3+DD30 = win 62% meanR +1.59 holdout A+1.41/B+1.84.
+T2_DUMP_PCT               = 14.0   # 2026-08-17: 18->14 (holdout-verified, test>=train, 9/9mo). 18% dump is rare in calm markets = block feedstock dried up. 14% forms more blocks, edge nearly intact (2.05R->1.85R base), ~more trades. Do NOT go below 12 (weakens).
+T2_DUMP_LOOKAHEAD_DAYS    = 3      # 2026-08-17: 5->3. BIGGEST find - raises BOTH meanR AND win (LA3 lifts base ~2.25R->2.78R, win ->81%, holdout-verified) AND shrinks the always-blind confirm window from 5d to 3d (helps "no recent trades" too). Do NOT combine with TP5 (81% win does not survive that combo).
+T2_VOL_SPIKE              = 1.5    # 2026-08-17: 1.3->1.5 (small clean gain, holdout-verified). Cleaner blocks; slightly fewer but stronger. Combined LA3+vol1.5+TP4 cap3 = 2.27R test2.31/win75-76% 9/9mo.  [was 1.3 with 3M floor+DD filter]
 T2_MAX_DRAWDOWN_PCT       = float(os.environ.get("T2_MAX_DRAWDOWN_PCT", 0.35))   # 2026-08-16: 0.15->0.35 (bear-trap fix). DD15 killed ~100% of longs in a downtrend (every coin >15% below 60d high) -> short-only -> account $80->$40. DD35 restores long/short balance; holdout A+0.20/B+0.16, recent-bear positive.  [was 0.30->0.15.] Demand-LONG only works on STRONG coins near their 60d high. Feature analysis: coin 5-15% below high = win 74%, but 15-30% below = win 45% (support breaks on downtrend coins). Tightening to 15% raises LONG win 47->62% and overall win 52->62%, PnL $669->$1054, 9/9 months+, holdout A67%/B66%. Keeps both-sides (bull-run safe). SHORT unaffected.
 T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed 87% of signals
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
-T2_TP_R                   = 3.0    # 2026-08-16: 2R->3R. With fresh<7d blocks the fade edge is big (meanR+1.1); TP3R captures the runners. Sweet spot: TP2.5 win higher but meanR lower, TP4 meanR ~same but win 39%. RR = 3:1.
-T2_BLOCK_MAX_AGE_DAYS     = 7      # 2026-08-16: 30->7. THE REAL EDGE LEVER. A trapped-block fade only works while trapped holders are still trapped; after ~7d they've bailed and the level is dead. fresh<7d: meanR +0.27->+1.1, win 28->48%, holdout A+1.04/B+1.01, 9/9 months. Most old trades were on STALE blocks = the losers.  [was 30]
+T2_TP_R                   = 4.0    # 2026-08-17: 3->4 (holdout: TP3=1.89R/w77, TP4=2.25R/w74, TP5=2.65R/w74; TP4 chosen over TP5 - TP5 far target=longer holds, low patience). RR = 4:1.
+T2_BLOCK_MAX_AGE_DAYS     = 14     # 2026-08-17: 7->14 (holdout-verified, edge intact, keeps more blocks alive in calm markets so fewer zero-trade stretches). Age barely affects meanR; DUMP% is the real trade lever.  [was 30->7]
 T2_LONG_SIDE              = True   # HARDCODED. both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
 T2_ATR_LEN                = 14
 T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline median volume
@@ -1008,12 +1008,12 @@ T2_RISK_USDT              = 5.0    # 2026-08-05: 2->5 per Faisal (~5% risk on $1
 T2_LEVERAGE               = 10     # HARDCODED
 T2_MAX_MARGIN_USDT        = 60.0   # 2026-08-05: 25->60 so $5-risk + wide structure SL is never capped below intended risk
 T2_MAX_SYMBOLS            = 250    # HARDCODED
-T2_EXCLUDE_TOP_N          = 0      # HARDCODED. INCLUDE majors - they form clean blocks too
+T2_EXCLUDE_TOP_N          = 20     # 2026-08-17: 0->20. Top-20 $vol coins DO form/retest blocks but fewer & weaker (~1.82R vs ~2.05R for mid-liquid). Best bucket = 2M+ EXCLUDING top-20. get_liquid_symbols already sorts by $vol desc and slices [exclude_top_n:].
 T2_MIN_QUOTE_VOL          = 2_000_000  # 2026-08-12: 3M->2M. Backtest: 2M recovers ~$120 vs 3M ($825 vs $704 cap2) with holdout still robust (A+1.09/B+0.89) and still excludes RIF-tier thin coins that slipped SL live. 3M was over-conservative; 2M is the sweet spot between live-slippage safety and PnL.
 
 # Shared T1+T2 concurrency cap: on a $100 account both engines TOGETHER = 2 open.
 # (Backtest: shared-max2 $534 DD-$33 is the best risk-adj; raise once balance grows.)
-SHARED_MAX_CONCURRENT     = 4      # 2026-08-16: 2->4 ($50+ acct). T1+T2 (swing) share these 4 slots. T3 scalp has its OWN separate cap (T3_MAX_CONCURRENT).
+SHARED_MAX_CONCURRENT     = 3      # 2026-08-17: 4->3 (drawdown control on $200 acct). Backtest cap4 keeps edge (2.27R) but maxDD 4.1R->6.2R & worst-24h -6.2R & up to 4 concurrent losers; cap3 = maxDD 5.4R, ~43 trades/mo, edge intact. T1+T2 (swing) share these slots. T3 scalp has its OWN separate cap.  [was 2->4]
 CONFLUENCE_EXTRA_SLOTS    = 1      # 2026-08-12: a CONFLUENCE trade (T1+T2 agree same coin+dir within 5d)
                                    # may open ONE dedicated slot BEYOND the 2 normal slots, so the bot's
                                    # highest-conviction trades are never dropped by the cap. Backtest cap2+1conf:

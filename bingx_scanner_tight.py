@@ -997,7 +997,9 @@ T2_VOL_EXHAUSTION         = 0      # HARDCODED. DISABLED (0=off) - exh0.8 killed
 T2_SL_ATR_BUF             = 0.5    # HARDCODED. SL nearer level = more R per move
 T2_TP_R                   = 4.0    # 2026-08-17: 3->4 (holdout: TP3=1.89R/w77, TP4=2.25R/w74, TP5=2.65R/w74; TP4 chosen over TP5 - TP5 far target=longer holds, low patience). RR = 4:1.
 T2_BLOCK_MAX_AGE_DAYS     = 14     # 2026-08-17: 7->14 (holdout-verified, edge intact, keeps more blocks alive in calm markets so fewer zero-trade stretches). Age barely affects meanR; DUMP% is the real trade lever.  [was 30->7]
-T2_LONG_SIDE              = True   # HARDCODED. both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
+T2_LONG_SIDE              = False  # 2026-08-20: OFF. The LONG demand-block leg WAS the old "T1"; under strict
+                                   # no-lookahead timing it measured -0.211R (worse than random), so the T1 slot is
+                                   # now the 24h-reversion engine below and T2 stays SHORT-only. Old note said both-sides (short resistance + long demand): 26.7 trades/wk $1049 vs short-only 10.4/wk $594, fully validated.
 T2_ATR_LEN                = 14
 T2_DORMANCY_DAYS          = 5      # trailing window for the block's baseline median volume
 T2_BLOCK_SCAN_SECONDS     = 14400  # HARDCODED. rebuild block map every 4h
@@ -1511,14 +1513,43 @@ def t3_loop():
 def all_open_symbols():
     """Every symbol currently held by ANY engine (T1 + T2 + CrashFade). Used so no
     engine opens a coin another engine already holds — this is the guard that was
-    missing when CF + Tight 2 both opened 1000BONK at once and one got liquidated."""
+    missing when CF + Tight 2 both opened 1000BONK at once and one got liquidated.
+
+    2026-08-20 BUGFIX: t3s_open_trades (OI-short scalp) and rev_open_trades were
+    MISSING from this set. track_t3_scalp_trades() calls this to decide whether its
+    own position is gone; because its own trades were never in the set, EVERY T3
+    scalp was declared "closed" on the first tracking pass (~16 min), the bot popped
+    it from its dict and sent a "closed" Telegram - while the position stayed OPEN
+    and unmanaged on BingX (COMP-USDT 2026-08-19). Every engine's dict belongs here."""
     syms = set()
-    for d in (t3_open_trades, t2_open_trades):
+    for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
                 syms.add(s)
     return syms
+
+
+def exchange_has_position(symbol):
+    """Ground truth from BingX, not from an in-memory dict. Returns True/False, or
+    None when the API call fails (caller must treat None as 'unknown, do nothing' -
+    never as 'position gone', which is what caused the phantom-close bug)."""
+    try:
+        positions = get_open_positions()
+    except Exception as e:
+        print(f"[POS CHECK] {symbol}: {e}")
+        return None
+    if positions is None:
+        return None
+    for p in positions:
+        try:
+            if p.get("symbol") != symbol:
+                continue
+            if abs(float(p.get("positionAmt", 0) or 0)) > 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 def t2_total_open():
     """Shared open count across T1 + T2 for the shared concurrency cap.
@@ -1972,7 +2003,7 @@ def trailing_loop():
 
 # ==================== TELEGRAM COMMANDS ====================
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2034,6 +2065,36 @@ def handle_telegram_commands():
                         lines_s += ("\n" + ts["symbol"] + " SHORT | entry " + str(ts["entry"]) +
                                     " | SL " + str(ts["sl"]))
                     send_tg(lines_s)
+                # ---- Tight 1 = 24h-reversion (2026-08-20) ----
+                elif text == "/rev_start":
+                    if not REV_ENGINE_ENABLED:
+                        send_tg("Tight 1 (24h-reversion) is disabled at build level (REV_ENGINE_ENABLED=0).")
+                    else:
+                        rev_auto_enabled = True
+                        send_tg("Tight 1 (24h-reversion) Auto-trade ON.")
+                elif text == "/rev_stop":
+                    rev_auto_enabled = False
+                    send_tg("Tight 1 (24h-reversion) Auto-trade OFF.")
+                elif text == "/rev_status":
+                    _btc = rev_btc_regime()
+                    lines_r = ("Tight 1 (24h-reversion): " + ("ON" if rev_auto_enabled else "OFF") +
+                               " | Open: " + str(len(rev_open_trades)) + "/" + str(REV_MAX_CONCURRENT) +
+                               " | Pending limits: " + str(len(rev_pending)) +
+                               "\nEntry: resting LIMIT at signal close, cancels after " + str(REV_FILL_BARS * 15) + "m" +
+                               "\nTrigger: " + str(round(REV_RET_THR * 100, 1)) + "% over 24h + range edge + vol " +
+                               str(REV_VOL_MULT) + "x" +
+                               "\nLONG SL " + str(REV_LONG_SL_ATR) + "xATR TP " + str(REV_LONG_TP_R) + "R | " +
+                               "SHORT SL " + str(REV_SHORT_SL_ATR) + "xATR TP " + str(REV_SHORT_TP_R) + "R" +
+                               "\nBTC 4d: " + (f"{_btc*100:+.1f}%" if _btc is not None else "n/a") +
+                               " (gate +/-" + str(round(REV_BTC_THR * 100)) + "%)" +
+                               " | risk $" + str(int(REV_RISK_USDT)))
+                    for _sym, _p in list(rev_pending.items()):
+                        lines_r += "\n[pending] " + _sym + " " + _p["pos_side"] + " @ " + str(round(_p["entry"], 6))
+                    for _oid, _t in list(rev_open_trades.items()):
+                        lines_r += ("\n" + _t["symbol"] + " " + _t["pos_side"] + " | entry " +
+                                    str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
+                                    " | TP " + str(round(_t["tp"], 6)))
+                    send_tg(lines_r)
                 # ---- /status : everything at a glance ----
                 elif text == "/status":
                     backoff = ""
@@ -2043,7 +2104,9 @@ def handle_telegram_commands():
                     shorts = sum(1 for t in t2_open_trades.values() if t.get("side") == "SELL")
                     send_tg(
                         "===== NITI BOT STATUS =====\n"
-                        "Tight 1 (LONG demand-block): " + ("ON" if t3_auto_trade_enabled else "OFF") + " | Open longs: " + str(longs) + "\n"
+                        "Tight 1 (24h-reversion): " + ("ON" if rev_auto_enabled else "OFF") +
+                        " | Open: " + str(len(rev_open_trades)) + "/" + str(REV_MAX_CONCURRENT) +
+                        " | Pending: " + str(len(rev_pending)) + " | risk $" + str(int(REV_RISK_USDT)) + "\n"
                         "Tight 2 (SHORT resistance-block): " + ("ON" if t2_auto_trade_enabled else "OFF") + " | Open shorts: " + str(shorts) + "\n"
                         "Fresh-block <" + str(T2_BLOCK_MAX_AGE_DAYS) + "d | TP " + str(T2_TP_R) + "R | risk $" + str(int(T2_RISK_USDT)) + " flat | Blocks: " + str(len(t2_blocks)) + "\n"
                         "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + "\n"
@@ -2305,11 +2368,35 @@ def track_t3_scalp_trades():
                 send_tg(f"\u23f1\ufe0f TIGHT 3 {sym} SHORT time-stop closed | entry {ef} | ~{pstr}")
             except Exception as e:
                 print(f"[T3 TIMESTOP {sym}] {e}")
+            try:
+                journal_closed_trade({
+                    "label": "TIGHT 3", "symbol": sym, "side": "SHORT",
+                    "entry": t.get("entry_fill", t.get("entry", 0)),
+                    "result": "time-stop",
+                    "pnl": round(pnl, 2) if pnl is not None else 0,
+                })
+            except Exception as _je:
+                print(f"[T3 JOURNAL {sym}] {_je}")
             t3s_last_fire[sym] = now
             t3s_open_trades.pop(oid, None)
             continue
         # position gone -> SL hit (or manual/liq)
-        if sym not in open_syms:
+        # 2026-08-20 BUGFIX: this used to trust all_open_symbols() alone, which did not
+        # contain t3s trades at all, so it fired on the FIRST pass every time and closed
+        # the trade in memory only. Now: ask the exchange, and require TWO consecutive
+        # confirmations before believing a position is really gone.
+        gone = exchange_has_position(sym)
+        if gone is None:          # API failed - unknown, never assume closed
+            t["gone_strikes"] = 0
+            continue
+        if gone:                  # still open on BingX
+            t["gone_strikes"] = 0
+            continue
+        t["gone_strikes"] = t.get("gone_strikes", 0) + 1
+        if t["gone_strikes"] < 2:
+            print(f"[T3 OI] {sym} looks gone (strike 1/2) - waiting for confirmation")
+            continue
+        if True:
             result = "closed"
             try:
                 px = get_current_price(sym)
@@ -2329,6 +2416,11 @@ def track_t3_scalp_trades():
                 else:
                     approx = "~"; emoji = "\u2139\ufe0f"
                 send_tg(f"{emoji} TIGHT 3 {sym} SHORT {result} | entry {ef} | ~{approx} | held {held_min}m")
+                journal_closed_trade({
+                    "label": "TIGHT 3", "symbol": sym, "side": "SHORT", "entry": ef,
+                    "result": result,
+                    "pnl": (-T3_RISK_USDT if result == "SL" else 0),
+                })
             except Exception as _e:
                 print(f"[T3 JOURNAL {sym}] {_e}")
             t3s_open_trades.pop(oid, None)
@@ -2382,6 +2474,423 @@ def t3_scalp_loop():
 def health():
     return ("Niti combined - Tight 1 (Dormant Awakening) + Tight 2 (Trapped-Block Fade, both sides) "
             "+ Confluence dedicated slot + OI collector + consolidated journal"), 200
+
+
+
+
+# ============================================================================
+# ==================== TIGHT 1 = 24h-REVERSION (2026-08-20) ==================
+# ============================================================================
+# REPLACES the old Tight 1 (LONG demand-block). That engine measured -0.211R once
+# the block-timing lookahead was removed, i.e. worse than random, and is retired.
+#
+# HOW THIS ONE WAS FOUND (method matters): a Spearman scan of 13 candle features
+# against forward returns over 4.1M rows / 174 coins. Every return-based feature
+# came back NEGATIVE - i.e. the only real signal in candle data is LONG-HORIZON
+# MEAN REVERSION. Strongest: 24h return (-0.057) and position-in-96-bar-range
+# (-0.051) vs the 48-bar forward return. The rules below were then built on that
+# measured fact instead of being invented first.
+#
+# RULES
+#   SHORT: alt UP >= REV_RET_THR over the last 24h (96 x 15m bars) AND printing at
+#          the very top of its 96-bar range AND this bar's volume >= 1.3x the
+#          96-bar median volume.
+#   LONG : mirror - DOWN >= REV_RET_THR over 24h AND at the very bottom of the
+#          96-bar range AND the same volume surge.
+#   BTC REGIME GATE: if BTC is down > 12% over 4 days take NO LONGS; if BTC is up
+#          > 12% over 4 days take NO SHORTS. This single gate turned the worst
+#          month (June, BTC -20.6%) from -4.3R into +14.0R and halved max drawdown.
+#   ENTRY: RESTING LIMIT at the signal bar's CLOSE, cancelled after 4 bars (1h).
+#          NOT market. Measured: market entry = $765 / OOS +0.226; resting limit =
+#          98% fill, $1041 / OOS +0.324. Placing the limit at a *better* price is
+#          worse (fill 67% and OOS +0.055 at +0.5%) because if price comes back to
+#          you the reversal was weak. A "watch and send post-only on touch" variant
+#          fills only 72% and earns a third as much - the best trades snap away.
+#   STOPS: LONG SL 1.5xATR14 / TP 4R.  SHORT SL 2.0xATR14 / TP 3R.  (asymmetric on
+#          purpose - LONG fires after an >=8% dump when volatility is elevated).
+#   Time-stop 24h, per-coin cooldown 24h, own shared cap REV_MAX_CONCURRENT.
+#
+# BACKTEST (8.3mo, 249-coin 15m, maker fee): n451 (~12.5/wk), meanR +0.462,
+#   win 40%, +$1041 at flat $5, maxDD ~$76, 9/9 months positive.
+#   OUT-OF-SAMPLE (May-Jul, never used for tuning): meanR +0.324.
+#   Walk-forward positive at SIX different cut dates; 7 of 8 rolling 60d windows
+#   positive; random-side control negative on all seeds.
+#
+# THE ONE REAL RISK - LIQUIDITY. The whole edge lives in THIN coins: raising the
+#   liquidity floor destroys it ($2M -> +0.226 OOS, $5M -> -0.036, $10M -> -0.274).
+#   Slippage sensitivity: 5/20bps -> +0.105, 10/40bps -> -0.016. Historical live
+#   slippage of ~100bps (ONG, VELVET) would wipe this out completely. That is why
+#   the resting-limit entry and the depth guard are NOT optional.
+# ============================================================================
+REV_ENGINE_ENABLED   = os.environ.get("REV_ENGINE_ENABLED", "1") == "1"
+rev_auto_enabled     = AUTO_RESUME_ON_START   # /rev_start /rev_stop
+
+REV_RET_WINDOW       = int(os.environ.get("REV_RET_WINDOW", 96))      # 96 x 15m = 24h
+REV_RET_THR          = float(os.environ.get("REV_RET_THR", 0.08))     # >= 8% move over that window
+REV_RANGE_WINDOW     = int(os.environ.get("REV_RANGE_WINDOW", 96))    # range the coin must be at the edge of
+REV_VOL_MULT         = float(os.environ.get("REV_VOL_MULT", 1.3))     # volume >= 1.3x 96-bar median
+REV_ATR_LEN          = int(os.environ.get("REV_ATR_LEN", 14))
+REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 1.5))
+REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 4.0))
+REV_SHORT_SL_ATR     = float(os.environ.get("REV_SHORT_SL_ATR", 2.0))
+REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 3.0))
+REV_SL_CAP_PCT       = float(os.environ.get("REV_SL_CAP_PCT", 0.06))  # skip if SL > 6% away
+REV_BTC_WINDOW       = int(os.environ.get("REV_BTC_WINDOW", 384))     # 384 x 15m = 4 days
+REV_BTC_THR          = float(os.environ.get("REV_BTC_THR", 0.12))     # regime gate at +/-12%
+REV_HOLD_SECONDS     = int(os.environ.get("REV_HOLD_SECONDS", 24 * 3600))
+REV_COOLDOWN_SECONDS = int(os.environ.get("REV_COOLDOWN_SECONDS", 24 * 3600))
+REV_FILL_BARS        = int(os.environ.get("REV_FILL_BARS", 4))        # cancel the resting limit after 4 bars (1h)
+REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 5.0))
+REV_LEVERAGE         = int(os.environ.get("REV_LEVERAGE", 10))
+REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 5))
+REV_MAX_MARGIN_USDT  = float(os.environ.get("REV_MAX_MARGIN_USDT", 40))
+REV_MIN_QUOTE_VOL    = float(os.environ.get("REV_MIN_QUOTE_VOL", 2_000_000))  # DO NOT RAISE - see header
+REV_EXCLUDE_TOP_N    = int(os.environ.get("REV_EXCLUDE_TOP_N", 20))
+REV_MAX_SYMBOLS      = int(os.environ.get("REV_MAX_SYMBOLS", 600))
+REV_SCAN_SECONDS     = int(os.environ.get("REV_SCAN_SECONDS", 300))
+
+rev_open_trades   = {}   # order_id -> live trade
+rev_pending       = {}   # symbol -> resting limit order awaiting fill
+rev_last_fire     = {}   # symbol -> ts of last entry
+
+
+def rev_in_cooldown(symbol):
+    return (time.time() - rev_last_fire.get(symbol, 0)) < REV_COOLDOWN_SECONDS
+
+
+def rev_symbol_busy(symbol):
+    return symbol in all_open_symbols() or symbol in rev_pending
+
+
+def rev_btc_regime():
+    """BTC 4-day return. Returns None if it can't be read (then we skip, not guess)."""
+    try:
+        candles = get_candles("BTC-USDT", limit=REV_BTC_WINDOW + 5, interval="15m")
+        if not candles or len(candles) < REV_BTC_WINDOW + 1:
+            return None
+        closes = [cl(c) for c in candles]
+        past, now_px = closes[-(REV_BTC_WINDOW + 1)], closes[-1]
+        if past <= 0:
+            return None
+        return now_px / past - 1.0
+    except Exception as e:
+        print(f"[REV BTC] {e}")
+        return None
+
+
+def rev_check_signal(symbol, btc_ret):
+    """Return (side, entry_px, sl_px, tp_px) or None. side is 'BUY' (long) / 'SELL' (short)."""
+    need = max(REV_RET_WINDOW, REV_RANGE_WINDOW) + REV_ATR_LEN + 5
+    candles = get_candles(symbol, limit=need, interval="15m")
+    if not candles or len(candles) < need:
+        return None
+    closes = [cl(c) for c in candles]
+    highs  = [h(c)  for c in candles]
+    lows   = [l(c)  for c in candles]
+    vols   = [v(c)  for c in candles]
+
+    px = closes[-1]
+    if px <= 0 or px < 0.001:
+        return None
+
+    # 24h return
+    past = closes[-(REV_RET_WINDOW + 1)]
+    if past <= 0:
+        return None
+    ret = px / past - 1.0
+
+    # position inside the 96-bar range: 1.0 = printing the high, 0.0 = printing the low
+    win_hi = max(highs[-REV_RANGE_WINDOW:])
+    win_lo = min(lows[-REV_RANGE_WINDOW:])
+    if win_hi <= win_lo:
+        return None
+    pos = (px - win_lo) / (win_hi - win_lo)
+
+    # volume surge vs the 96-bar median
+    med_vol = sorted(vols[-REV_RANGE_WINDOW:])[REV_RANGE_WINDOW // 2]
+    if med_vol <= 0 or vols[-1] < REV_VOL_MULT * med_vol:
+        return None
+
+    atr = atr_series(highs, lows, closes, REV_ATR_LEN)
+    if not atr:
+        return None
+    atr_now = atr[-1]
+    if atr_now is None or atr_now <= 0:
+        return None
+
+    side = None
+    if ret >= REV_RET_THR and pos >= 1.0:
+        side = "SELL"
+    elif ret <= -REV_RET_THR and pos <= 0.0:
+        side = "BUY"
+    if side is None:
+        return None
+
+    # BTC regime gate - never fight a violent BTC move
+    if btc_ret is not None:
+        if side == "BUY" and btc_ret < -REV_BTC_THR:
+            return None
+        if side == "SELL" and btc_ret > REV_BTC_THR:
+            return None
+
+    if side == "BUY":
+        sl = px - REV_LONG_SL_ATR * atr_now
+        risk = px - sl
+        tp = px + risk * REV_LONG_TP_R
+    else:
+        sl = px + REV_SHORT_SL_ATR * atr_now
+        risk = sl - px
+        tp = px - risk * REV_SHORT_TP_R
+
+    if risk <= 0 or risk / px > REV_SL_CAP_PCT:
+        return None
+    return side, px, sl, tp
+
+
+def place_rev_limit(symbol, side, entry, sl, tp):
+    """RESTING LIMIT entry at the signal close. Maker, no slippage - this is the part
+    that makes the strategy survivable in thin coins (see engine header)."""
+    try:
+        set_leverage_api(symbol, REV_LEVERAGE)
+        precision = symbol_precision.get(symbol, 4)
+        risk_dist = abs(sl - entry)
+        if risk_dist <= 0:
+            return None
+        risk_qty       = REV_RISK_USDT / risk_dist
+        margin_cap_qty = (REV_MAX_MARGIN_USDT * REV_LEVERAGE) / entry
+        qty = round(min(risk_qty, margin_cap_qty), precision)
+        if qty <= 0:
+            return None
+        if not depth_ok(symbol, entry, sl, qty, side):
+            print(f"[REV DEPTH SKIP] {symbol} {side}")
+            return "DEPTH_SKIP"
+
+        pos_side   = "LONG" if side == "BUY" else "SHORT"
+        close_side = "SELL" if side == "BUY" else "BUY"
+
+        required_margin = qty * entry / REV_LEVERAGE
+        avail = get_available_margin()
+        if avail is not None and avail < required_margin * 1.05:
+            print(f"[REV MARGIN SKIP] {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
+            return "MARGIN_SKIP"
+
+        url = BASE_URL + "/openApi/swap/v2/trade/order"
+        params = build_signed_params({
+            "symbol": symbol, "side": side, "positionSide": pos_side,
+            "type": "LIMIT", "price": round(entry, 6), "quantity": qty,
+            "timeInForce": "GTC",
+        })
+        r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
+        if oid == "N/A":
+            print(f"[REV LIMIT FAIL] {symbol} {side} qty={qty} px={entry} - BingX: {r}")
+            return None
+
+        rev_pending[symbol] = {
+            "order_id": oid, "symbol": symbol, "side": side, "pos_side": pos_side,
+            "close_side": close_side, "entry": entry, "sl": sl, "tp": tp,
+            "qty": qty, "placed_ts": time.time(),
+        }
+        send_tg(
+            f"\u23f3 TIGHT 1 {symbol} {pos_side} LIMIT RESTING\n"
+            f"Entry: {round(entry, 6)} | SL: {round(sl, 6)} | TP: {round(tp, 6)}\n"
+            f"Risk: ${REV_RISK_USDT} | cancels in {REV_FILL_BARS * 15}m"
+        )
+        return oid
+    except Exception as e:
+        print(f"[REV ORDER {symbol}] {e}")
+        return None
+
+
+def rev_track_pending():
+    """Resting limits: promote to a live trade once filled, cancel after REV_FILL_BARS."""
+    if not rev_pending:
+        return
+    now = time.time()
+    for sym, p in list(rev_pending.items()):
+        try:
+            status = check_order_status(p["order_id"], sym)
+        except Exception as e:
+            print(f"[REV PEND {sym}] {e}")
+            continue
+
+        if status == "FILLED":
+            fill = get_fill_price(p["order_id"], sym, fallback=p["entry"])
+            # re-derive stops off the ACTUAL fill so R stays honest
+            if p["side"] == "BUY":
+                risk = fill - p["sl"]
+                tp   = fill + risk * REV_LONG_TP_R
+            else:
+                risk = p["sl"] - fill
+                tp   = fill - risk * REV_SHORT_TP_R
+            sl_id = place_sl_guarded(sym, p["close_side"], p["pos_side"], p["sl"], p["qty"])
+            tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label="TIGHT 1")
+            rev_open_trades[p["order_id"]] = {
+                "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
+                "close_side": p["close_side"], "entry": p["entry"], "entry_fill": fill,
+                "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "risk_usdt": REV_RISK_USDT,
+                "sl_id": sl_id, "tp_id": tp_id, "open_ts": now, "gone_strikes": 0,
+                "label": "TIGHT 1",
+            }
+            rev_last_fire[sym] = now
+            rev_pending.pop(sym, None)
+            slip = abs(fill - p["entry"]) / p["entry"] * 100 if p["entry"] else 0
+            send_tg(
+                f"\u2705 TIGHT 1 {sym} {p['pos_side']} FILLED\n"
+                f"Entry: {fill} (limit {round(p['entry'], 6)}, slip {slip:.2f}%)\n"
+                f"SL: {round(p['sl'], 6)} | TP: {round(tp, 6)} | Risk: ${REV_RISK_USDT}"
+            )
+            continue
+
+        if now - p["placed_ts"] > REV_FILL_BARS * 15 * 60:
+            try:
+                cancel_order(sym, p["order_id"])
+            except Exception as e:
+                print(f"[REV CANCEL {sym}] {e}")
+            rev_pending.pop(sym, None)
+            print(f"[REV] {sym} limit unfilled after {REV_FILL_BARS} bars - cancelled")
+
+
+def rev_track_trades():
+    """Time-stop + reconcile closed positions. Same two-strike exchange confirmation as
+    T3 - never declare a position closed off a single in-memory guess."""
+    if not rev_open_trades:
+        return
+    now = time.time()
+    for oid, t in list(rev_open_trades.items()):
+        sym = t["symbol"]
+
+        if now - t.get("open_ts", now) > REV_HOLD_SECONDS:
+            try:
+                place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
+                for k in ("sl_id", "tp_id"):
+                    if t.get(k) and t[k] != "N/A":
+                        try:
+                            cancel_order(sym, t[k])
+                        except Exception:
+                            pass
+                ef = t.get("entry_fill", t.get("entry", 0))
+                px = get_current_price(sym)
+                pnl = None
+                if px and ef:
+                    risk_dist = abs(ef - t["sl"])
+                    if risk_dist > 0:
+                        d = (px - ef) if t["side"] == "BUY" else (ef - px)
+                        pnl = d / risk_dist * REV_RISK_USDT
+                send_tg(f"\u23f1\ufe0f TIGHT 1 {sym} {t['pos_side']} time-stop closed | entry {ef}"
+                        + (f" | {'+' if pnl >= 0 else '-'}${abs(round(pnl, 2))}" if pnl is not None else ""))
+                journal_closed_trade({
+                    "label": "TIGHT 1", "symbol": sym, "side": t["pos_side"], "entry": ef,
+                    "result": "time-stop", "pnl": round(pnl, 2) if pnl is not None else 0,
+                })
+            except Exception as e:
+                print(f"[REV TIMESTOP {sym}] {e}")
+            rev_last_fire[sym] = now
+            rev_open_trades.pop(oid, None)
+            continue
+
+        gone = exchange_has_position(sym)
+        if gone is None or gone:
+            t["gone_strikes"] = 0
+            continue
+        t["gone_strikes"] = t.get("gone_strikes", 0) + 1
+        if t["gone_strikes"] < 2:
+            print(f"[REV] {sym} looks gone (strike 1/2) - waiting for confirmation")
+            continue
+
+        ef = t.get("entry_fill", t.get("entry", 0))
+        result, pnl = "closed", 0
+        try:
+            px = get_current_price(sym)
+            if px and ef:
+                if t["side"] == "BUY":
+                    result = "TP" if px >= t["tp"] * 0.999 else ("SL" if px <= t["sl"] * 1.001 else "closed")
+                else:
+                    result = "TP" if px <= t["tp"] * 1.001 else ("SL" if px >= t["sl"] * 0.999 else "closed")
+        except Exception:
+            pass
+        if result == "TP":
+            pnl = REV_RISK_USDT * (REV_LONG_TP_R if t["side"] == "BUY" else REV_SHORT_TP_R)
+        elif result == "SL":
+            pnl = -REV_RISK_USDT
+        for k in ("sl_id", "tp_id"):
+            if t.get(k) and t[k] != "N/A":
+                try:
+                    cancel_order(sym, t[k])
+                except Exception:
+                    pass
+        emoji = "\u2705" if result == "TP" else ("\u274c" if result == "SL" else "\u2139\ufe0f")
+        held_min = int((now - t.get("open_ts", now)) / 60)
+        send_tg(f"{emoji} TIGHT 1 {sym} {t['pos_side']} {result} | entry {ef} | held {held_min}m")
+        journal_closed_trade({
+            "label": "TIGHT 1", "symbol": sym, "side": t["pos_side"], "entry": ef,
+            "result": result, "pnl": round(pnl, 2),
+        })
+        rev_last_fire[sym] = now
+        rev_open_trades.pop(oid, None)
+
+
+def rev_loop():
+    print("Tight 1 loop started - 24h-reversion, resting-limit entry (/rev_start /rev_stop)")
+    if not REV_ENGINE_ENABLED:
+        print("[REV] disabled by env REV_ENGINE_ENABLED=0 - loop idle")
+        return
+    while True:
+        try:
+            rev_track_pending()
+            rev_track_trades()
+
+            if not rev_auto_enabled:
+                time.sleep(30)
+                continue
+            if api_backoff_active():
+                time.sleep(60)
+                continue
+
+            open_slots = REV_MAX_CONCURRENT - (len(rev_open_trades) + len(rev_pending))
+            if open_slots <= 0:
+                time.sleep(REV_SCAN_SECONDS)
+                continue
+
+            all_syms = get_futures_symbols()
+            symbols = get_liquid_symbols(
+                all_syms, min_quote_vol=REV_MIN_QUOTE_VOL,
+                max_n=REV_MAX_SYMBOLS, exclude_top_n=REV_EXCLUDE_TOP_N,
+            )
+            btc_ret = rev_btc_regime()
+            scanned = fired = 0
+            for sym in symbols:
+                if open_slots <= 0:
+                    break
+                if rev_in_cooldown(sym) or rev_symbol_busy(sym):
+                    continue
+                if is_tokenized(sym) or coin_too_young(sym):
+                    continue
+                scanned += 1
+                try:
+                    sig = rev_check_signal(sym, btc_ret)
+                except Exception as e:
+                    print(f"[REV SIG {sym}] {e}")
+                    continue
+                if not sig:
+                    continue
+                side, entry, sl, tp = sig
+                res = place_rev_limit(sym, side, entry, sl, tp)
+                if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP"):
+                    fired += 1
+                    open_slots -= 1
+                time.sleep(0.3)
+
+            btc_str = f"{btc_ret * 100:+.1f}%" if btc_ret is not None else "n/a"
+            print(f"[REV SCAN] open={len(rev_open_trades)}/{REV_MAX_CONCURRENT} "
+                  f"pending={len(rev_pending)} on={rev_auto_enabled} scanned={scanned} "
+                  f"fired={fired} btc4d={btc_str}")
+        except Exception as e:
+            print(f"[REV LOOP] {e}")
+        time.sleep(REV_SCAN_SECONDS)
+
+
+# ==================== END TIGHT 1 (24h-reversion) ====================
 
 
 # ============================================================================
@@ -2477,4 +2986,5 @@ if __name__ == "__main__":
     Thread(target=handle_telegram_commands, daemon=True).start()
     Thread(target=oi_collector_loop,        daemon=True).start()   # OI logger -> Supabase (2026-08-10)
     Thread(target=t3_scalp_loop,            daemon=True).start()   # Tight 3 = OI-Short short-cover fade (2026-08-18)
+    Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

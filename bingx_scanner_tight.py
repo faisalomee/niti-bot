@@ -1022,7 +1022,7 @@ CONFLUENCE_EXTRA_SLOTS    = 1      # 2026-08-12: a CONFLUENCE trade (T1+T2 agree
                                    # $966->$2285, win 42->46%, holdout A+$1030/B+$1320. Keep conf risk $10 (not higher)
                                    # on a small account - 3 open positions is the max margin exposure.
 
-t2_auto_trade_enabled = AUTO_RESUME_ON_START
+t2_auto_trade_enabled = False   # 2026-08-20: old block-based Tight 2 RETIRED (replaced by rev2). Hard-off.
 t2_blocks       = {}    # symbol -> list of (resistance_level, formed_day_ms)
 t2_open_trades  = {}    # order_id -> open Tight 2 fade trade
 t2_last_fire    = {}    # symbol -> ts of last fired fade (normal 6h cooldown)
@@ -1522,7 +1522,7 @@ def all_open_symbols():
     it from its dict and sent a "closed" Telegram - while the position stayed OPEN
     and unmanaged on BingX (COMP-USDT 2026-08-19). Every engine's dict belongs here."""
     syms = set()
-    for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades):
+    for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades, rev2_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
@@ -2003,7 +2003,7 @@ def trailing_loop():
 
 # ==================== TELEGRAM COMMANDS ====================
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2032,18 +2032,24 @@ def handle_telegram_commands():
                     continue
                 # ---- Tight 2 Trapped-Block Fade: /t2_start /t2_stop (/start /stop alias) ----
                 if text in ("/t2_start", "/start"):
-                    t2_auto_trade_enabled = True
-                    send_tg("Tight 2 (Trapped-Block Fade) Auto-trade ON.")
+                    if not REV2_ENGINE_ENABLED:
+                        send_tg("Tight 2 (24h-reversion ceiling) is disabled at build level (REV2_ENGINE_ENABLED=0).")
+                    else:
+                        rev2_auto_enabled = True
+                        send_tg("Tight 2 (24h-reversion) Auto-trade ON.")
                 elif text in ("/t2_stop", "/stop"):
-                    t2_auto_trade_enabled = False
-                    send_tg("Tight 2 (Trapped-Block Fade) Auto-trade OFF.")
-                # ---- Tight 1 = LONG fresh demand-block: /t1_start /t1_stop ----
-                elif text == "/t1_start":
-                    t3_auto_trade_enabled = True
-                    send_tg("Tight 1 (LONG demand-block) Auto-trade ON.")
-                elif text == "/t1_stop":
-                    t3_auto_trade_enabled = False
-                    send_tg("Tight 1 (LONG demand-block) Auto-trade OFF.")
+                    rev2_auto_enabled = False
+                    send_tg("Tight 2 (24h-reversion) Auto-trade OFF.")
+                # ---- Tight 1 = 24h-reversion: /t1_start /t1_stop (/rev_* kept as alias) ----
+                elif text in ("/t1_start", "/rev_start"):
+                    if not REV_ENGINE_ENABLED:
+                        send_tg("Tight 1 (24h-reversion) is disabled at build level (REV_ENGINE_ENABLED=0).")
+                    else:
+                        rev_auto_enabled = True
+                        send_tg("Tight 1 (24h-reversion) Auto-trade ON.")
+                elif text in ("/t1_stop", "/rev_stop"):
+                    rev_auto_enabled = False
+                    send_tg("Tight 1 (24h-reversion) Auto-trade OFF.")
                 # ---- Tight 3 = OI-Short (short-cover fade): /t3_start /t3_stop ----
                 elif text == "/t3_start":
                     if not T3_ENGINE_ENABLED:
@@ -2066,23 +2072,14 @@ def handle_telegram_commands():
                                     " | SL " + str(ts["sl"]))
                     send_tg(lines_s)
                 # ---- Tight 1 = 24h-reversion (2026-08-20) ----
-                elif text == "/rev_start":
-                    if not REV_ENGINE_ENABLED:
-                        send_tg("Tight 1 (24h-reversion) is disabled at build level (REV_ENGINE_ENABLED=0).")
-                    else:
-                        rev_auto_enabled = True
-                        send_tg("Tight 1 (24h-reversion) Auto-trade ON.")
-                elif text == "/rev_stop":
-                    rev_auto_enabled = False
-                    send_tg("Tight 1 (24h-reversion) Auto-trade OFF.")
-                elif text == "/rev_status":
+                # /rev_status kept as an alias for T1 detail
+                elif text in ("/rev_status", "/t1_status"):
                     _btc = rev_btc_regime()
                     lines_r = ("Tight 1 (24h-reversion): " + ("ON" if rev_auto_enabled else "OFF") +
                                " | Open: " + str(len(rev_open_trades)) + "/" + str(REV_MAX_CONCURRENT) +
-                               " | Pending limits: " + str(len(rev_pending)) +
-                               "\nEntry: resting LIMIT at signal close, cancels after " + str(REV_FILL_BARS * 15) + "m" +
-                               "\nTrigger: " + str(round(REV_RET_THR * 100, 1)) + "% over 24h + range edge + vol " +
-                               str(REV_VOL_MULT) + "x" +
+                               " | Pending: " + str(len(rev_pending)) +
+                               "\nTrigger: " + str(round(REV_T1["ret_thr"] * 100, 1)) + "% over 24h + range edge + vol >=" +
+                               str(REV_T1["vol_mult"]) + "x" +
                                "\nLONG SL " + str(REV_LONG_SL_ATR) + "xATR TP " + str(REV_LONG_TP_R) + "R | " +
                                "SHORT SL " + str(REV_SHORT_SL_ATR) + "xATR TP " + str(REV_SHORT_TP_R) + "R" +
                                "\nBTC 4d: " + (f"{_btc*100:+.1f}%" if _btc is not None else "n/a") +
@@ -2095,42 +2092,38 @@ def handle_telegram_commands():
                                     str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
                                     " | TP " + str(round(_t["tp"], 6)))
                     send_tg(lines_r)
+                # ---- Tight 2 detail (ceiling 24h-reversion) ----
+                elif text == "/t2_status":
+                    lines2 = ("Tight 2 (24h-reversion ceiling): " + ("ON" if rev2_auto_enabled else "OFF") +
+                              " | Open: " + str(len(rev2_open_trades)) + "/" + str(REV2_MAX_CONCURRENT) +
+                              " | Pending: " + str(len(rev2_pending)) +
+                              "\nTrigger: " + str(round(REV2_RET_THR * 100, 1)) + "% over 24h + range edge + vol " +
+                              str(REV2_VOL_MULT) + "-" + str(REV2_VOL_MULT_MAX) + "x + ATR%<" + str(round(REV2_ATRP_MAX*100,1)) + "%" +
+                              " | risk $" + str(int(REV2_RISK_USDT)))
+                    for _sym, _p in list(rev2_pending.items()):
+                        lines2 += "\n[pending] " + _sym + " " + _p["pos_side"] + " @ " + str(round(_p["entry"], 6))
+                    for _oid, _t in list(rev2_open_trades.items()):
+                        lines2 += ("\n" + _t["symbol"] + " " + _t["pos_side"] + " | entry " +
+                                   str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
+                                   " | TP " + str(round(_t["tp"], 6)))
+                    send_tg(lines2)
                 # ---- /status : everything at a glance ----
                 elif text == "/status":
                     backoff = ""
                     if api_backoff_active():
                         backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
-                    longs  = sum(1 for t in t2_open_trades.values() if t.get("side") == "BUY")
-                    shorts = sum(1 for t in t2_open_trades.values() if t.get("side") == "SELL")
                     send_tg(
                         "===== NITI BOT STATUS =====\n"
                         "Tight 1 (24h-reversion): " + ("ON" if rev_auto_enabled else "OFF") +
                         " | Open: " + str(len(rev_open_trades)) + "/" + str(REV_MAX_CONCURRENT) +
-                        " | Pending: " + str(len(rev_pending)) + " | risk $" + str(int(REV_RISK_USDT)) + "\n"
-                        "Tight 2 (SHORT resistance-block): " + ("ON" if t2_auto_trade_enabled else "OFF") + " | Open shorts: " + str(shorts) + "\n"
-                        "Fresh-block <" + str(T2_BLOCK_MAX_AGE_DAYS) + "d | TP " + str(T2_TP_R) + "R | risk $" + str(int(T2_RISK_USDT)) + " flat | Blocks: " + str(len(t2_blocks)) + "\n"
-                        "Shared cap (T1+T2): " + str(t2_total_open()) + "/" + str(SHARED_MAX_CONCURRENT) + "\n"
+                        " | Pending: " + str(len(rev_pending)) +
+                        " | " + str(round(REV_RET_THR*100)) + "% vol>=" + str(REV_VOL_MULT) + "x | risk $" + str(int(REV_RISK_USDT)) + "\n"
+                        "Tight 2 (24h-reversion ceiling): " + ("ON" if rev2_auto_enabled else "OFF") +
+                        " | Open: " + str(len(rev2_open_trades)) + "/" + str(REV2_MAX_CONCURRENT) +
+                        " | Pending: " + str(len(rev2_pending)) +
+                        " | " + str(round(REV2_RET_THR*100)) + "% vol " + str(REV2_VOL_MULT) + "-" + str(REV2_VOL_MULT_MAX) + "x ATR%<" + str(round(REV2_ATRP_MAX*100,1)) + "% | risk $" + str(int(REV2_RISK_USDT)) + "\n"
                         "Tight 3 (OI-Short): " + ("ON" if t3_scalp_auto_enabled else "OFF") + " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) + " | risk $" + str(int(T3_RISK_USDT)) + backoff
                     )
-                # ---- per-strategy detail ----
-                elif text == "/t2_status":
-                    lines2 = ("Tight 2 (Fade): " + ("ON" if t2_auto_trade_enabled else "OFF") +
-                              " | Blocks: " + str(len(t2_blocks)) + " | Open: " + str(len(t2_open_trades)))
-                    for _oid2, t2t in list(t2_open_trades.items()):
-                        lines2 += ("\n" + t2t["symbol"] + " SHORT | entry " + str(t2t["entry"]) +
-                                   " | SL " + str(t2t["sl"]) + " | TP " + str(t2t.get("tp", "?")))
-                    send_tg(lines2)
-                elif text == "/t1_status":
-                    lines3 = ("Tight 1 (Awakening): " + ("ON" if t3_auto_trade_enabled else "OFF") +
-                              " | Watchlist: " + str(len(t3_watchlist)) +
-                              " | Awakened: " + str(len(t3_watch)) + " | Open: " + str(len(t3_open_trades)))
-                    for s, st3 in list(t3_watch.items()):
-                        hrs = max(0, int((st3["expiry_ts"] - time.time()) / 3600))
-                        lines3 += "\n" + s + " " + st3["side"] + " - awaiting chase entry (" + str(hrs) + "h left)"
-                    for _oid3, t3t in list(t3_open_trades.items()):
-                        lines3 += ("\n" + t3t["symbol"] + " " + t3t["side"] + " open | peak " +
-                                   str(round(t3t.get("peak_r", 0), 1)) + "R | SL " + str(t3t["sl"]))
-                    send_tg(lines3)
         except Exception as e:
             print(f"[TG CMD] error: {e}")
         time.sleep(1)
@@ -2553,13 +2546,60 @@ rev_open_trades   = {}   # order_id -> live trade
 rev_pending       = {}   # symbol -> resting limit order awaiting fill
 rev_last_fire     = {}   # symbol -> ts of last entry
 
+# ---- 2026-08-20 ceiling filters (used by BOTH engines; T1 leaves them wide, T2 tightens) ----
+# vol band: T1 = >=1.3x (no upper). T2 = 1.3x..3.0x (vr>4 = FOMO continuation, measured NEGATIVE).
+# ATR% ceiling: T1 = none. T2 = skip coins whose ATR14/price > 3% (high-vol coins were OOS-negative).
 
-def rev_in_cooldown(symbol):
-    return (time.time() - rev_last_fire.get(symbol, 0)) < REV_COOLDOWN_SECONDS
+# Tight 1 engine descriptor (the original v8 24h-reversion, unchanged params).
+REV_T1 = {
+    "name": "TIGHT 1", "tag": "t1",
+    "ret_thr": REV_RET_THR, "vol_mult": REV_VOL_MULT, "vol_mult_max": 0.0,   # 0 = no upper band
+    "atrp_max": 0.0,                                                          # 0 = no ATR% ceiling
+    "long_sl_atr": REV_LONG_SL_ATR, "long_tp_r": REV_LONG_TP_R,
+    "short_sl_atr": REV_SHORT_SL_ATR, "short_tp_r": REV_SHORT_TP_R,
+    "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV_RISK_USDT, "leverage": REV_LEVERAGE,
+    "max_concurrent": REV_MAX_CONCURRENT, "max_margin": REV_MAX_MARGIN_USDT,
+    "open": rev_open_trades, "pending": rev_pending, "last_fire": rev_last_fire,
+}
+
+# ---- Tight 2 = ceiling 24h-reversion (2026-08-20). SAME engine, tuned to its ceiling:
+#      ret>=10%, vol band 1.3-3.0x, ATR%<3%, cap 20. Backtest 8.3mo: ~9.9 trades/day,
+#      meanR +0.131, win 33%, +$1631 flat $5, OOS +0.177, holdout A+0.110/B+0.152.
+#      REPLACES the old block-based Tight 2 (SHORT resistance-block), now removed. ----
+REV2_ENGINE_ENABLED   = os.environ.get("REV2_ENGINE_ENABLED", "1") == "1"
+rev2_auto_enabled     = AUTO_RESUME_ON_START   # /t2_start /t2_stop
+REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.10))
+REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.3))
+REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 3.0))
+REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.03))
+REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 20))
+REV2_RISK_USDT        = float(os.environ.get("REV2_RISK_USDT", 5.0))
+REV2_MAX_MARGIN_USDT  = float(os.environ.get("REV2_MAX_MARGIN_USDT", 40))
+REV2_SCAN_SECONDS     = int(os.environ.get("REV2_SCAN_SECONDS", 300))
+
+rev2_open_trades = {}
+rev2_pending     = {}
+rev2_last_fire   = {}
+
+REV_T2 = {
+    "name": "TIGHT 2", "tag": "t2",
+    "ret_thr": REV2_RET_THR, "vol_mult": REV2_VOL_MULT, "vol_mult_max": REV2_VOL_MULT_MAX,
+    "atrp_max": REV2_ATRP_MAX,
+    "long_sl_atr": REV_LONG_SL_ATR, "long_tp_r": REV_LONG_TP_R,
+    "short_sl_atr": REV_SHORT_SL_ATR, "short_tp_r": REV_SHORT_TP_R,
+    "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV2_RISK_USDT, "leverage": REV_LEVERAGE,
+    "max_concurrent": REV2_MAX_CONCURRENT, "max_margin": REV2_MAX_MARGIN_USDT,
+    "open": rev2_open_trades, "pending": rev2_pending, "last_fire": rev2_last_fire,
+}
 
 
-def rev_symbol_busy(symbol):
-    return symbol in all_open_symbols() or symbol in rev_pending
+def rev_in_cooldown(symbol, eng):
+    return (time.time() - eng["last_fire"].get(symbol, 0)) < REV_COOLDOWN_SECONDS
+
+
+def rev_symbol_busy(symbol, eng):
+    # A coin held/pending by ANY engine is off-limits (prevents T1 and T2 both grabbing it).
+    return symbol in all_open_symbols() or symbol in eng["pending"] or symbol in rev_pending or symbol in rev2_pending
 
 
 def rev_btc_regime():
@@ -2578,8 +2618,9 @@ def rev_btc_regime():
         return None
 
 
-def rev_check_signal(symbol, btc_ret):
-    """Return (side, entry_px, sl_px, tp_px) or None. side is 'BUY' (long) / 'SELL' (short)."""
+def rev_check_signal(symbol, btc_ret, eng):
+    """Return (side, entry_px, sl_px, tp_px) or None. side 'BUY' (long) / 'SELL' (short).
+    Config-driven so Tight 1 (wide) and Tight 2 (ceiling filters) share one code path."""
     need = max(REV_RET_WINDOW, REV_RANGE_WINDOW) + REV_ATR_LEN + 5
     candles = get_candles(symbol, limit=need, interval="15m")
     if not candles or len(candles) < need:
@@ -2593,22 +2634,25 @@ def rev_check_signal(symbol, btc_ret):
     if px <= 0 or px < 0.001:
         return None
 
-    # 24h return
     past = closes[-(REV_RET_WINDOW + 1)]
     if past <= 0:
         return None
     ret = px / past - 1.0
 
-    # position inside the 96-bar range: 1.0 = printing the high, 0.0 = printing the low
     win_hi = max(highs[-REV_RANGE_WINDOW:])
     win_lo = min(lows[-REV_RANGE_WINDOW:])
     if win_hi <= win_lo:
         return None
     pos = (px - win_lo) / (win_hi - win_lo)
 
-    # volume surge vs the 96-bar median
     med_vol = sorted(vols[-REV_RANGE_WINDOW:])[REV_RANGE_WINDOW // 2]
-    if med_vol <= 0 or vols[-1] < REV_VOL_MULT * med_vol:
+    if med_vol <= 0:
+        return None
+    vr = vols[-1] / med_vol
+    if vr < eng["vol_mult"]:
+        return None
+    # T2 ceiling: reject FOMO-continuation volume spikes (vr>3x measured NEGATIVE). T1 leaves this off (max=0).
+    if eng["vol_mult_max"] > 0 and vr > eng["vol_mult_max"]:
         return None
 
     atr = atr_series(highs, lows, closes, REV_ATR_LEN)
@@ -2618,15 +2662,18 @@ def rev_check_signal(symbol, btc_ret):
     if atr_now is None or atr_now <= 0:
         return None
 
+    # T2 ceiling: skip high-volatility coins (ATR%>3% was OOS-negative). T1 leaves this off (max=0).
+    if eng["atrp_max"] > 0 and (atr_now / px) > eng["atrp_max"]:
+        return None
+
     side = None
-    if ret >= REV_RET_THR and pos >= 1.0:
+    if ret >= eng["ret_thr"] and pos >= 1.0:
         side = "SELL"
-    elif ret <= -REV_RET_THR and pos <= 0.0:
+    elif ret <= -eng["ret_thr"] and pos <= 0.0:
         side = "BUY"
     if side is None:
         return None
 
-    # BTC regime gate - never fight a violent BTC move
     if btc_ret is not None:
         if side == "BUY" and btc_ret < -REV_BTC_THR:
             return None
@@ -2634,44 +2681,45 @@ def rev_check_signal(symbol, btc_ret):
             return None
 
     if side == "BUY":
-        sl = px - REV_LONG_SL_ATR * atr_now
+        sl = px - eng["long_sl_atr"] * atr_now
         risk = px - sl
-        tp = px + risk * REV_LONG_TP_R
+        tp = px + risk * eng["long_tp_r"]
     else:
-        sl = px + REV_SHORT_SL_ATR * atr_now
+        sl = px + eng["short_sl_atr"] * atr_now
         risk = sl - px
-        tp = px - risk * REV_SHORT_TP_R
+        tp = px - risk * eng["short_tp_r"]
 
-    if risk <= 0 or risk / px > REV_SL_CAP_PCT:
+    if risk <= 0 or risk / px > eng["sl_cap_pct"]:
         return None
     return side, px, sl, tp
 
 
-def place_rev_limit(symbol, side, entry, sl, tp):
-    """RESTING LIMIT entry at the signal close. Maker, no slippage - this is the part
-    that makes the strategy survivable in thin coins (see engine header)."""
+def place_rev_limit(symbol, side, entry, sl, tp, eng):
+    """RESTING LIMIT entry at the signal close (maker, no slippage). Notifies Telegram on
+    resting, and on a margin/depth skip (so a blocked trade is never silent)."""
+    name = eng["name"]
     try:
-        set_leverage_api(symbol, REV_LEVERAGE)
+        set_leverage_api(symbol, eng["leverage"])
         precision = symbol_precision.get(symbol, 4)
         risk_dist = abs(sl - entry)
         if risk_dist <= 0:
             return None
-        risk_qty       = REV_RISK_USDT / risk_dist
-        margin_cap_qty = (REV_MAX_MARGIN_USDT * REV_LEVERAGE) / entry
+        risk_qty       = eng["risk_usdt"] / risk_dist
+        margin_cap_qty = (eng["max_margin"] * eng["leverage"]) / entry
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
         if not depth_ok(symbol, entry, sl, qty, side):
-            print(f"[REV DEPTH SKIP] {symbol} {side}")
+            print(f"[REV DEPTH SKIP] {name} {symbol} {side}")
             return "DEPTH_SKIP"
 
         pos_side   = "LONG" if side == "BUY" else "SHORT"
         close_side = "SELL" if side == "BUY" else "BUY"
 
-        required_margin = qty * entry / REV_LEVERAGE
+        required_margin = qty * entry / eng["leverage"]
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
-            print(f"[REV MARGIN SKIP] {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
+            print(f"[REV MARGIN SKIP] {name} {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
             return "MARGIN_SKIP"
 
         url = BASE_URL + "/openApi/swap/v2/trade/order"
@@ -2683,18 +2731,18 @@ def place_rev_limit(symbol, side, entry, sl, tp):
         r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
         oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
         if oid == "N/A":
-            print(f"[REV LIMIT FAIL] {symbol} {side} qty={qty} px={entry} - BingX: {r}")
+            print(f"[REV LIMIT FAIL] {name} {symbol} {side} qty={qty} px={entry} - BingX: {r}")
             return None
 
-        rev_pending[symbol] = {
+        eng["pending"][symbol] = {
             "order_id": oid, "symbol": symbol, "side": side, "pos_side": pos_side,
             "close_side": close_side, "entry": entry, "sl": sl, "tp": tp,
             "qty": qty, "placed_ts": time.time(),
         }
         send_tg(
-            f"\u23f3 TIGHT 1 {symbol} {pos_side} LIMIT RESTING\n"
+            f"\u23f3 {name} {symbol} {pos_side} LIMIT RESTING\n"
             f"Entry: {round(entry, 6)} | SL: {round(sl, 6)} | TP: {round(tp, 6)}\n"
-            f"Risk: ${REV_RISK_USDT} | cancels in {REV_FILL_BARS * 15}m"
+            f"Risk: ${eng['risk_usdt']} | cancels in {REV_FILL_BARS * 15}m"
         )
         return oid
     except Exception as e:
@@ -2702,12 +2750,15 @@ def place_rev_limit(symbol, side, entry, sl, tp):
         return None
 
 
-def rev_track_pending():
-    """Resting limits: promote to a live trade once filled, cancel after REV_FILL_BARS."""
-    if not rev_pending:
+def rev_track_pending(eng):
+    """Resting limits: promote to a live trade once filled (notify), cancel + notify (margin
+    released) after REV_FILL_BARS if never filled."""
+    pend = eng["pending"]
+    if not pend:
         return
+    name = eng["name"]
     now = time.time()
-    for sym, p in list(rev_pending.items()):
+    for sym, p in list(pend.items()):
         try:
             status = check_order_status(p["order_id"], sym)
         except Exception as e:
@@ -2716,29 +2767,28 @@ def rev_track_pending():
 
         if status == "FILLED":
             fill = get_fill_price(p["order_id"], sym, fallback=p["entry"])
-            # re-derive stops off the ACTUAL fill so R stays honest
             if p["side"] == "BUY":
                 risk = fill - p["sl"]
-                tp   = fill + risk * REV_LONG_TP_R
+                tp   = fill + risk * eng["long_tp_r"]
             else:
                 risk = p["sl"] - fill
-                tp   = fill - risk * REV_SHORT_TP_R
+                tp   = fill - risk * eng["short_tp_r"]
             sl_id = place_sl_guarded(sym, p["close_side"], p["pos_side"], p["sl"], p["qty"])
-            tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label="TIGHT 1")
-            rev_open_trades[p["order_id"]] = {
+            tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label=name)
+            eng["open"][p["order_id"]] = {
                 "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
                 "close_side": p["close_side"], "entry": p["entry"], "entry_fill": fill,
-                "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "risk_usdt": REV_RISK_USDT,
+                "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "risk_usdt": eng["risk_usdt"],
                 "sl_id": sl_id, "tp_id": tp_id, "open_ts": now, "gone_strikes": 0,
-                "label": "TIGHT 1",
+                "label": name, "eng_tag": eng["tag"],
             }
-            rev_last_fire[sym] = now
-            rev_pending.pop(sym, None)
+            eng["last_fire"][sym] = now
+            pend.pop(sym, None)
             slip = abs(fill - p["entry"]) / p["entry"] * 100 if p["entry"] else 0
             send_tg(
-                f"\u2705 TIGHT 1 {sym} {p['pos_side']} FILLED\n"
+                f"\u2705 {name} {sym} {p['pos_side']} FILLED (trade executed)\n"
                 f"Entry: {fill} (limit {round(p['entry'], 6)}, slip {slip:.2f}%)\n"
-                f"SL: {round(p['sl'], 6)} | TP: {round(tp, 6)} | Risk: ${REV_RISK_USDT}"
+                f"SL: {round(p['sl'], 6)} | TP: {round(tp, 6)} | Risk: ${eng['risk_usdt']}"
             )
             continue
 
@@ -2747,17 +2797,23 @@ def rev_track_pending():
                 cancel_order(sym, p["order_id"])
             except Exception as e:
                 print(f"[REV CANCEL {sym}] {e}")
-            rev_pending.pop(sym, None)
-            print(f"[REV] {sym} limit unfilled after {REV_FILL_BARS} bars - cancelled")
+            pend.pop(sym, None)
+            print(f"[REV] {name} {sym} limit unfilled after {REV_FILL_BARS} bars - cancelled")
+            send_tg(
+                f"\u274e {name} {sym} {p['pos_side']} LIMIT CANCELLED (unfilled {REV_FILL_BARS * 15}m) "
+                f"- margin released"
+            )
 
 
-def rev_track_trades():
-    """Time-stop + reconcile closed positions. Same two-strike exchange confirmation as
-    T3 - never declare a position closed off a single in-memory guess."""
-    if not rev_open_trades:
+def rev_track_trades(eng):
+    """Time-stop + reconcile closed positions, then journal. Two-strike exchange
+    confirmation before declaring a position closed (no phantom closes)."""
+    trades = eng["open"]
+    if not trades:
         return
+    name = eng["name"]
     now = time.time()
-    for oid, t in list(rev_open_trades.items()):
+    for oid, t in list(trades.items()):
         sym = t["symbol"]
 
         if now - t.get("open_ts", now) > REV_HOLD_SECONDS:
@@ -2776,17 +2832,23 @@ def rev_track_trades():
                     risk_dist = abs(ef - t["sl"])
                     if risk_dist > 0:
                         d = (px - ef) if t["side"] == "BUY" else (ef - px)
-                        pnl = d / risk_dist * REV_RISK_USDT
-                send_tg(f"\u23f1\ufe0f TIGHT 1 {sym} {t['pos_side']} time-stop closed | entry {ef}"
+                        pnl = d / risk_dist * eng["risk_usdt"]
+                exit_r = None
+                if px and ef:
+                    rd = abs(ef - t["sl"])
+                    if rd > 0:
+                        exit_r = round(((px - ef) if t["side"] == "BUY" else (ef - px)) / rd, 2)
+                send_tg(f"\u23f1\ufe0f {name} {sym} {t['pos_side']} time-stop closed | entry {ef}"
                         + (f" | {'+' if pnl >= 0 else '-'}${abs(round(pnl, 2))}" if pnl is not None else ""))
                 journal_closed_trade({
-                    "label": "TIGHT 1", "symbol": sym, "side": t["pos_side"], "entry": ef,
+                    "label": name, "symbol": sym, "side": t["pos_side"], "entry": ef,
                     "result": "time-stop", "pnl": round(pnl, 2) if pnl is not None else 0,
+                    "exit_r": exit_r if exit_r is not None else 0,
                 })
             except Exception as e:
                 print(f"[REV TIMESTOP {sym}] {e}")
-            rev_last_fire[sym] = now
-            rev_open_trades.pop(oid, None)
+            eng["last_fire"][sym] = now
+            trades.pop(oid, None)
             continue
 
         gone = exchange_has_position(sym)
@@ -2795,11 +2857,11 @@ def rev_track_trades():
             continue
         t["gone_strikes"] = t.get("gone_strikes", 0) + 1
         if t["gone_strikes"] < 2:
-            print(f"[REV] {sym} looks gone (strike 1/2) - waiting for confirmation")
+            print(f"[REV] {name} {sym} looks gone (strike 1/2) - waiting for confirmation")
             continue
 
         ef = t.get("entry_fill", t.get("entry", 0))
-        result, pnl = "closed", 0
+        result, pnl, exit_r = "closed", 0, 0
         try:
             px = get_current_price(sym)
             if px and ef:
@@ -2810,9 +2872,11 @@ def rev_track_trades():
         except Exception:
             pass
         if result == "TP":
-            pnl = REV_RISK_USDT * (REV_LONG_TP_R if t["side"] == "BUY" else REV_SHORT_TP_R)
+            pnl = eng["risk_usdt"] * (eng["long_tp_r"] if t["side"] == "BUY" else eng["short_tp_r"])
+            exit_r = eng["long_tp_r"] if t["side"] == "BUY" else eng["short_tp_r"]
         elif result == "SL":
-            pnl = -REV_RISK_USDT
+            pnl = -eng["risk_usdt"]
+            exit_r = -1
         for k in ("sl_id", "tp_id"):
             if t.get(k) and t[k] != "N/A":
                 try:
@@ -2821,35 +2885,34 @@ def rev_track_trades():
                     pass
         emoji = "\u2705" if result == "TP" else ("\u274c" if result == "SL" else "\u2139\ufe0f")
         held_min = int((now - t.get("open_ts", now)) / 60)
-        send_tg(f"{emoji} TIGHT 1 {sym} {t['pos_side']} {result} | entry {ef} | held {held_min}m")
+        send_tg(f"{emoji} {name} {sym} {t['pos_side']} {result} | entry {ef} | held {held_min}m")
         journal_closed_trade({
-            "label": "TIGHT 1", "symbol": sym, "side": t["pos_side"], "entry": ef,
-            "result": result, "pnl": round(pnl, 2),
+            "label": name, "symbol": sym, "side": t["pos_side"], "entry": ef,
+            "result": result, "pnl": round(pnl, 2), "exit_r": exit_r,
         })
-        rev_last_fire[sym] = now
-        rev_open_trades.pop(oid, None)
+        eng["last_fire"][sym] = now
+        trades.pop(oid, None)
 
 
-def rev_loop():
-    print("Tight 1 loop started - 24h-reversion, resting-limit entry (/rev_start /rev_stop)")
-    if not REV_ENGINE_ENABLED:
-        print("[REV] disabled by env REV_ENGINE_ENABLED=0 - loop idle")
-        return
+def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
+    """Shared scan/track loop for a rev engine descriptor."""
+    name = eng["name"]
+    print(f"{name} loop started - 24h-reversion, resting-limit entry")
     while True:
         try:
-            rev_track_pending()
-            rev_track_trades()
+            rev_track_pending(eng)
+            rev_track_trades(eng)
 
-            if not rev_auto_enabled:
+            if not is_enabled_fn():
                 time.sleep(30)
                 continue
             if api_backoff_active():
                 time.sleep(60)
                 continue
 
-            open_slots = REV_MAX_CONCURRENT - (len(rev_open_trades) + len(rev_pending))
+            open_slots = eng["max_concurrent"] - (len(eng["open"]) + len(eng["pending"]))
             if open_slots <= 0:
-                time.sleep(REV_SCAN_SECONDS)
+                time.sleep(scan_seconds)
                 continue
 
             all_syms = get_futures_symbols()
@@ -2862,33 +2925,46 @@ def rev_loop():
             for sym in symbols:
                 if open_slots <= 0:
                     break
-                if rev_in_cooldown(sym) or rev_symbol_busy(sym):
+                if rev_in_cooldown(sym, eng) or rev_symbol_busy(sym, eng):
                     continue
                 if is_tokenized(sym) or coin_too_young(sym):
                     continue
                 scanned += 1
                 try:
-                    sig = rev_check_signal(sym, btc_ret)
+                    sig = rev_check_signal(sym, btc_ret, eng)
                 except Exception as e:
                     print(f"[REV SIG {sym}] {e}")
                     continue
                 if not sig:
                     continue
                 side, entry, sl, tp = sig
-                res = place_rev_limit(sym, side, entry, sl, tp)
+                res = place_rev_limit(sym, side, entry, sl, tp, eng)
                 if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP"):
                     fired += 1
                     open_slots -= 1
                 time.sleep(0.3)
 
             btc_str = f"{btc_ret * 100:+.1f}%" if btc_ret is not None else "n/a"
-            print(f"[REV SCAN] open={len(rev_open_trades)}/{REV_MAX_CONCURRENT} "
-                  f"pending={len(rev_pending)} on={rev_auto_enabled} scanned={scanned} "
+            print(f"[{eng['tag'].upper()} SCAN] open={len(eng['open'])}/{eng['max_concurrent']} "
+                  f"pending={len(eng['pending'])} on={is_enabled_fn()} scanned={scanned} "
                   f"fired={fired} btc4d={btc_str}")
         except Exception as e:
-            print(f"[REV LOOP] {e}")
-        time.sleep(REV_SCAN_SECONDS)
+            print(f"[REV LOOP {name}] {e}")
+        time.sleep(scan_seconds)
 
+
+def rev_loop():
+    if not REV_ENGINE_ENABLED:
+        print("[REV] Tight 1 disabled by env REV_ENGINE_ENABLED=0 - loop idle")
+        return
+    _rev_engine_loop(REV_T1, lambda: rev_auto_enabled, REV_SCAN_SECONDS)
+
+
+def rev2_loop():
+    if not REV2_ENGINE_ENABLED:
+        print("[REV] Tight 2 disabled by env REV2_ENGINE_ENABLED=0 - loop idle")
+        return
+    _rev_engine_loop(REV_T2, lambda: rev2_auto_enabled, REV2_SCAN_SECONDS)
 
 # ==================== END TIGHT 1 (24h-reversion) ====================
 
@@ -2980,7 +3056,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[STARTUP ADOPT ERROR] {e}")
 
-    Thread(target=t2_loop,                  daemon=True).start()   # Tight 2 fade (replaces retired RSI on /start /stop)
+    # Thread(target=t2_loop, ...) RETIRED 2026-08-20: old block-based Tight 2 (SHORT resistance-block)
+    # removed. Tight 2 is now the ceiling 24h-reversion engine (rev2_loop) below.
+    Thread(target=rev2_loop,                daemon=True).start()   # Tight 2 = 24h-reversion CEILING (2026-08-20)
     Thread(target=trailing_loop,            daemon=True).start()
     Thread(target=t3_loop,                  daemon=True).start()
     Thread(target=handle_telegram_commands, daemon=True).start()

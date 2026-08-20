@@ -2696,9 +2696,13 @@ def rev_check_signal(symbol, btc_ret, eng):
         return None
 
     side = None
-    if ret >= eng["ret_thr"] and pos >= 1.0:
+    # 2026-08-20 BUGFIX: was `pos >= 1.0` / `pos <= 0.0` (EXACT match to the 96-bar
+    # high/low) - the close price essentially never equals the running extreme exactly,
+    # so this fired almost never. The backtest that produced every number in this file
+    # used 0.999/0.001 (near-extreme, not exact) - this is that same threshold, restored.
+    if ret >= eng["ret_thr"] and pos >= 0.999:
         side = "SELL"
-    elif ret <= -eng["ret_thr"] and pos <= 0.0:
+    elif ret <= -eng["ret_thr"] and pos <= 0.001:
         side = "BUY"
     if side is None:
         return None

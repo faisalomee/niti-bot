@@ -1545,7 +1545,12 @@ def exchange_has_position(symbol):
         try:
             if p.get("symbol") != symbol:
                 continue
-            if abs(float(p.get("positionAmt", 0) or 0)) > 0:
+            # get_open_positions() returns the size under "amt" (already abs, >0 filtered),
+            # NOT "positionAmt". The old key was always 0 -> exchange_has_position always
+            # returned False -> EVERY rev trade phantom-closed within ~2 cycles (~5 min),
+            # leaving the real position naked on BingX. This is that fix.
+            amt = p.get("amt", p.get("positionAmt", 0))
+            if abs(float(amt or 0)) > 0:
                 return True
         except Exception:
             continue
@@ -2597,9 +2602,33 @@ def rev_in_cooldown(symbol, eng):
     return (time.time() - eng["last_fire"].get(symbol, 0)) < REV_COOLDOWN_SECONDS
 
 
+import threading as _threading
+_rev_claim_lock = _threading.Lock()
+rev_claimed = set()   # coins a rev engine is mid-placing (T1 & T2 run in parallel threads;
+                      # this makes the claim atomic so both can't open the SAME coin at once,
+                      # which is exactly what doubled PENDLE 2026-08-20).
+
+
+def rev_try_claim(symbol):
+    """Atomically reserve a coin for a rev order. Returns True if we got it, False if
+    another rev engine already holds/reserved it."""
+    with _rev_claim_lock:
+        if (symbol in rev_claimed or symbol in all_open_symbols()
+                or symbol in rev_pending or symbol in rev2_pending):
+            return False
+        rev_claimed.add(symbol)
+        return True
+
+
+def rev_release_claim(symbol):
+    with _rev_claim_lock:
+        rev_claimed.discard(symbol)
+
+
 def rev_symbol_busy(symbol, eng):
-    # A coin held/pending by ANY engine is off-limits (prevents T1 and T2 both grabbing it).
-    return symbol in all_open_symbols() or symbol in eng["pending"] or symbol in rev_pending or symbol in rev2_pending
+    # A coin held/pending/claimed by ANY engine is off-limits (prevents T1 and T2 both grabbing it).
+    return (symbol in all_open_symbols() or symbol in eng["pending"]
+            or symbol in rev_pending or symbol in rev2_pending or symbol in rev_claimed)
 
 
 def rev_btc_regime():
@@ -2774,6 +2803,18 @@ def rev_track_pending(eng):
                 risk = p["sl"] - fill
                 tp   = fill - risk * eng["short_tp_r"]
             sl_id = place_sl_guarded(sym, p["close_side"], p["pos_side"], p["sl"], p["qty"])
+            if sl_id is None:
+                # SL could not be placed on BOTH attempts -> NEVER leave the position naked.
+                # Market-close it immediately and alert, rather than run without a stop.
+                try:
+                    place_market_order(sym, p["close_side"], p["qty"], p["pos_side"])
+                except Exception as _e:
+                    print(f"[REV SL-FAIL emergency close {sym}] {_e}")
+                send_tg(f"\u26a0\ufe0f {name} {sym} {p['pos_side']} SL placement FAILED - "
+                        f"position emergency-closed (no naked risk).")
+                eng["last_fire"][sym] = now
+                pend.pop(sym, None)
+                continue
             tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label=name)
             eng["open"][p["order_id"]] = {
                 "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
@@ -2938,7 +2979,14 @@ def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
                 if not sig:
                     continue
                 side, entry, sl, tp = sig
+                # Atomically claim the coin so the other rev engine (parallel thread) can't
+                # also open it this cycle. If we can't claim, skip.
+                if not rev_try_claim(sym):
+                    continue
                 res = place_rev_limit(sym, side, entry, sl, tp, eng)
+                # Once it's resting in eng["pending"] the pending-check covers it, so release
+                # the short-lived claim. If placement failed/skipped, also release.
+                rev_release_claim(sym)
                 if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP"):
                     fired += 1
                     open_slots -= 1

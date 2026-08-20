@@ -2668,13 +2668,26 @@ def rev_check_signal(symbol, btc_ret, eng):
         return None
     ret = px / past - 1.0
 
-    win_hi = max(highs[-REV_RANGE_WINDOW:])
-    win_lo = min(lows[-REV_RANGE_WINDOW:])
+    # 2026-08-20 BUGFIX #2: backtest computed the 96-bar range from CLOSES
+    # (rolling max/min of close price), not from wicks. Using highs/lows here made
+    # pos>=0.999 even harder to reach (a bar's own upper wick pushes win_hi above its
+    # close), stacking with bug #1 to keep fired=0 even after that fix. Match backtest.
+    # 2026-08-20 BUGFIX #3: window sizing now matches backtest exactly.
+    # Backtest used rolling(97) for the range (97 bars INCLUDING current) and a
+    # volume median SHIFTED by 1 (the prior 96 bars, EXCLUDING current). Live was
+    # off-by-one on the range window and included current volume in its own median
+    # (a big current-bar volume was inflating the very median it's compared against,
+    # making vr>=1.3 harder to reach). Both now match the backtest precisely.
+    win_hi = max(closes[-(REV_RANGE_WINDOW + 1):])
+    win_lo = min(closes[-(REV_RANGE_WINDOW + 1):])
     if win_hi <= win_lo:
         return None
     pos = (px - win_lo) / (win_hi - win_lo)
 
-    med_vol = sorted(vols[-REV_RANGE_WINDOW:])[REV_RANGE_WINDOW // 2]
+    vol_window = vols[-(REV_RANGE_WINDOW + 1):-1]   # prior N bars, excludes current
+    if len(vol_window) < REV_RANGE_WINDOW:
+        return None
+    med_vol = sorted(vol_window)[len(vol_window) // 2]
     if med_vol <= 0:
         return None
     vr = vols[-1] / med_vol

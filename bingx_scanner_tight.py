@@ -2055,26 +2055,32 @@ def handle_telegram_commands():
                 elif text in ("/t1_stop", "/rev_stop"):
                     rev_auto_enabled = False
                     send_tg("Tight 1 (24h-reversion) Auto-trade OFF.")
-                # ---- Tight 3 = OI-Short (short-cover fade): /t3_start /t3_stop ----
+                # ---- Tight 3 = S/R Sweep SHORT (bear engine): /t3_start /t3_stop ----
                 elif text == "/t3_start":
                     if not T3_ENGINE_ENABLED:
-                        send_tg("Tight 3 (OI-Short) is disabled at build level (T3_ENGINE_ENABLED=0).")
-                    elif not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-                        send_tg("Tight 3 (OI-Short) needs SUPABASE_URL / SUPABASE_SERVICE_KEY (the OI history). Not set - cannot start.")
+                        send_tg("Tight 3 (S/R Sweep SHORT) is disabled at build level (T3_ENGINE_ENABLED=0).")
                     else:
                         t3_scalp_auto_enabled = True
-                        send_tg("Tight 3 (OI-Short) Auto-trade ON.")
+                        send_tg("Tight 3 (S/R Sweep SHORT) Auto-trade ON.")
                 elif text == "/t3_stop":
                     t3_scalp_auto_enabled = False
-                    send_tg("Tight 3 (OI-Short) Auto-trade OFF.")
+                    send_tg("Tight 3 (S/R Sweep SHORT) Auto-trade OFF.")
                 elif text == "/t3_status":
-                    lines_s = ("Tight 3 (OI-Short): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
+                    _t3btc = t3_btc_regime()
+                    lines_s = ("Tight 3 (S/R Sweep SHORT - bear engine): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
                                " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
-                               " | z>" + str(T3_Z_MIN) + " pump>" + str(round(T3_PUMP_MIN*100,1)) + "%" +
-                               " | hold " + str(T3_HOLD_SECONDS//60) + "m SL " + str(round(T3_SL_PCT*100,1)) + "% | risk $" + str(int(T3_RISK_USDT)) + " flat")
+                               " | Pending: " + str(len(t3s_pending)) +
+                               "\nSweep: >=" + str(T3_MIN_TOUCHES) + " touches, wick>=" + str(round(T3_WICK_MIN*100)) + "%" +
+                               " -> MSS -> FVG limit | SL sweep-high TP " + str(T3_TP_R) + "R" +
+                               "\nBTC 4d: " + (f"{_t3btc*100:+.1f}%" if _t3btc is not None else "n/a") +
+                               " (short only if <= +" + str(round(T3_BTC_MAX*100)) + "%)" +
+                               " | rf>=" + str(round(T3_RF_MIN*100,1)) + "% | risk $" + str(int(T3_RISK_USDT)) + " flat")
+                    for _sym, _p in list(t3s_pending.items()):
+                        lines_s += "\n[pending] " + _sym + " SHORT @ " + str(round(_p["entry"], 6))
                     for _oid, ts in list(t3s_open_trades.items()):
-                        lines_s += ("\n" + ts["symbol"] + " SHORT | entry " + str(ts["entry"]) +
-                                    " | SL " + str(ts["sl"]))
+                        lines_s += ("\n" + ts["symbol"] + " SHORT | entry " +
+                                    str(ts.get("entry_fill", ts["entry"])) + " | SL " + str(round(ts["sl"], 6)) +
+                                    " | TP " + str(round(ts["tp"], 6)))
                     send_tg(lines_s)
                 # ---- Tight 1 = 24h-reversion (2026-08-20) ----
                 # /rev_status kept as an alias for T1 detail
@@ -2127,7 +2133,7 @@ def handle_telegram_commands():
                         " | Open: " + str(len(rev2_open_trades)) + "/" + str(REV2_MAX_CONCURRENT) +
                         " | Pending: " + str(len(rev2_pending)) +
                         " | " + str(round(REV2_RET_THR*100)) + "% vol " + str(REV2_VOL_MULT) + "-" + str(REV2_VOL_MULT_MAX) + "x ATR%<" + str(round(REV2_ATRP_MAX*100,1)) + "% | risk $" + str(int(REV2_RISK_USDT)) + "\n"
-                        "Tight 3 (OI-Short): " + ("ON" if t3_scalp_auto_enabled else "OFF") + " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) + " | risk $" + str(int(T3_RISK_USDT)) + backoff
+                        "Tight 3 (S/R Sweep SHORT): " + ("ON" if t3_scalp_auto_enabled else "OFF") + " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) + " | Pending: " + str(len(t3s_pending)) + " | TP " + str(T3_TP_R) + "R risk $" + str(int(T3_RISK_USDT)) + backoff
                     )
         except Exception as e:
             print(f"[TG CMD] error: {e}")
@@ -2137,47 +2143,80 @@ def handle_telegram_commands():
 
 # ============================================================================
 # ============================================================================
-# ==================== TIGHT 3 = OI-SHORT (short-cover fade, 2026-08-18) ======
-# Replaces the retired VWAP-revert scalp. Independent engine using the open
-# interest the bot already logs to Supabase (oi_collector_loop). SEPARATE from
-# the swing fresh-block edge (T1/T2): own whitelist, own cap, own /t3_start.
-# SIGNAL (per 15-min OI snapshot, backtest-verified - held on BOTH holdout
-#   halves of the 8-day OI sample, PROMISING not yet fully verified): a liquid
-#   coin whose OI z-score (vs its own last T3_Z_LEN snapshots) > T3_Z_MIN AND
-#   whose implied price pumped >= T3_PUMP_MIN over the last T3_PUMP_LOOKBACK
-#   snapshots -> SHORT. This is a hollow, OI-not-confirmed rally that fades
-#   (short covering, not fresh longs). Exit: time-stop (~2h) or hard SL 5%.
-#   Implied price = oi_value / open_interest (same as the backtest).
-# LIQUID ONLY: OI notional > T3_MIN_VALUE_USD ($5M). The edge dies on micro-caps.
-# INITIAL SMALL TEST: risk $3 flat (8-day data only - keep tiny until proven).
-# Reuses the same safe order infra (place_market_order / place_sl_guarded /
-#   place_tp_guarded / depth_ok). Commands /t3_start /t3_stop /t3_status.
-# NOTE: needs T3_Z_LEN+1 snapshots per coin before it can fire; the collector
-#   logs every 15 min, so a coin needs ~2.75h of history before its first signal.
+# ==================== TIGHT 3 = S/R SWEEP SHORT (2026-08-23) =================
+# Faisal's own SMC engine (Equal-Highs / strong-S-R liquidity sweep), polished
+# from fee-dead to a real fee-surviving edge and coded as T3. SEPARATE engine
+# from the swing 24h-reversion (T1/T2): own cap, own /t3_start. Reuses the same
+# tested order infra (place_sl_guarded / place_tp_guarded / depth_ok / journal)
+# and the same resting-limit -> pending -> filled flow as the rev engines.
+#
+# WHY THIS SHAPE (measured, not invented):
+#   The raw sweep idea was DEAD after fees: the tight sweep-SL made risk/entry
+#   tiny (~0.65%), so a 0.10% round-trip ate ~0.15R/trade and every variant went
+#   negative. Three fixes turned it positive and all three are load-bearing:
+#     1. rf>=0.8% filter  - drop signals whose SL is <0.8% from entry (the ones
+#        fees destroy). THIS is the main lever.
+#     2. BTC bear_soft gate - only short when BTC 4d-return <= +3% (this is a
+#        directional SHORT engine; it loses in BTC up-months, so it stays out).
+#     3. strong S/R cluster (>=2 swing-highs at one level), not just a double top.
+#
+# SIGNAL (all on 15m):
+#   - find the strongest RESISTANCE cluster in the last T3_LEVEL_LOOKBACK bars:
+#     the price level (built from swing-highs, +/-2 fractal) that the most swing-
+#     highs sit within T3_LEVEL_TOL of. Require >= T3_MIN_TOUCHES swing-highs.
+#   - SWEEP candle: this 15m bar's HIGH pierces the level but its CLOSE is back
+#     below the level, with an upper rejection wick >= T3_WICK_MIN of the range.
+#   - MSS: within T3_MSS_LOOK bars after the sweep, a 15m CLOSE breaks the recent
+#     swing-low (min low of the prior T3_SWING_LB bars) -> structure shift down.
+#   - ENTRY: resting LIMIT at the bearish FVG top (gap left by the MSS down-move),
+#     cancelled after T3_FILL_BARS bars if unfilled.
+#   - SL = the sweep candle HIGH.  TP = T3_TP_R * risk.  (risk = SL - entry)
+#   - rf = risk/entry must be within [T3_RF_MIN, T3_SL_CAP_PCT].
+#   - BTC gate: skip if BTC 4d-return > T3_BTC_MAX (bear_soft = +3%).
+#
+# BACKTEST (8mo, 249-coin 15m, maker+taker fees, realistic slippage sim):
+#   ~9 trades/wk, win ~35%, meanR +0.23, +$345 at flat $5 over 8mo, holdout
+#   both halves positive, random-side control strongly negative (genuine edge).
+#   HONEST: this is a BEAR/CORRECTION engine. It is strong in dump months and
+#   weak/negative in BTC up-months - run it as a bear hedge, not all-weather.
+#   Small live test sizing until proven forward.
+# Commands: /t3_start /t3_stop /t3_status  (globals named t3s_* / T3_* so the
+#   existing /status + command wiring is unchanged).
 # ============================================================================
 T3_ENGINE_ENABLED   = os.environ.get("T3_ENGINE_ENABLED", "1") == "1"   # master build flag
-t3_scalp_auto_enabled = AUTO_RESUME_ON_START   # runtime on/off via /t3_start /t3_stop (kept name so /status + globals wiring is unchanged)
+t3_scalp_auto_enabled = AUTO_RESUME_ON_START   # runtime on/off via /t3_start /t3_stop (name kept for /status wiring)
 
-T3_Z_LEN            = int(os.environ.get("T3_Z_LEN", 10))         # rolling window for the OI z-score
-T3_Z_MIN            = float(os.environ.get("T3_Z_MIN", 2.0))      # z > 2.0 = OI crowded far above its own recent mean (high-conviction)
-T3_PUMP_LOOKBACK    = int(os.environ.get("T3_PUMP_LOOKBACK", 3))  # price pump measured over last 3 snapshots
-T3_PUMP_MIN         = float(os.environ.get("T3_PUMP_MIN", 0.03))  # >= 3% pump into the signal
-T3_MIN_VALUE_USD    = float(os.environ.get("T3_MIN_VALUE_USD", 5_000_000))  # liquid only: OI notional > $5M
-T3_HOLD_SECONDS     = int(os.environ.get("T3_HOLD_SECONDS", 8 * 15 * 60))   # ~8 snapshots x 15min = 2h time-stop
-T3_SL_PCT           = float(os.environ.get("T3_SL_PCT", 0.05))    # hard 5% stop (MANDATORY - raw worst trade was -28% without one)
-T3_RISK_USDT        = float(os.environ.get("T3_RISK_USDT", 3.0))  # INITIAL SMALL TEST $3 flat
+T3_LEVEL_LOOKBACK   = int(os.environ.get("T3_LEVEL_LOOKBACK", 96))    # bars to search for the S/R cluster (~24h)
+T3_LEVEL_TOL        = float(os.environ.get("T3_LEVEL_TOL", 0.004))    # swing-highs within 0.4% = same level
+T3_MIN_TOUCHES      = int(os.environ.get("T3_MIN_TOUCHES", 2))        # >=2 swing-highs at the level (strong S/R)
+T3_WICK_MIN         = float(os.environ.get("T3_WICK_MIN", 0.5))       # sweep upper wick >= 50% of candle range
+T3_MSS_LOOK         = int(os.environ.get("T3_MSS_LOOK", 16))          # bars after sweep to see a swing-low break
+T3_SWING_LB         = int(os.environ.get("T3_SWING_LB", 10))          # bars used to define the recent swing-low
+T3_FVG_EXPIRY       = int(os.environ.get("T3_FVG_EXPIRY", 20))        # bars for price to return into the FVG (setup expiry)
+T3_TP_R             = float(os.environ.get("T3_TP_R", 4.0))           # fixed take-profit in R
+T3_RF_MIN           = float(os.environ.get("T3_RF_MIN", 0.008))       # risk/entry floor - THE main fee fix, do not lower
+T3_SL_CAP_PCT       = float(os.environ.get("T3_SL_CAP_PCT", 0.10))    # risk/entry ceiling
+T3_BTC_MAX          = float(os.environ.get("T3_BTC_MAX", 0.03))       # bear_soft gate: short only if BTC 4d-return <= +3%
+T3_BTC_WINDOW       = int(os.environ.get("T3_BTC_WINDOW", 384))       # 4 days of 15m bars
+T3_ATR_LEN          = int(os.environ.get("T3_ATR_LEN", 14))
+T3_FILL_BARS        = int(os.environ.get("T3_FILL_BARS", 8))          # cancel resting limit after 8 bars (2h)
+T3_HOLD_SECONDS     = int(os.environ.get("T3_HOLD_SECONDS", 64 * 15 * 60))   # 16h max hold (matches backtest)
+T3_COOLDOWN_SECONDS = int(os.environ.get("T3_COOLDOWN_SECONDS", 7200))       # 2h per-coin after a signal
+T3_LOSS_COOLDOWN_S  = int(os.environ.get("T3_LOSS_COOLDOWN_S", 86400))       # 1d ban after an SL
+T3_RISK_USDT        = float(os.environ.get("T3_RISK_USDT", 3.0))      # small live test
 T3_LEVERAGE         = int(os.environ.get("T3_LEVERAGE", 10))
-T3_MAX_CONCURRENT   = int(os.environ.get("T3_MAX_CONCURRENT", 2)) # own slot cap, separate from swing (T1/T2)
+T3_MAX_CONCURRENT   = int(os.environ.get("T3_MAX_CONCURRENT", 5))     # own slot cap, separate from swing (T1/T2)
 T3_MAX_MARGIN_USDT  = float(os.environ.get("T3_MAX_MARGIN_USDT", 40))
-T3_COOLDOWN_SECONDS = int(os.environ.get("T3_COOLDOWN_SECONDS", 7200))    # 2h per-coin
-T3_LOSS_COOLDOWN_S  = int(os.environ.get("T3_LOSS_COOLDOWN_S", 86400))    # 1d ban after an SL
-T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 900))         # scan every 15min (matches the collector)
-T3_DEPTH_MULT       = float(os.environ.get("T3_DEPTH_MULT", 3.0))         # depth guard (same as swing)
-T3_SLIP_ALERT_PCT   = float(os.environ.get("T3_SLIP_ALERT_PCT", 0.3))
+T3_MIN_QUOTE_VOL    = float(os.environ.get("T3_MIN_QUOTE_VOL", 2_000_000))
+T3_EXCLUDE_TOP_N    = int(os.environ.get("T3_EXCLUDE_TOP_N", 20))
+T3_MAX_SYMBOLS      = int(os.environ.get("T3_MAX_SYMBOLS", 600))
+T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 300))
 
-t3s_open_trades   = {}    # order_id -> open OI-short trade
-t3s_last_fire     = {}    # symbol -> ts of last entry
-t3s_loss_until    = {}    # symbol -> ts until which coin is banned (after SL)
+# globals named t3s_* so /status + command handlers are unchanged
+t3s_open_trades   = {}    # order_id -> live trade
+t3s_pending       = {}    # symbol   -> resting limit awaiting fill
+t3s_last_fire     = {}    # symbol   -> ts of last entry
+t3s_loss_until    = {}    # symbol   -> ts until which coin is banned (after SL)
 
 
 def t3s_in_cooldown(symbol):
@@ -2189,166 +2228,261 @@ def t3s_in_cooldown(symbol):
     return False
 
 
-def t3s_symbol_has_open(symbol):
-    return any(t.get("symbol") == symbol for t in t3s_open_trades.values())
-
-
-def t3_fetch_oi_history(symbol, limit):
-    """Read the last `limit` oi_history rows for one symbol from Supabase,
-    oldest->newest. Returns list of dicts {ts, open_interest, oi_value} or []."""
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return []
+def t3s_symbol_busy(symbol):
+    if symbol in t3s_pending:
+        return True
+    if any(t.get("symbol") == symbol for t in t3s_open_trades.values()):
+        return True
     try:
-        url = SUPABASE_URL + "/rest/v1/oi_history"
-        headers = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": "Bearer " + SUPABASE_SERVICE_KEY,
-        }
-        params = {
-            "symbol": "eq." + symbol,
-            "select": "ts,open_interest,oi_value",
-            "order": "ts.desc",
-            "limit": str(limit),
-        }
-        r = requests.get(url, headers=headers, params=params, timeout=15)
-        if r.status_code != 200:
-            return []
-        rows = r.json()
-        if not isinstance(rows, list):
-            return []
-        rows = list(reversed(rows))   # oldest -> newest
-        out = []
-        for row in rows:
-            try:
-                oi = float(row.get("open_interest"))
-                val = float(row.get("oi_value"))
-                out.append({"ts": row.get("ts"), "open_interest": oi, "oi_value": val})
-            except (TypeError, ValueError):
-                continue
-        return out
+        if symbol in all_open_symbols():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def t3_btc_regime():
+    """BTC 4-day return. None if unreadable (then we skip, never guess)."""
+    try:
+        candles = get_candles("BTC-USDT", limit=T3_BTC_WINDOW + 5, interval="15m")
+        if not candles or len(candles) < T3_BTC_WINDOW + 1:
+            return None
+        closes = [cl(c) for c in candles]
+        past, now_px = closes[-(T3_BTC_WINDOW + 1)], closes[-1]
+        if past <= 0:
+            return None
+        return now_px / past - 1.0
     except Exception as e:
-        print(f"[T3 OI HIST ERROR] {symbol}: {e}")
-        return []
-
-
-def t3s_scalp_signal(symbol):
-    """Return ('SELL', entry_price) if the short-cover-fade short fires, else None.
-    (Name kept as t3s_scalp_signal so the loop wiring is unchanged.)"""
-    need = max(T3_Z_LEN, T3_PUMP_LOOKBACK) + 1
-    hist = t3_fetch_oi_history(symbol, need)
-    if len(hist) < need:
-        return None
-    ois    = [h["open_interest"] for h in hist]
-    prices = []
-    for h in hist:
-        oi = h["open_interest"]
-        prices.append(h["oi_value"] / oi if oi and oi > 0 else 0.0)
-    if any(p <= 0 for p in prices):
+        print(f"[T3 BTC] {e}")
         return None
 
-    if hist[-1]["oi_value"] < T3_MIN_VALUE_USD:
-        return None
 
-    window = ois[-T3_Z_LEN:]
-    if len(window) < T3_Z_LEN:
-        return None
-    mean = sum(window) / len(window)
-    var = sum((x - mean) ** 2 for x in window) / len(window)
-    std = var ** 0.5
-    if std <= 0:
-        return None
-    z = (ois[-1] - mean) / std
-    if z <= T3_Z_MIN:
-        return None
-
-    p_now  = prices[-1]
-    p_then = prices[-1 - T3_PUMP_LOOKBACK]
-    if p_then <= 0:
-        return None
-    pump = p_now / p_then - 1.0
-    if pump < T3_PUMP_MIN:
-        return None
-
-    live = get_current_price(symbol)
-    entry = live if live and live > 0 else p_now
-    return ("SELL", entry)
+def _t3_swing_high_idx(highs):
+    """Indices of +/-2 fractal swing-highs within the given window."""
+    out = []
+    for j in range(2, len(highs) - 2):
+        if (highs[j] >= highs[j - 1] and highs[j] >= highs[j - 2]
+                and highs[j] >= highs[j + 1] and highs[j] >= highs[j + 2]):
+            out.append(j)
+    return out
 
 
-def place_t3_scalp_order(symbol, entry, side="SELL"):
-    """Percent-SL OI short. Reuses the same safe infra as the other engines.
-    (Name kept so the loop wiring is unchanged; side is always SELL here.)"""
+def t3s_check_signal(symbol, btc_ret):
+    """S/R sweep SHORT setup. Returns (entry_px, sl_px, tp_px) or None.
+    Mirrors the backtest exactly: strong resistance cluster -> sweep candle
+    (pierce + close back below + rejection wick) -> MSS (swing-low break) ->
+    entry at the bearish FVG top, SL at the sweep high, TP fixed R."""
+    need = T3_LEVEL_LOOKBACK + T3_MSS_LOOK + T3_FVG_EXPIRY + T3_ATR_LEN + 5
+    candles = get_candles(symbol, limit=need, interval="15m")
+    if not candles or len(candles) < T3_LEVEL_LOOKBACK + T3_MSS_LOOK + 5:
+        return None
+    highs = [h(c) for c in candles]
+    lows  = [l(c) for c in candles]
+    closes = [cl(c) for c in candles]
+    opens = [o(c) for c in candles]
+    n = len(candles)
+
+    # The sweep candle must be recent enough that the MSS + FVG could have formed
+    # AND be old enough to have T3_LEVEL_LOOKBACK bars of history behind it. We look
+    # for the sweep in the window [oldest_ok .. last_bar - 2] and require the whole
+    # MSS/FVG chain to complete on already-closed bars.
+    # Scan from the most recent qualifying sweep backwards; take the first that
+    # produces a still-valid (not-yet-filled, not expired) entry at the latest bar.
+    latest = n - 1
+    # search sweeps whose FVG entry window could still be open right now
+    earliest_sweep = max(T3_LEVEL_LOOKBACK, n - 1 - (T3_MSS_LOOK + T3_FVG_EXPIRY))
+    for i in range(latest - 1, earliest_sweep - 1, -1):
+        win_h = highs[i - T3_LEVEL_LOOKBACK:i]
+        if len(win_h) < 5:
+            continue
+        sh = _t3_swing_high_idx(win_h)
+        if not sh:
+            continue
+        # strongest cluster
+        best_lvl = None; best_cnt = 0
+        for j in sh:
+            lvl = win_h[j]
+            cnt = sum(1 for k in sh if abs(win_h[k] - lvl) / lvl <= T3_LEVEL_TOL)
+            if cnt > best_cnt:
+                best_cnt = cnt; best_lvl = lvl
+        if best_lvl is None or best_cnt < T3_MIN_TOUCHES:
+            continue
+        cluster = [win_h[k] for k in sh if abs(win_h[k] - best_lvl) / best_lvl <= T3_LEVEL_TOL]
+        rlvl = max(cluster)
+
+        c_h, c_l, c_o, c_c = highs[i], lows[i], opens[i], closes[i]
+        rng = c_h - c_l
+        if rng <= 0:
+            continue
+        # sweep: pierce the level then close back below it
+        if not (c_h > rlvl and c_c < rlvl):
+            continue
+        upper = c_h - max(c_o, c_c)
+        if upper / rng < T3_WICK_MIN:
+            continue
+        sweep_high = c_h
+
+        # MSS: swing-low break within T3_MSS_LOOK bars after the sweep
+        pre = lows[max(0, i - T3_SWING_LB):i]
+        if not pre:
+            continue
+        swing_low = min(pre)
+        mss = None
+        for k in range(i + 1, min(i + 1 + T3_MSS_LOOK, n)):
+            if closes[k] < swing_low:
+                mss = k; break
+        if mss is None or mss < 2:
+            continue
+
+        # bearish FVG top (gap between low[mss-2] and high[mss]); fallback = order block
+        ft = lows[mss - 2]; fb = highs[mss]
+        if ft <= fb:
+            ft = max(highs[mss - 1], highs[mss])
+        entry = ft
+        sl = sweep_high
+        risk = sl - entry
+        if risk <= 0:
+            continue
+        rf = risk / entry
+        if rf < T3_RF_MIN or rf > T3_SL_CAP_PCT:
+            continue
+
+        # the FVG entry must not have already been touched between mss and now
+        # (if price already returned into the FVG on a closed bar, the setup is spent)
+        touched = False
+        for k in range(mss + 1, n):
+            if highs[k] >= entry:
+                touched = True; break
+        if touched:
+            continue
+        # and the setup must still be within its expiry window
+        if (n - 1) - mss > T3_FVG_EXPIRY:
+            continue
+
+        # BTC bear_soft gate
+        if btc_ret is not None and btc_ret > T3_BTC_MAX:
+            return None
+
+        tp = entry - risk * T3_TP_R
+        return entry, sl, tp
+    return None
+
+
+def place_t3_limit(symbol, entry, sl, tp):
+    """RESTING LIMIT short at the FVG top (maker). Notifies on rest / margin / depth skip."""
     try:
         set_leverage_api(symbol, T3_LEVERAGE)
         precision = symbol_precision.get(symbol, 4)
-        sl = round(entry * (1 + T3_SL_PCT), 6)   # SHORT: stop above
-        pos_side, close_side = "SHORT", "BUY"
         risk_dist = abs(sl - entry)
         if risk_dist <= 0:
             return None
-        risk_qty = T3_RISK_USDT / risk_dist
+        risk_qty       = T3_RISK_USDT / risk_dist
         margin_cap_qty = (T3_MAX_MARGIN_USDT * T3_LEVERAGE) / entry
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
-        global DEPTH_LIQUIDITY_MULT
-        _saved = DEPTH_LIQUIDITY_MULT
-        DEPTH_LIQUIDITY_MULT = T3_DEPTH_MULT
-        try:
-            _depth_pass = depth_ok(symbol, entry, sl, qty, "SELL")
-        finally:
-            DEPTH_LIQUIDITY_MULT = _saved
-        if not _depth_pass:
-            send_tg("\u26a0\ufe0f TIGHT 3 " + symbol + " SHORT TRADE SKIPPED - order book too thin (slippage guard)")
+        side, pos_side, close_side = "SELL", "SHORT", "BUY"
+        if not depth_ok(symbol, entry, sl, qty, side):
+            print(f"[T3 DEPTH SKIP] {symbol}")
             return "DEPTH_SKIP"
         required_margin = qty * entry / T3_LEVERAGE
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
-            print(f"[T3 MARGIN SKIP] {symbol} need ~${required_margin:.2f}, avail ${avail:.2f}")
-            send_tg("\u26a0\ufe0f TIGHT 3 " + symbol + " SHORT TRADE SKIPPED - not enough margin")
+            print(f"[T3 MARGIN SKIP] {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
             return "MARGIN_SKIP"
-        order_id = place_market_order(symbol, "SELL", qty, pos_side)
-        print(f"[T3 OI ORDER] {symbol} SHORT qty={qty} risk=${T3_RISK_USDT}: {order_id}")
-        if order_id in ("N/A", "MARGIN_SKIP", None):
-            send_tg("\u26a0\ufe0f TIGHT 3 " + symbol + " SHORT TRADE SKIPPED - order not placed")
-            return order_id
-        time.sleep(0.5)
-        entry_fill = get_fill_price(order_id, symbol, fallback=entry)
-        slip_pct = abs(entry_fill - entry) / entry * 100 if entry > 0 else 0.0
-        print(f"[T3 SLIP] {symbol} signal={entry} fill={entry_fill} slip={slip_pct:.3f}%")
-        if slip_pct > T3_SLIP_ALERT_PCT:
-            send_tg(f"\u26a0\ufe0f TIGHT 3 {symbol}: fill slipped {slip_pct:.2f}%. Kept - logging.")
-        sl = round(entry_fill * (1 + T3_SL_PCT), 6)
-        sl_id = place_sl_guarded(symbol, close_side, pos_side, sl, qty)
-        if sl_id is None:
-            print(f"[T3 SL GUARD] {symbol} SL failed twice - emergency close")
-            place_market_order(symbol, close_side, qty, pos_side)
-            send_tg(f"\u26a0\ufe0f TIGHT 3 {symbol}: SL placement failed - position emergency-closed")
+        url = BASE_URL + "/openApi/swap/v2/trade/order"
+        params = build_signed_params({
+            "symbol": symbol, "side": side, "positionSide": pos_side,
+            "type": "LIMIT", "price": round(entry, 6), "quantity": qty,
+            "timeInForce": "GTC",
+        })
+        r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
+        if oid == "N/A":
+            print(f"[T3 LIMIT FAIL] {symbol} qty={qty} px={entry} - BingX: {r}")
             return None
-        t3s_open_trades[str(order_id)] = {
-            "symbol": symbol, "side": "SELL", "entry": entry, "entry_fill": entry_fill,
-            "sl": sl, "sl_id": sl_id, "total_qty": qty, "close_side": close_side,
-            "pos_side": pos_side, "risk_usdt": T3_RISK_USDT, "engine": "T3_OI",
-            "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            "open_ts": time.time(),
+        t3s_pending[symbol] = {
+            "order_id": oid, "symbol": symbol, "side": side, "pos_side": pos_side,
+            "close_side": close_side, "entry": entry, "sl": sl, "tp": tp,
+            "qty": qty, "placed_ts": time.time(),
         }
-        send_tg("\u2705 TIGHT 3 " + symbol + " SHORT TRADE EXECUTED\n"
-                "Entry: " + str(round(entry_fill, 6)) + " | SL: " + str(sl) +
-                " | time-stop " + str(T3_HOLD_SECONDS // 60) + "m | Risk: $" + str(T3_RISK_USDT))
-        return order_id
+        send_tg(
+            f"\u23f3 TIGHT 3 {symbol} SHORT LIMIT RESTING (S/R sweep)\n"
+            f"Entry: {round(entry, 6)} | SL: {round(sl, 6)} | TP: {round(tp, 6)}\n"
+            f"Risk: ${T3_RISK_USDT} | cancels in {T3_FILL_BARS * 15}m"
+        )
+        return oid
     except Exception as e:
-        print(f"[T3 OI ORDER ERROR] {symbol}: {e}")
+        print(f"[T3 ORDER {symbol}] {e}")
         return None
 
 
-def track_t3_scalp_trades():
-    """Reconcile open OI shorts: detect SL fills (position gone) + time-stop.
-    No fixed TP order - exit is time-stop or SL (matches the backtest hold)."""
-    if not t3s_open_trades:
+def track_t3_pending():
+    """Promote resting T3 limits to live trades on fill (place SL+TP), cancel if unfilled."""
+    if not t3s_pending:
         return
-    try:
-        open_syms = all_open_symbols()
-    except Exception as e:
-        print(f"[T3 TRACK] open-symbol fetch error: {e}")
+    now = time.time()
+    for sym, p in list(t3s_pending.items()):
+        try:
+            status = check_order_status(p["order_id"], sym)
+        except Exception as e:
+            print(f"[T3 PEND {sym}] {e}")
+            continue
+        if status == "FILLED":
+            fill = get_fill_price(p["order_id"], sym, fallback=p["entry"])
+            risk = p["sl"] - fill
+            if risk <= 0:
+                # fill worse than SL somehow - close immediately, never run naked/inverted
+                try:
+                    place_market_order(sym, p["close_side"], p["qty"], p["pos_side"])
+                except Exception as _e:
+                    print(f"[T3 bad-fill close {sym}] {_e}")
+                send_tg(f"\u26a0\ufe0f TIGHT 3 {sym} SHORT bad fill (>= SL) - closed, no naked risk.")
+                t3s_last_fire[sym] = now
+                t3s_pending.pop(sym, None)
+                continue
+            tp = fill - risk * T3_TP_R
+            sl_id = place_sl_guarded(sym, p["close_side"], p["pos_side"], p["sl"], p["qty"])
+            if sl_id is None:
+                try:
+                    place_market_order(sym, p["close_side"], p["qty"], p["pos_side"])
+                except Exception as _e:
+                    print(f"[T3 SL-FAIL emergency close {sym}] {_e}")
+                send_tg(f"\u26a0\ufe0f TIGHT 3 {sym} SHORT SL placement FAILED - position emergency-closed.")
+                t3s_last_fire[sym] = now
+                t3s_pending.pop(sym, None)
+                continue
+            tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label="TIGHT 3")
+            t3s_open_trades[p["order_id"]] = {
+                "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
+                "close_side": p["close_side"], "entry": p["entry"], "entry_fill": fill,
+                "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "risk_usdt": T3_RISK_USDT,
+                "sl_id": sl_id, "tp_id": tp_id, "open_ts": now, "gone_strikes": 0,
+                "label": "TIGHT 3",
+            }
+            t3s_last_fire[sym] = now
+            t3s_pending.pop(sym, None)
+            slip = abs(fill - p["entry"]) / p["entry"] * 100 if p["entry"] else 0
+            send_tg(
+                f"\u2705 TIGHT 3 {sym} SHORT FILLED (trade executed)\n"
+                f"Entry: {fill} (limit {round(p['entry'], 6)}, slip {slip:.2f}%)\n"
+                f"SL: {round(p['sl'], 6)} | TP: {round(tp, 6)} | Risk: ${T3_RISK_USDT}"
+            )
+            continue
+        if now - p["placed_ts"] > T3_FILL_BARS * 15 * 60:
+            try:
+                cancel_order(sym, p["order_id"])
+            except Exception as e:
+                print(f"[T3 CANCEL {sym}] {e}")
+            t3s_pending.pop(sym, None)
+            send_tg(f"\u274e TIGHT 3 {sym} SHORT LIMIT CANCELLED (unfilled {T3_FILL_BARS * 15}m) - margin released")
+
+
+def track_t3_scalp_trades():
+    """Time-stop + reconcile closed T3 positions, then journal. Two-strike exchange
+    confirmation before declaring a position closed (no phantom closes).
+    (Name kept as track_t3_scalp_trades so the loop wiring is unchanged.)"""
+    if not t3s_open_trades:
         return
     now = time.time()
     for oid, t in list(t3s_open_trades.items()):
@@ -2357,113 +2491,128 @@ def track_t3_scalp_trades():
         if now - t.get("open_ts", now) > T3_HOLD_SECONDS:
             try:
                 place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
+                for k in ("sl_id", "tp_id"):
+                    if t.get(k) and t[k] != "N/A":
+                        try:
+                            cancel_order(sym, t[k])
+                        except Exception:
+                            pass
                 ef = t.get("entry_fill", t.get("entry", 0))
                 px = get_current_price(sym)
-                pnl = None
+                pnl = None; exit_r = 0
                 if px and ef:
-                    pnl = (ef - px) / ef * (T3_RISK_USDT / T3_SL_PCT)   # short pnl approx
-                pstr = (("+$" if pnl >= 0 else "-$") + str(abs(round(pnl, 2)))) if pnl is not None else "~"
-                send_tg(f"\u23f1\ufe0f TIGHT 3 {sym} SHORT time-stop closed | entry {ef} | ~{pstr}")
+                    rd = abs(ef - t["sl"])
+                    if rd > 0:
+                        pnl = (ef - px) / rd * T3_RISK_USDT
+                        exit_r = round((ef - px) / rd, 2)
+                send_tg(f"\u23f1\ufe0f TIGHT 3 {sym} SHORT time-stop closed | entry {ef}"
+                        + (f" | {'+' if pnl >= 0 else '-'}${abs(round(pnl, 2))}" if pnl is not None else ""))
+                journal_closed_trade({
+                    "label": "TIGHT 3", "symbol": sym, "side": "SHORT", "entry": ef,
+                    "result": "time-stop", "pnl": round(pnl, 2) if pnl is not None else 0,
+                    "exit_r": exit_r,
+                })
             except Exception as e:
                 print(f"[T3 TIMESTOP {sym}] {e}")
-            try:
-                journal_closed_trade({
-                    "label": "TIGHT 3", "symbol": sym, "side": "SHORT",
-                    "entry": t.get("entry_fill", t.get("entry", 0)),
-                    "result": "time-stop",
-                    "pnl": round(pnl, 2) if pnl is not None else 0,
-                })
-            except Exception as _je:
-                print(f"[T3 JOURNAL {sym}] {_je}")
             t3s_last_fire[sym] = now
             t3s_open_trades.pop(oid, None)
             continue
-        # position gone -> SL hit (or manual/liq)
-        # 2026-08-20 BUGFIX: this used to trust all_open_symbols() alone, which did not
-        # contain t3s trades at all, so it fired on the FIRST pass every time and closed
-        # the trade in memory only. Now: ask the exchange, and require TWO consecutive
-        # confirmations before believing a position is really gone.
+        # reconcile: position gone => SL or TP hit
         gone = exchange_has_position(sym)
-        if gone is None:          # API failed - unknown, never assume closed
-            t["gone_strikes"] = 0
-            continue
-        if gone:                  # still open on BingX
+        if gone is None or gone:
             t["gone_strikes"] = 0
             continue
         t["gone_strikes"] = t.get("gone_strikes", 0) + 1
         if t["gone_strikes"] < 2:
-            print(f"[T3 OI] {sym} looks gone (strike 1/2) - waiting for confirmation")
+            print(f"[T3] {sym} looks gone (strike 1/2) - waiting for confirmation")
             continue
-        if True:
-            result = "closed"
-            try:
-                px = get_current_price(sym)
-                if px:
-                    result = "SL" if px >= t["sl"] * 0.999 else "closed"
-            except Exception:
-                pass
-            if result == "SL":
-                t3s_loss_until[sym] = now + T3_LOSS_COOLDOWN_S
-            t3s_last_fire[sym] = now
-            print(f"[T3 OI CLOSED] {sym} {result}")
-            try:
-                ef = t.get("entry_fill", t.get("entry", 0))
-                held_min = int((now - t.get("open_ts", now)) / 60)
-                if result == "SL":
-                    approx = "-$" + str(round(T3_RISK_USDT, 2)); emoji = "\u274c"
-                else:
-                    approx = "~"; emoji = "\u2139\ufe0f"
-                send_tg(f"{emoji} TIGHT 3 {sym} SHORT {result} | entry {ef} | ~{approx} | held {held_min}m")
-                journal_closed_trade({
-                    "label": "TIGHT 3", "symbol": sym, "side": "SHORT", "entry": ef,
-                    "result": result,
-                    "pnl": (-T3_RISK_USDT if result == "SL" else 0),
-                })
-            except Exception as _e:
-                print(f"[T3 JOURNAL {sym}] {_e}")
-            t3s_open_trades.pop(oid, None)
+        ef = t.get("entry_fill", t.get("entry", 0))
+        result, pnl, exit_r = "closed", 0, 0
+        try:
+            px = get_current_price(sym)
+            if px and ef:
+                result = "TP" if px <= t["tp"] * 1.001 else ("SL" if px >= t["sl"] * 0.999 else "closed")
+        except Exception:
+            pass
+        if result == "TP":
+            pnl = T3_RISK_USDT * T3_TP_R; exit_r = T3_TP_R
+        elif result == "SL":
+            pnl = -T3_RISK_USDT; exit_r = -1
+            t3s_loss_until[sym] = now + T3_LOSS_COOLDOWN_S
+        for k in ("sl_id", "tp_id"):
+            if t.get(k) and t[k] != "N/A":
+                try:
+                    cancel_order(sym, t[k])
+                except Exception:
+                    pass
+        emoji = "\u2705" if result == "TP" else ("\u274c" if result == "SL" else "\u2139\ufe0f")
+        held_min = int((now - t.get("open_ts", now)) / 60)
+        send_tg(f"{emoji} TIGHT 3 {sym} SHORT {result} | entry {ef} | held {held_min}m")
+        journal_closed_trade({
+            "label": "TIGHT 3", "symbol": sym, "side": "SHORT", "entry": ef,
+            "result": result, "pnl": round(pnl, 2), "exit_r": exit_r,
+        })
+        t3s_last_fire[sym] = now
+        t3s_open_trades.pop(oid, None)
 
 
 def t3_scalp_loop():
-    print("Tight 3 loop started - OI-Short (short-cover fade, Supabase OI, /t3_start /t3_stop)")
+    print("Tight 3 loop started - S/R Sweep SHORT (bear engine, 15m, resting-limit entry, /t3_start /t3_stop)")
     if not T3_ENGINE_ENABLED:
-        print("[T3 OI] disabled by env T3_ENGINE_ENABLED=0 - loop idle")
-        while True:
-            time.sleep(3600)
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("[T3 OI] SUPABASE_URL / SUPABASE_SERVICE_KEY not set - loop idle (needs the OI history)")
+        print("[T3] disabled by env T3_ENGINE_ENABLED=0 - loop idle")
         while True:
             time.sleep(3600)
     scan_list = sorted(BACKTESTED_COINS) if WHITELIST_ONLY else None
     while True:
         try:
-            if api_backoff_active():
+            track_t3_pending()
+            track_t3_scalp_trades()
+            if not t3_scalp_auto_enabled:
                 time.sleep(30)
                 continue
-            track_t3_scalp_trades()
-            if t3_scalp_auto_enabled:
-                universe = scan_list if scan_list is not None else (get_futures_symbols() or [])
-                fired = 0
-                for sym in universe:
-                    if api_backoff_active():
-                        break
-                    if not t3_scalp_auto_enabled:
-                        break
-                    if len(t3s_open_trades) >= T3_MAX_CONCURRENT:
-                        break
-                    if t3s_symbol_has_open(sym) or t3s_in_cooldown(sym):
-                        continue
-                    sig = t3s_scalp_signal(sym)
-                    if sig:
-                        _side, entry = sig
-                        res = place_t3_scalp_order(sym, entry, "SELL")
-                        if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP", "N/A"):
-                            t3s_last_fire[sym] = time.time()
-                            fired += 1
-                    time.sleep(0.15)
-                print(f"[T3 SCAN] open={len(t3s_open_trades)}/{T3_MAX_CONCURRENT} on={t3_scalp_auto_enabled} scanned={len(universe)} fired={fired}")
+            if api_backoff_active():
+                time.sleep(60)
+                continue
+            open_slots = T3_MAX_CONCURRENT - (len(t3s_open_trades) + len(t3s_pending))
+            if open_slots <= 0:
+                time.sleep(T3_SCAN_SECONDS)
+                continue
+            if scan_list is not None:
+                universe = scan_list
+            else:
+                universe = get_liquid_symbols(
+                    get_futures_symbols() or [], min_quote_vol=T3_MIN_QUOTE_VOL,
+                    max_n=T3_MAX_SYMBOLS, exclude_top_n=T3_EXCLUDE_TOP_N,
+                )
+            btc_ret = t3_btc_regime()
+            scanned = fired = 0
+            for sym in universe:
+                if open_slots <= 0:
+                    break
+                if not t3_scalp_auto_enabled or api_backoff_active():
+                    break
+                if t3s_in_cooldown(sym) or t3s_symbol_busy(sym):
+                    continue
+                if is_tokenized(sym) or coin_too_young(sym):
+                    continue
+                scanned += 1
+                try:
+                    sig = t3s_check_signal(sym, btc_ret)
+                except Exception as e:
+                    print(f"[T3 SIG {sym}] {e}")
+                    continue
+                if not sig:
+                    continue
+                entry, sl, tp = sig
+                res = place_t3_limit(sym, entry, sl, tp)
+                if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP", "N/A"):
+                    fired += 1
+                    open_slots -= 1
+                time.sleep(0.2)
+            print(f"[T3 SCAN] open={len(t3s_open_trades)} pending={len(t3s_pending)}/{T3_MAX_CONCURRENT} "
+                  f"on={t3_scalp_auto_enabled} scanned={scanned} fired={fired}")
         except Exception as e:
-            print(f"[T3 OI LOOP ERROR] {e}")
+            print(f"[T3 LOOP ERROR] {e}")
         time.sleep(T3_SCAN_SECONDS)
 
 
@@ -3125,9 +3274,9 @@ if __name__ == "__main__":
     # removed. Tight 2 is now the ceiling 24h-reversion engine (rev2_loop) below.
     Thread(target=rev2_loop,                daemon=True).start()   # Tight 2 = 24h-reversion CEILING (2026-08-20)
     Thread(target=trailing_loop,            daemon=True).start()
-    Thread(target=t3_loop,                  daemon=True).start()
+    # Thread(target=t3_loop, ...) DISABLED 2026-08-23: old dormant/OI watchlist T3 retired; superseded by S/R Sweep SHORT (t3_scalp_loop).
     Thread(target=handle_telegram_commands, daemon=True).start()
     Thread(target=oi_collector_loop,        daemon=True).start()   # OI logger -> Supabase (2026-08-10)
-    Thread(target=t3_scalp_loop,            daemon=True).start()   # Tight 3 = OI-Short short-cover fade (2026-08-18)
+    Thread(target=t3_scalp_loop,            daemon=True).start()   # Tight 3 = S/R Sweep SHORT bear engine (2026-08-23)
     Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -826,13 +826,28 @@ def get_open_orders_for(symbol):
 
 def adopt_positions_on_start():
     """Run ONCE at startup. All engine state is in-memory, so a Render restart/redeploy
-    forgets every open position: the bot then re-opens past the concurrency cap and
-    ORPHANS the old positions (their BE/trail management never runs again). This
-    re-adopts what is actually open on BingX so the caps hold and management resumes.
+    forgets every open position.
 
-    Only LONG positions are adopted here. Any adopted LONG is handed to the Tight 2
-    tracker (it manages BE/trail/TP for both long and short). If a position has no SL at all, a protective SL is placed and
-    the user is alerted. SHORT positions keep their exchange SL and are only reported."""
+    2026-08-24 REWRITE. The old version adopted ONLY LONG positions and handed them to the
+    retired block-based Tight 2 tracker. Every engine now running (T1, T2, T3) is
+    predominantly SHORT, so in practice a restart orphaned essentially every live trade:
+    its SL/TP survived on the exchange (no liquidation risk), but the bot no longer knew
+    about it, which meant NO time-stop (margin locked indefinitely) and NO slot accounting
+    (the engine could re-fill all its slots on top of the forgotten position). Observed live
+    on 2026-08-24: T1 held one position from 10:47, the service restarted at 12:28, and the
+    position kept running untracked.
+
+    Now: BOTH sides are adopted, into the rev (Tight 1) tracker, which handles long and short
+    and applies the time-stop. Notes on the deliberate simplifications:
+      - Engine attribution is not recoverable from the exchange (a T1/T2/T3 short looks
+        identical), so everything lands in Tight 1. That is fine: the tracker only needs
+        entry/SL/TP/qty to manage and journal the trade, and all_open_symbols() then keeps
+        every other engine off that coin.
+      - open_ts is set to NOW, not to the real entry time (which is unknown after a restart).
+        The time-stop therefore restarts from adoption - conservative, never premature.
+      - risk_usdt is computed from the REAL distance to the stop x qty, so PnL reporting on
+        the adopted trade is honest rather than assuming the flat $5.
+    """
     try:
         positions = get_open_positions()
     except Exception as e:
@@ -841,61 +856,65 @@ def adopt_positions_on_start():
     if not positions:
         print("[ADOPT] no open positions on BingX to re-adopt")
         return
-    tracked = {t["symbol"] for t in t2_open_trades.values()} | {t["symbol"] for t in t3_open_trades.values()}
-    adopted = shorts = 0
+    tracked = all_open_symbols()
+    adopted = 0
     lines = []
+    now = time.time()
     for p in positions:
         sym, amt, avg = p["symbol"], p["amt"], p["avg"]
-        if p["pos_side"] != "LONG":
-            shorts += 1
-            lines.append(sym + " SHORT (kept on its exchange SL, not adopted)")
+        if not sym or amt <= 0 or avg <= 0:
             continue
-        if sym in tracked or avg <= 0:
+        if sym in tracked:
             continue
+        is_long = (p["pos_side"] == "LONG")
+        side       = "BUY"  if is_long else "SELL"
+        pos_side   = "LONG" if is_long else "SHORT"
+        close_side = "SELL" if is_long else "BUY"
+
         sl_id, sl_price, tp_id, tp_price = get_open_orders_for(sym)
-        # Ensure the position is protected. If no SL exists, place a conservative one.
+
+        # No stop on the exchange -> place a protective one immediately. A position with no
+        # stop is the one situation that can actually blow up the account.
         if sl_id is None:
-            fallback_sl = round(avg * (1 - 0.05), 6)   # 5% protective stop until proper management takes over
-            sl_id = place_sl_guarded(sym, "SELL", "LONG", fallback_sl, amt)
+            fallback_sl = round(avg * (0.95 if is_long else 1.05), 6)
+            sl_id = place_sl_guarded(sym, close_side, pos_side, fallback_sl, amt)
             sl_price = fallback_sl
             if sl_id is None:
-                send_tg("ADOPT WARNING - " + sym + " LONG has NO stop-loss on the exchange and one could not be placed. Set an SL manually NOW.")
+                send_tg("\u26a0\ufe0f ADOPT WARNING - " + sym + " " + pos_side +
+                        " has NO stop-loss on the exchange and one could NOT be placed. "
+                        "Set an SL manually NOW.")
             else:
-                send_tg("ADOPT - " + sym + " LONG had no SL - placed a protective 5% stop at " + str(fallback_sl) + " until trailing takes over.")
-        now = time.time()
-        if tp_id is not None:
-            # Adopted LONG with a live TP bracket -> hand to Tight 2 tracker.
-            t2_open_trades["adopt-" + sym] = {
-                "symbol": sym, "side": "BUY", "entry": avg, "entry_fill": avg,
-                "sl": sl_price if sl_price else round(avg * 0.95, 6), "sl_id": sl_id,
-                "tp": tp_price, "tp_id": tp_id, "close_side": "SELL", "pos_side": "LONG",
-                "total_qty": amt,
-                "risk_dist": abs(avg - (sl_price or avg * 0.95)), "risk_usdt": T2_RISK_USDT,
-                "atr_at_entry": 0.0, "opened_ts": now,
-                "peak_r": 0.0, "be_done": False, "stop_r": None,
-                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            }
-            adopted += 1
-            lines.append(sym + " LONG -> Tight 2 (adopted SL+TP bracket)")
-        else:
-            # Adopted LONG with no exchange TP -> hand to Tight 2 tracker (bot-driven exit).
-            risk_dist = abs(avg - sl_price) if sl_price else avg * 0.05
-            t2_open_trades["adopt-" + sym] = {
-                "symbol": sym, "side": "BUY", "entry": avg, "entry_fill": avg,
-                "sl": sl_price if sl_price else round(avg * 0.95, 6), "sl_id": sl_id,
-                "tp": None, "tp_id": None, "close_side": "SELL", "pos_side": "LONG",
-                "total_qty": amt,
-                "risk_dist": risk_dist if risk_dist > 0 else avg * 0.05, "risk_usdt": T2_RISK_USDT,
-                "atr_at_entry": 0.0, "opened_ts": now,
-                "peak_r": 0.0, "be_done": False, "stop_r": None,
-                "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            }
-            adopted += 1
-            lines.append(sym + " LONG -> Tight 2 (adopted, trail-managed)")
-    print(f"[ADOPT] re-adopted {adopted} into Tight 2, {shorts} short(s) left on their SL")
+                send_tg("ADOPT - " + sym + " " + pos_side + " had no SL - placed a protective 5% stop at "
+                        + str(fallback_sl))
+
+        if not sl_price or sl_price <= 0:
+            sl_price = round(avg * (0.95 if is_long else 1.05), 6)
+        risk_dist = abs(avg - sl_price)
+        if risk_dist <= 0:
+            risk_dist = avg * 0.05
+        risk_usdt = round(risk_dist * amt, 2) or REV_RISK_USDT
+
+        # If there is no TP on the exchange, leave tp as None - rev_track_trades reconciles
+        # on the position disappearing and on the time-stop either way.
+        rev_open_trades["adopt-" + sym] = {
+            "symbol": sym, "side": side, "pos_side": pos_side, "close_side": close_side,
+            "entry": avg, "entry_fill": avg,
+            "sl": sl_price, "tp": tp_price if tp_price else None,
+            "sl_id": sl_id, "tp_id": tp_id,
+            "total_qty": amt, "risk_usdt": risk_usdt,
+            "open_ts": now, "gone_strikes": 0,
+            "label": "TIGHT 1 (adopted)", "eng_tag": "t1", "adopted": True,
+            "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+        }
+        adopted += 1
+        lines.append(sym + " " + pos_side + " qty " + str(amt) + " | SL " + str(sl_price) +
+                     (" | TP " + str(tp_price) if tp_price else " | no TP on exchange") +
+                     " -> adopted (time-stop restarts now)")
+
+    print(f"[ADOPT] re-adopted {adopted} position(s) into the Tight 1 tracker")
     if lines:
         send_tg("STARTUP RE-ADOPT\n------------------------------\n" + "\n".join(lines) +
-                "\n------------------------------\nConcurrency caps and trailing now account for these.")
+                "\n------------------------------\nConcurrency caps and the time-stop now account for these.")
 
 
 def place_sl_guarded(symbol, close_side, pos_side, sl_price, qty):
@@ -2070,10 +2089,10 @@ def handle_telegram_commands():
                     lines_s = ("Tight 3 (S/R Sweep SHORT - bear engine): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
                                " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
                                " | Pending: " + str(len(t3s_pending)) +
-                               "\nSweep: >=" + str(T3_MIN_TOUCHES) + " touches, wick>=" + str(round(T3_WICK_MIN*100)) + "%" +
+                               "\nSweep: >=" + str(T3_MIN_TOUCHES) + " touches, wick>=" + str(round(T3_WICK_MIN*100)) + "%" + " | swing_lb " + str(T3_SWING_LB) + " | vol>=$" + str(int(T3_MIN_QUOTE_VOL/1e6)) + "M" +
                                " -> MSS -> FVG limit | SL sweep-high TP " + str(T3_TP_R) + "R" +
                                "\nBTC 4d: " + (f"{_t3btc*100:+.1f}%" if _t3btc is not None else "n/a") +
-                               " (short only if <= +" + str(round(T3_BTC_MAX*100)) + "%)" +
+                               (" (gate ON: short only if <= +" + str(round(T3_BTC_MAX*100)) + "%)" if T3_BTC_GATE else " (gate OFF)") +
                                " | rf>=" + str(round(T3_RF_MIN*100,1)) + "% | risk $" + str(int(T3_RISK_USDT)) + " flat")
                     for _sym, _p in list(t3s_pending.items()):
                         lines_s += "\n[pending] " + _sym + " SHORT @ " + str(round(_p["entry"], 6))
@@ -2190,13 +2209,23 @@ T3_LEVEL_LOOKBACK   = int(os.environ.get("T3_LEVEL_LOOKBACK", 96))    # bars to 
 T3_LEVEL_TOL        = float(os.environ.get("T3_LEVEL_TOL", 0.004))    # swing-highs within 0.4% = same level
 T3_MIN_TOUCHES      = int(os.environ.get("T3_MIN_TOUCHES", 2))        # >=2 swing-highs at the level (strong S/R)
 T3_WICK_MIN         = float(os.environ.get("T3_WICK_MIN", 0.5))       # sweep upper wick >= 50% of candle range
-T3_MSS_LOOK         = int(os.environ.get("T3_MSS_LOOK", 16))          # bars after sweep to see a swing-low break
-T3_SWING_LB         = int(os.environ.get("T3_SWING_LB", 10))          # bars used to define the recent swing-low
-T3_FVG_EXPIRY       = int(os.environ.get("T3_FVG_EXPIRY", 20))        # bars for price to return into the FVG (setup expiry)
+T3_MSS_LOOK         = int(os.environ.get("T3_MSS_LOOK", 8))           # 2026-08-24: 16->8. Part of the deep-structure retune (see T3_SWING_LB).
+T3_SWING_LB         = int(os.environ.get("T3_SWING_LB", 20))          # 2026-08-24: 10->20. BIGGEST lever found: the MSS must break a 20-bar swing-low,
+                                                                      # not a 10-bar one - a real structure shift, not noise. On the untouched Mar-Jul half
+                                                                      # the old config made +$10 while this one made +$354 (30 trades/wk, win 34%).
+T3_FVG_EXPIRY       = int(os.environ.get("T3_FVG_EXPIRY", 10))        # 2026-08-24: 20->10. A stale FVG is a dead setup.
 T3_TP_R             = float(os.environ.get("T3_TP_R", 4.0))           # fixed take-profit in R
 T3_RF_MIN           = float(os.environ.get("T3_RF_MIN", 0.008))       # risk/entry floor - THE main fee fix, do not lower
-T3_SL_CAP_PCT       = float(os.environ.get("T3_SL_CAP_PCT", 0.10))    # risk/entry ceiling
-T3_BTC_MAX          = float(os.environ.get("T3_BTC_MAX", 0.03))       # bear_soft gate: short only if BTC 4d-return <= +3%
+T3_SL_CAP_PCT       = float(os.environ.get("T3_SL_CAP_PCT", 0.02))    # 2026-08-24: 0.10->0.02. The rf CEILING had never been swept; capping it at 2%
+                                                                      # lifted the untouched-half result materially. Band is now rf 0.8%-2%.
+# 2026-08-24 BTC GATE NOW OFF BY DEFAULT. The old bear_soft gate (short only when BTC
+# 4d <= +3%) existed because the WEAK structure filter lost money in bull months. With
+# T3_SWING_LB=20 that is reversed: the BTC +5%..+10% bucket became the single BEST bucket
+# (+0.343R) while deep bear (-10%..-5%) is now the weak one. Keeping the gate would cut the
+# best trades - and it was doing exactly that live (BTC 4d = +11.8%, T3 fired=0 all day).
+# Set T3_BTC_GATE=1 in Render env to switch the old gate back on without a redeploy.
+T3_BTC_GATE         = os.environ.get("T3_BTC_GATE", "0") == "1"
+T3_BTC_MAX          = float(os.environ.get("T3_BTC_MAX", 0.03))       # only used when T3_BTC_GATE=1
 T3_BTC_WINDOW       = int(os.environ.get("T3_BTC_WINDOW", 384))       # 4 days of 15m bars
 T3_ATR_LEN          = int(os.environ.get("T3_ATR_LEN", 14))
 T3_FILL_BARS        = int(os.environ.get("T3_FILL_BARS", 8))          # cancel resting limit after 8 bars (2h)
@@ -2207,7 +2236,16 @@ T3_RISK_USDT        = float(os.environ.get("T3_RISK_USDT", 3.0))      # small li
 T3_LEVERAGE         = int(os.environ.get("T3_LEVERAGE", 10))
 T3_MAX_CONCURRENT   = int(os.environ.get("T3_MAX_CONCURRENT", 5))     # own slot cap, separate from swing (T1/T2)
 T3_MAX_MARGIN_USDT  = float(os.environ.get("T3_MAX_MARGIN_USDT", 40))
-T3_MIN_QUOTE_VOL    = float(os.environ.get("T3_MIN_QUOTE_VOL", 2_000_000))
+# 2026-08-24 LIQUIDITY FLOOR 2M -> 10M. This is the slippage decision, and it is the one
+# that actually matters. Backtest with a realistic execution model (resting-limit entry =
+# maker, but STOP-MARKET SL and time-stop exits slipping against us):
+#   $2M universe : 30 trades/wk, 8mo PnL -$40 at 20bps, -$1210 at 50bps, -$3159 at 100bps
+#   $10M universe: 2.2 trades/wk, 8mo PnL +$144 at 20bps, +$65 at 50bps, -$66 at 100bps
+# Live slippage on thin coins has hit ~100bps (ONG, VELVET), so the $2M version is a losing
+# engine in practice. Far fewer trades is the price of surviving the stop-market exit.
+# HONEST: even the $10M corner is only ~n80 trades over 8 months - a plausible edge, not a
+# proven one. Keep T3_RISK_USDT small.
+T3_MIN_QUOTE_VOL    = float(os.environ.get("T3_MIN_QUOTE_VOL", 10_000_000))
 T3_EXCLUDE_TOP_N    = int(os.environ.get("T3_EXCLUDE_TOP_N", 20))
 T3_MAX_SYMBOLS      = int(os.environ.get("T3_MAX_SYMBOLS", 600))
 T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 300))
@@ -2359,8 +2397,8 @@ def t3s_check_signal(symbol, btc_ret):
         if (n - 1) - mss > T3_FVG_EXPIRY:
             continue
 
-        # BTC bear_soft gate
-        if btc_ret is not None and btc_ret > T3_BTC_MAX:
+        # BTC gate - OFF by default since 2026-08-24 (see T3_BTC_GATE above)
+        if T3_BTC_GATE and btc_ret is not None and btc_ret > T3_BTC_MAX:
             return None
 
         tp = entry - risk * T3_TP_R
@@ -2562,7 +2600,12 @@ def t3_scalp_loop():
         print("[T3] disabled by env T3_ENGINE_ENABLED=0 - loop idle")
         while True:
             time.sleep(3600)
-    scan_list = sorted(BACKTESTED_COINS) if WHITELIST_ONLY else None
+    # 2026-08-24: the old code scanned the raw BACKTESTED_COINS list whenever WHITELIST_ONLY
+    # was on, which BYPASSED get_liquid_symbols entirely - so T3 had no liquidity floor at all
+    # (that is why it scanned 249 coins) and it kept requesting de-listed symbols such as
+    # VANRY-USDT, spamming [CANDLES ERROR] every cycle. Now the universe always comes from
+    # get_liquid_symbols(), which applies the whitelist gate itself, enforces T3_MIN_QUOTE_VOL,
+    # drops the top-N by volume, and can only return symbols the exchange currently lists.
     while True:
         try:
             track_t3_pending()
@@ -2577,13 +2620,10 @@ def t3_scalp_loop():
             if open_slots <= 0:
                 time.sleep(T3_SCAN_SECONDS)
                 continue
-            if scan_list is not None:
-                universe = scan_list
-            else:
-                universe = get_liquid_symbols(
-                    get_futures_symbols() or [], min_quote_vol=T3_MIN_QUOTE_VOL,
-                    max_n=T3_MAX_SYMBOLS, exclude_top_n=T3_EXCLUDE_TOP_N,
-                )
+            universe = get_liquid_symbols(
+                get_futures_symbols() or [], min_quote_vol=T3_MIN_QUOTE_VOL,
+                max_n=T3_MAX_SYMBOLS, exclude_top_n=T3_EXCLUDE_TOP_N,
+            )
             btc_ret = t3_btc_regime()
             scanned = fired = 0
             for sym in universe:

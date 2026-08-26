@@ -566,6 +566,67 @@ def send_journal(msg):
         send_tg(msg, chat_id=TG_JOURNAL_ID)
 
 
+def resolve_exit(trade, side, entry_fill):
+    """2026-08-25 JOURNAL FIX. The old code guessed the outcome by comparing the CURRENT
+    price (fetched minutes after the position vanished) against tp/sl, then reported a
+    THEORETICAL pnl (risk x tp_r on a TP, -risk on an SL). Three consequences:
+      - an SL that the price later retraced past was logged as 'closed'
+      - every TP logged the same idealised figure regardless of the real fill
+      - unrecognised exits logged pnl 0, so real losses vanished from the totals
+    Now we ask the exchange for the actual average fill of the SL and TP orders and
+    compute pnl from that. Returns (result, pnl, exit_r, exit_px).
+    """
+    sl_px = tp_px = 0.0
+    try:
+        if trade.get("sl_id") and trade["sl_id"] != "N/A":
+            sl_px = get_fill_price(trade["sl_id"], trade["symbol"], 0.0)
+    except Exception:
+        pass
+    try:
+        if trade.get("tp_id") and trade["tp_id"] != "N/A":
+            tp_px = get_fill_price(trade["tp_id"], trade["symbol"], 0.0)
+    except Exception:
+        pass
+
+    result, exit_px = "closed", 0.0
+    if tp_px > 0 and sl_px > 0:
+        # both report a fill: trust whichever is closer to the recorded target
+        d_tp = abs(tp_px - float(trade.get("tp", tp_px)))
+        d_sl = abs(sl_px - float(trade.get("sl", sl_px)))
+        result, exit_px = ("TP", tp_px) if d_tp <= d_sl else ("SL", sl_px)
+    elif tp_px > 0:
+        result, exit_px = "TP", tp_px
+    elif sl_px > 0:
+        result, exit_px = "SL", sl_px
+
+    if exit_px <= 0:
+        # exchange gave us nothing (manual close, liquidation, API hiccup) - fall back to
+        # the last traded price, but keep the label honest instead of pretending it is 0.
+        try:
+            exit_px = get_current_price(trade["symbol"]) or 0.0
+        except Exception:
+            exit_px = 0.0
+        result = "closed"
+
+    qty = 0.0
+    try:
+        qty = float(trade.get("qty", 0) or 0)
+    except Exception:
+        qty = 0.0
+
+    pnl, exit_r = 0.0, 0.0
+    if exit_px > 0 and entry_fill and entry_fill > 0:
+        move = (exit_px - entry_fill) if side == "BUY" else (entry_fill - exit_px)
+        if qty > 0:
+            pnl = move * qty
+        rd = abs(entry_fill - float(trade.get("sl", 0) or 0))
+        if rd > 0:
+            exit_r = round(move / rd, 2)
+            if qty <= 0:
+                pnl = exit_r * float(trade.get("risk_usdt", 0) or 0)
+    return result, round(pnl, 2), exit_r, exit_px
+
+
 def journal_closed_trade(trade):
     """Single consolidated journal entry per closed trade - kept deliberately simple,
     no intermediate messages (no TP1-banked / cooldown-triggered spam)."""
@@ -579,6 +640,7 @@ def journal_closed_trade(trade):
         "------------------------------\n"
         "Side  : " + trade["side"] + "\nEntry : " + str(trade["entry"]) + "\n"
         "Result: " + trade.get("result", "?") + "\n"
+        + ("Exit  : " + str(trade["exit_px"]) + "\n" if trade.get("exit_px") else "")
         + r_line +
         "PnL   : " + sign + str(trade.get("pnl", 0)) + " USDT\n"
         "------------------------------\nNiti Journal"
@@ -711,6 +773,22 @@ def get_available_margin():
             bal = next((b for b in bal if b.get("asset") == "USDT"), bal[0] if bal else {})
         avail = float(bal.get("availableMargin", 0) or 0)
         return avail if avail > 0 else None
+    except Exception:
+        return None
+
+
+def get_balance():
+    """Total USDT equity (available + margin already committed). Used for the shared
+    margin budget so the cap does not shrink as trades open. None on failure."""
+    try:
+        params = build_signed_params({})
+        url = BASE_URL + "/openApi/swap/v2/user/balance"
+        r = requests.get(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        bal = r.get("data", {}).get("balance", {})
+        if isinstance(bal, list):
+            bal = next((b for b in bal if b.get("asset") == "USDT"), bal[0] if bal else {})
+        eq = float(bal.get("equity", 0) or bal.get("balance", 0) or 0)
+        return eq if eq > 0 else None
     except Exception:
         return None
 
@@ -2202,7 +2280,7 @@ def handle_telegram_commands():
 # Commands: /t3_start /t3_stop /t3_status  (globals named t3s_* / T3_* so the
 #   existing /status + command wiring is unchanged).
 # ============================================================================
-T3_ENGINE_ENABLED   = os.environ.get("T3_ENGINE_ENABLED", "1") == "1"   # master build flag
+T3_ENGINE_ENABLED   = os.environ.get("T3_ENGINE_ENABLED", "0") == "1"   # master build flag
 t3_scalp_auto_enabled = AUTO_RESUME_ON_START   # runtime on/off via /t3_start /t3_stop (name kept for /status wiring)
 
 T3_LEVEL_LOOKBACK   = int(os.environ.get("T3_LEVEL_LOOKBACK", 96))    # bars to search for the S/R cluster (~24h)
@@ -2428,6 +2506,9 @@ def place_t3_limit(symbol, entry, sl, tp):
         if avail is not None and avail < required_margin * 1.05:
             print(f"[T3 MARGIN SKIP] {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
             return "MARGIN_SKIP"
+        if not rev_margin_allows(required_margin, get_balance()):
+            print(f"[T3 BUDGET SKIP] {symbol} need ~${required_margin:.2f}")
+            return "MARGIN_SKIP"
         url = BASE_URL + "/openApi/swap/v2/trade/order"
         params = build_signed_params({
             "symbol": symbol, "side": side, "positionSide": pos_side,
@@ -2565,17 +2646,10 @@ def track_t3_scalp_trades():
             print(f"[T3] {sym} looks gone (strike 1/2) - waiting for confirmation")
             continue
         ef = t.get("entry_fill", t.get("entry", 0))
-        result, pnl, exit_r = "closed", 0, 0
-        try:
-            px = get_current_price(sym)
-            if px and ef:
-                result = "TP" if px <= t["tp"] * 1.001 else ("SL" if px >= t["sl"] * 0.999 else "closed")
-        except Exception:
-            pass
-        if result == "TP":
-            pnl = T3_RISK_USDT * T3_TP_R; exit_r = T3_TP_R
-        elif result == "SL":
-            pnl = -T3_RISK_USDT; exit_r = -1
+        t.setdefault("symbol", sym)
+        t.setdefault("risk_usdt", T3_RISK_USDT)
+        result, pnl, exit_r, exit_px = resolve_exit(t, "SELL", ef)
+        if result == "SL":
             t3s_loss_until[sym] = now + T3_LOSS_COOLDOWN_S
         for k in ("sl_id", "tp_id"):
             if t.get(k) and t[k] != "N/A":
@@ -2589,6 +2663,7 @@ def track_t3_scalp_trades():
         journal_closed_trade({
             "label": "TIGHT 3", "symbol": sym, "side": "SHORT", "entry": ef,
             "result": result, "pnl": round(pnl, 2), "exit_r": exit_r,
+            "exit_px": round(exit_px, 8) if exit_px else 0,
         })
         t3s_last_fire[sym] = now
         t3s_open_trades.pop(oid, None)
@@ -2713,24 +2788,59 @@ REV_ENGINE_ENABLED   = os.environ.get("REV_ENGINE_ENABLED", "1") == "1"
 rev_auto_enabled     = AUTO_RESUME_ON_START   # /rev_start /rev_stop
 
 REV_RET_WINDOW       = int(os.environ.get("REV_RET_WINDOW", 96))      # 96 x 15m = 24h
-REV_RET_THR          = float(os.environ.get("REV_RET_THR", 0.08))     # >= 8% move over that window
+REV_RET_THR          = float(os.environ.get("REV_RET_THR", 0.06))     # >= 6% move over that window
 REV_RANGE_WINDOW     = int(os.environ.get("REV_RANGE_WINDOW", 96))    # range the coin must be at the edge of
 REV_VOL_MULT         = float(os.environ.get("REV_VOL_MULT", 1.3))     # volume >= 1.3x 96-bar median
 REV_ATR_LEN          = int(os.environ.get("REV_ATR_LEN", 14))
-REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 1.5))
-REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 4.0))
+REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 2.0))
+REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 2.5))
 REV_SHORT_SL_ATR     = float(os.environ.get("REV_SHORT_SL_ATR", 2.0))
-REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 3.0))
+REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 2.5))
 REV_SL_CAP_PCT       = float(os.environ.get("REV_SL_CAP_PCT", 0.06))  # skip if SL > 6% away
 REV_BTC_WINDOW       = int(os.environ.get("REV_BTC_WINDOW", 384))     # 384 x 15m = 4 days
 REV_BTC_THR          = float(os.environ.get("REV_BTC_THR", 0.12))     # regime gate at +/-12%
 REV_HOLD_SECONDS     = int(os.environ.get("REV_HOLD_SECONDS", 24 * 3600))
-REV_COOLDOWN_SECONDS = int(os.environ.get("REV_COOLDOWN_SECONDS", 24 * 3600))
+REV_COOLDOWN_SECONDS = int(os.environ.get("REV_COOLDOWN_SECONDS", 6 * 3600))
 REV_FILL_BARS        = int(os.environ.get("REV_FILL_BARS", 4))        # cancel the resting limit after 4 bars (1h)
 REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 5.0))
 REV_LEVERAGE         = int(os.environ.get("REV_LEVERAGE", 10))
-REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 5))
+REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 20))
 REV_MAX_MARGIN_USDT  = float(os.environ.get("REV_MAX_MARGIN_USDT", 40))
+
+# ---- 2026-08-25 SHARED MARGIN BUDGET -------------------------------------------------
+# Bug: T1 (cap 20) + T2 (cap 20) + T3 each hold their own $40 cap, so total demand was
+# $1,000+ on a far smaller account. Worse, it was ASYMMETRIC: qty = risk/risk_dist, and a
+# LONG's SL was tighter than a SHORT's, so a long needed ~33% more margin for the same $5
+# risk and MARGIN_SKIP culled longs first. That is why Faisal saw only shorts opening.
+# Now every engine draws from ONE budget, expressed as a fraction of live balance.
+REV_MARGIN_BUDGET_PCT = float(os.environ.get("REV_MARGIN_BUDGET_PCT", 0.60))
+REV_MARGIN_MIN_FREE   = float(os.environ.get("REV_MARGIN_MIN_FREE", 5.0))
+
+
+def rev_margin_in_use():
+    """Margin currently committed across every engine's open + pending trades."""
+    total = 0.0
+    for book in (rev_open_trades, rev_pending, rev2_open_trades, rev2_pending):
+        for t in list(book.values()):
+            try:
+                total += float(t.get("margin_used", 0) or 0)
+            except Exception:
+                pass
+    try:
+        for t in list(t3s_open_trades.values()):
+            total += float(t.get("margin_used", 0) or 0)
+    except Exception:
+        pass
+    return total
+
+
+def rev_margin_allows(required, balance):
+    """True if `required` USDT of margin fits inside the SHARED budget."""
+    if balance is None or balance <= 0:
+        return True
+    budget = balance * REV_MARGIN_BUDGET_PCT
+    return (rev_margin_in_use() + required) <= budget and (balance - required) >= REV_MARGIN_MIN_FREE
+# --------------------------------------------------------------------------------------
 REV_MIN_QUOTE_VOL    = float(os.environ.get("REV_MIN_QUOTE_VOL", 2_000_000))  # DO NOT RAISE - see header
 REV_EXCLUDE_TOP_N    = int(os.environ.get("REV_EXCLUDE_TOP_N", 20))
 REV_MAX_SYMBOLS      = int(os.environ.get("REV_MAX_SYMBOLS", 600))
@@ -2756,16 +2866,24 @@ REV_T1 = {
     "open": rev_open_trades, "pending": rev_pending, "last_fire": rev_last_fire,
 }
 
-# ---- Tight 2 = ceiling 24h-reversion (2026-08-20). SAME engine, tuned to its ceiling:
-#      ret>=10%, vol band 1.3-3.0x, ATR%<3%, cap 20. Backtest 8.3mo: ~9.9 trades/day,
-#      meanR +0.131, win 33%, +$1631 flat $5, OOS +0.177, holdout A+0.110/B+0.152.
-#      REPLACES the old block-based Tight 2 (SHORT resistance-block), now removed. ----
+# ---- Tight 2 = SCALPER 24h-reversion (2026-08-25 rebuild). SAME engine as T1, but a
+#      1:1 RR that exits fast. ret>=8%, NO vol ceiling, NO ATR% ceiling, SL 2.0xATR,
+#      TP 1.0R, cap 20, cd 6h. Strict-sim backtest: 8mo 1.9 trades/day, win 60%, +$282;
+#      Aug OOS 1.7/day, win 58%, +$22.
+#      WHY THE CEILING FILTERS WENT: vol_max 3.0x cost money (+$304 -> +$187) and the
+#      ATR% filter changed nothing at all (identical results at 0.00 and 0.03).
+#      WHY 1:1 HERE AND 1:2.5 ON T1: T2 is the BULL-PROOF leg. Monthly PnL vs BTC shows
+#      T2 positive in 9 of 10 months with win rate never leaving 54-67% regardless of
+#      direction (Aug 2026, BTC +25.4%: T1 -$2, T2 +$27). T1's edge is its SHORT leg and
+#      that is bear-dependent; a near TP exits before the trend can invert.
+#      NOTE: with T1 at ret 6%, T2's signals are ~99% a subset of T1's. Accepted -
+#      splitting them (ret band / liquidity / side) was measured and all three are worse. ----
 REV2_ENGINE_ENABLED   = os.environ.get("REV2_ENGINE_ENABLED", "1") == "1"
 rev2_auto_enabled     = AUTO_RESUME_ON_START   # /t2_start /t2_stop
-REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.10))
+REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.08))
 REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.3))
-REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 3.0))
-REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.03))
+REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 0.0))
+REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.0))
 REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 20))
 REV2_RISK_USDT        = float(os.environ.get("REV2_RISK_USDT", 5.0))
 REV2_MAX_MARGIN_USDT  = float(os.environ.get("REV2_MAX_MARGIN_USDT", 40))
@@ -2775,20 +2893,28 @@ rev2_open_trades = {}
 rev2_pending     = {}
 rev2_last_fire   = {}
 
+REV2_LONG_SL_ATR      = float(os.environ.get("REV2_LONG_SL_ATR", 2.0))
+REV2_SHORT_SL_ATR     = float(os.environ.get("REV2_SHORT_SL_ATR", 2.0))
+REV2_LONG_TP_R        = float(os.environ.get("REV2_LONG_TP_R", 1.0))
+REV2_SHORT_TP_R       = float(os.environ.get("REV2_SHORT_TP_R", 1.0))
+REV2_COOLDOWN_SECONDS = int(os.environ.get("REV2_COOLDOWN_SECONDS", 6 * 3600))
+
 REV_T2 = {
     "name": "TIGHT 2", "tag": "t2",
     "ret_thr": REV2_RET_THR, "vol_mult": REV2_VOL_MULT, "vol_mult_max": REV2_VOL_MULT_MAX,
     "atrp_max": REV2_ATRP_MAX,
-    "long_sl_atr": REV_LONG_SL_ATR, "long_tp_r": REV_LONG_TP_R,
-    "short_sl_atr": REV_SHORT_SL_ATR, "short_tp_r": REV_SHORT_TP_R,
+    "long_sl_atr": REV2_LONG_SL_ATR, "long_tp_r": REV2_LONG_TP_R,
+    "short_sl_atr": REV2_SHORT_SL_ATR, "short_tp_r": REV2_SHORT_TP_R,
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV2_RISK_USDT, "leverage": REV_LEVERAGE,
     "max_concurrent": REV2_MAX_CONCURRENT, "max_margin": REV2_MAX_MARGIN_USDT,
+    "cooldown_s": REV2_COOLDOWN_SECONDS,
     "open": rev2_open_trades, "pending": rev2_pending, "last_fire": rev2_last_fire,
 }
 
 
 def rev_in_cooldown(symbol, eng):
-    return (time.time() - eng["last_fire"].get(symbol, 0)) < REV_COOLDOWN_SECONDS
+    cd = eng.get("cooldown_s", REV_COOLDOWN_SECONDS)
+    return (time.time() - eng["last_fire"].get(symbol, 0)) < cd
 
 
 import threading as _threading
@@ -2857,18 +2983,21 @@ def rev_check_signal(symbol, btc_ret, eng):
         return None
     ret = px / past - 1.0
 
-    # 2026-08-20 BUGFIX #2: backtest computed the 96-bar range from CLOSES
-    # (rolling max/min of close price), not from wicks. Using highs/lows here made
-    # pos>=0.999 even harder to reach (a bar's own upper wick pushes win_hi above its
-    # close), stacking with bug #1 to keep fired=0 even after that fix. Match backtest.
+    # 2026-08-25 BUGFIX #2 REVERSED: the 2026-08-20 note below was WRONG. Reproduction
+    # check settles it - the filed backtest (12.5 trades/wk) only reproduces with the
+    # HIGH/LOW range (12.0/wk); the CLOSE range gives 71/wk. A close-range is far
+    # narrower so pos>=0.999 fires ~6x too often and the extra 5/6 have no edge.
+    # Measured 8mo @20bps cap5: close = 71.0/wk meanR -0.010 -$132
+    #                           high/low = 12.0/wk meanR +0.151 win 35% +$312
+    # August 2026 week 33 alone: close 123 trades -$170 vs high/low 14 trades +$37.
     # 2026-08-20 BUGFIX #3: window sizing now matches backtest exactly.
     # Backtest used rolling(97) for the range (97 bars INCLUDING current) and a
     # volume median SHIFTED by 1 (the prior 96 bars, EXCLUDING current). Live was
     # off-by-one on the range window and included current volume in its own median
     # (a big current-bar volume was inflating the very median it's compared against,
     # making vr>=1.3 harder to reach). Both now match the backtest precisely.
-    win_hi = max(closes[-(REV_RANGE_WINDOW + 1):])
-    win_lo = min(closes[-(REV_RANGE_WINDOW + 1):])
+    win_hi = max(highs[-(REV_RANGE_WINDOW + 1):])
+    win_lo = min(lows[-(REV_RANGE_WINDOW + 1):])
     if win_hi <= win_lo:
         return None
     pos = (px - win_lo) / (win_hi - win_lo)
@@ -2956,6 +3085,12 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         if avail is not None and avail < required_margin * 1.05:
             print(f"[REV MARGIN SKIP] {name} {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
             return "MARGIN_SKIP"
+        # 2026-08-25 shared budget: stops one engine (T2 cap 20) eating everything and
+        # starving the others - and removes the long/short asymmetry that killed longs.
+        if not rev_margin_allows(required_margin, get_balance()):
+            print(f"[REV BUDGET SKIP] {name} {symbol} need ~${required_margin:.2f}, "
+                  f"in use ${rev_margin_in_use():.2f}")
+            return "MARGIN_SKIP"
 
         url = BASE_URL + "/openApi/swap/v2/trade/order"
         params = build_signed_params({
@@ -2973,6 +3108,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
             "order_id": oid, "symbol": symbol, "side": side, "pos_side": pos_side,
             "close_side": close_side, "entry": entry, "sl": sl, "tp": tp,
             "qty": qty, "placed_ts": time.time(),
+            "margin_used": required_margin, "risk_usdt": eng["risk_usdt"],
         }
         send_tg(
             f"\u23f3 {name} {symbol} {pos_side} LIMIT RESTING\n"
@@ -3025,7 +3161,8 @@ def rev_track_pending(eng):
             eng["open"][p["order_id"]] = {
                 "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
                 "close_side": p["close_side"], "entry": p["entry"], "entry_fill": fill,
-                "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "risk_usdt": eng["risk_usdt"],
+                "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "qty": p["qty"],
+                "risk_usdt": eng["risk_usdt"], "margin_used": p.get("margin_used", 0),
                 "sl_id": sl_id, "tp_id": tp_id, "open_ts": now, "gone_strikes": 0,
                 "label": name, "eng_tag": eng["tag"],
             }
@@ -3108,22 +3245,9 @@ def rev_track_trades(eng):
             continue
 
         ef = t.get("entry_fill", t.get("entry", 0))
-        result, pnl, exit_r = "closed", 0, 0
-        try:
-            px = get_current_price(sym)
-            if px and ef:
-                if t["side"] == "BUY":
-                    result = "TP" if px >= t["tp"] * 0.999 else ("SL" if px <= t["sl"] * 1.001 else "closed")
-                else:
-                    result = "TP" if px <= t["tp"] * 1.001 else ("SL" if px >= t["sl"] * 0.999 else "closed")
-        except Exception:
-            pass
-        if result == "TP":
-            pnl = eng["risk_usdt"] * (eng["long_tp_r"] if t["side"] == "BUY" else eng["short_tp_r"])
-            exit_r = eng["long_tp_r"] if t["side"] == "BUY" else eng["short_tp_r"]
-        elif result == "SL":
-            pnl = -eng["risk_usdt"]
-            exit_r = -1
+        t.setdefault("symbol", sym)
+        t.setdefault("risk_usdt", eng["risk_usdt"])
+        result, pnl, exit_r, exit_px = resolve_exit(t, t["side"], ef)
         for k in ("sl_id", "tp_id"):
             if t.get(k) and t[k] != "N/A":
                 try:
@@ -3136,6 +3260,7 @@ def rev_track_trades(eng):
         journal_closed_trade({
             "label": name, "symbol": sym, "side": t["pos_side"], "entry": ef,
             "result": result, "pnl": round(pnl, 2), "exit_r": exit_r,
+            "exit_px": round(exit_px, 8) if exit_px else 0,
         })
         eng["last_fire"][sym] = now
         trades.pop(oid, None)

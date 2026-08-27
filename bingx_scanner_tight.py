@@ -2172,7 +2172,7 @@ def handle_telegram_commands():
                                str(round(T3B_EXT_MIN*100)) + "-" + str(round(T3B_EXT_MAX*100)) + "%" +
                                " | retest <=" + str(T3B_RETEST_MAX) + " bars, vol >= break vol" +
                                "\nSL " + str(T3B_SL_ATR) + "xATR | TP " + str(T3B_TP_R) + "R | ATR%>=" +
-                               str(round(T3B_ATRP_MIN*100, 1)) + "% | vol>=$" + str(int(T3_MIN_QUOTE_VOL/1e6)) + "M" +
+                               str(round(T3B_ATRP_MIN*100, 1)) + "% | vol>=$" + str(int(T3B_MIN_QUOTE_VOL/1e6)) + "M" +
                                " | risk $" + str(int(T3_RISK_USDT)) + " flat" +
                                "\nCached levels: " + str(sum(len(x) for x in t3b_levels.values())) +
                                " on " + str(len(t3b_levels)) + " coins")
@@ -2347,7 +2347,12 @@ T3_RISK_USDT        = float(os.environ.get("T3_RISK_USDT", 3.0))      # small un
 T3_LEVERAGE         = int(os.environ.get("T3_LEVERAGE", 10))
 T3_MAX_CONCURRENT   = int(os.environ.get("T3_MAX_CONCURRENT", 5))     # own slot cap, separate from swing (T1/T2)
 T3_MAX_MARGIN_USDT  = float(os.environ.get("T3_MAX_MARGIN_USDT", 40))
-T3_MIN_QUOTE_VOL    = float(os.environ.get("T3_MIN_QUOTE_VOL", 2_000_000))   # backtest floor was $2M
+T3B_MIN_QUOTE_VOL   = 10_000_000   # 2026-08-27: $2M -> $10M. This is the fix for coin
+                                   # concentration, which was the engine's real weakness:
+                                   # at $2M the top-3 coins were 41% of PnL and dropping
+                                   # them left TEST at +0.035 (fragile); at $10M top-3 is
+                                   # 33% and ex-top-3 TEST is +0.141 (solid). $30M breaks
+                                   # it again (top-3 85%), so do not raise further.
 T3_EXCLUDE_TOP_N    = int(os.environ.get("T3_EXCLUDE_TOP_N", 20))
 T3_MAX_SYMBOLS      = int(os.environ.get("T3_MAX_SYMBOLS", 600))
 T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 300))
@@ -2569,6 +2574,12 @@ def t3b_check_signal(symbol):
             continue
 
         side = "LONG" if is_res else "SHORT"
+        # ORDER-FLOW GATE (continuation): the break must be backed by aggressors on
+        # the break side. Flow opposing a break is a measured loser (-0.160), so this
+        # one SKIPS rather than down-sizes.
+        ok, _flow, _cov = flow_allows(symbol, side, False, label=" TIGHT 3")
+        if not ok:
+            continue
         entry = px
         dist = T3B_SL_ATR * atr
         sl = entry - dist if is_res else entry + dist
@@ -2687,6 +2698,10 @@ def track_t3_pending():
             t3s_last_fire[sym] = now
             t3s_pending.pop(sym, None)
             slip = abs(fill - p["entry"]) / p["entry"] * 100 if p["entry"] else 0
+            _fv = p.get("flow"); _fc = p.get("flow_cover", 0)
+            print(f"[FLOW LOG] {sym} {p.get('dir','?')} flow="
+                  + ("n/a" if _fv is None else f"{_fv:+.3f}")
+                  + f" covered={int(_fc or 0)}s")
             send_tg(
                 f"\u2705 TIGHT 3 {sym} {d} FILLED (trade executed)\n"
                 f"Entry: {fill} (limit {round(p['entry'], 6)}, slip {slip:.2f}%)\n"
@@ -2801,7 +2816,7 @@ def t3_scalp_loop():
                 time.sleep(T3_SCAN_SECONDS)
                 continue
             universe = get_liquid_symbols(
-                get_futures_symbols() or [], min_quote_vol=T3_MIN_QUOTE_VOL,
+                get_futures_symbols() or [], min_quote_vol=T3B_MIN_QUOTE_VOL,
                 max_n=T3_MAX_SYMBOLS, exclude_top_n=T3_EXCLUDE_TOP_N,
             )
             scanned = fired = 0
@@ -2894,7 +2909,12 @@ rev_auto_enabled     = AUTO_RESUME_ON_START   # /rev_start /rev_stop
 REV_RET_WINDOW       = int(os.environ.get("REV_RET_WINDOW", 96))      # 96 x 15m = 24h
 REV_RET_THR          = float(os.environ.get("REV_RET_THR", 0.06))     # >= 6% move over that window
 REV_RANGE_WINDOW     = int(os.environ.get("REV_RANGE_WINDOW", 96))    # range the coin must be at the edge of
-REV_VOL_MULT         = float(os.environ.get("REV_VOL_MULT", 1.3))     # volume >= 1.3x 96-bar median
+REV_VOL_MULT         = 2.0   # 2026-08-27: 1.3 -> 2.0. With the flow gate on, the
+                             # full 420-config grid put 2.0x at meanR +0.263 vs +0.055
+                             # for 1.3x, and ex-top-3-coin TEST +0.316 vs +0.057.
+                             # Costs trades (39.5 -> 5.7/wk) and that is accepted.
+                             # IF LIVE TRADES ARE TOO FEW, this is the first lever
+                             # to move back to 1.3 (8.3/wk, +$709, still robust).     # volume >= 1.3x 96-bar median
 REV_ATR_LEN          = int(os.environ.get("REV_ATR_LEN", 14))
 REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 2.0))
 REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 2.5))
@@ -2903,7 +2923,8 @@ REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 2.5))
 REV_SL_CAP_PCT       = float(os.environ.get("REV_SL_CAP_PCT", 0.06))  # skip if SL > 6% away
 REV_BTC_WINDOW       = int(os.environ.get("REV_BTC_WINDOW", 384))     # 384 x 15m = 4 days
 REV_BTC_THR          = float(os.environ.get("REV_BTC_THR", 0.12))     # regime gate at +/-12%
-REV_HOLD_SECONDS     = int(os.environ.get("REV_HOLD_SECONDS", 24 * 3600))
+REV_HOLD_SECONDS     = 48 * 3600   # 2026-08-27: 24h -> 48h. Same grid; the winner
+                                   # at every robust setting held 48h. Shared by T1/T2.
 REV_COOLDOWN_SECONDS = int(os.environ.get("REV_COOLDOWN_SECONDS", 6 * 3600))
 REV_FILL_BARS        = int(os.environ.get("REV_FILL_BARS", 4))        # cancel the resting limit after 4 bars (1h)
 REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 5.0))
@@ -2999,8 +3020,11 @@ rev2_last_fire   = {}
 
 REV2_LONG_SL_ATR      = float(os.environ.get("REV2_LONG_SL_ATR", 2.0))
 REV2_SHORT_SL_ATR     = float(os.environ.get("REV2_SHORT_SL_ATR", 2.0))
-REV2_LONG_TP_R        = float(os.environ.get("REV2_LONG_TP_R", 1.0))
-REV2_SHORT_TP_R       = float(os.environ.get("REV2_SHORT_TP_R", 1.0))
+REV2_LONG_TP_R        = 1.5   # 2026-08-27: 1.0 -> 1.5. Not for the headline PnL but
+                              # for concentration: at TP 1.0R the top-3 coins were 84%
+                              # of all PnL (i.e. everything else lost); at 1.5R that
+                              # falls to 23%. meanR +0.024 -> +0.169, PnL +$142 -> +$438.
+REV2_SHORT_TP_R       = 1.5   # see REV2_LONG_TP_R
 REV2_COOLDOWN_SECONDS = int(os.environ.get("REV2_COOLDOWN_SECONDS", 6 * 3600))
 
 REV_T2 = {
@@ -3064,6 +3088,135 @@ def rev_btc_regime():
     except Exception as e:
         print(f"[REV BTC] {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# ORDER-FLOW GATE  (2026-08-27)
+#
+# WHAT IT MEASURES. Over the last hour, how much volume hit the ASK (aggressive
+# buying) versus the BID (aggressive selling). BingX's public trades endpoint
+# marks each print with isBuyerMaker: True means the buyer was the maker, so the
+# SELLER was the aggressor. flow = (buy_vol - sell_vol) / total, in [-1, +1].
+# Only the SIGN is used - coin-normalising it (z-score vs the coin's own 30d
+# flow) was measured and is WORSE (+0.111 vs +0.176).
+#
+# WHY IT HELPS, AND WHY THE DIRECTION DIFFERS PER ENGINE.
+#   T1 / T2 are REVERSION bets: we want the flow to OPPOSE the move. Price up
+#     6-8% but sellers are the aggressors = the rally is being distributed into,
+#     so the short is good. Flow agreeing = near-zero edge (+0.026, TRAIN -0.014).
+#   T3 is a CONTINUATION bet: we want the flow to CONFIRM the break. Flow
+#     opposing the break is a real loser (-0.160), not just a weak trade.
+# The anti-condition failing on all three engines is why this is believed to be
+# a real effect rather than a fitted one.
+#
+# MEASURED (Binance 12mo Aug2025-Jul2026, 220-225 coins, 20bps, flat $5,
+# maker limit entry, strict sim - flow came from taker-buy volume in the klines):
+#   T1  +0.057 -> +0.263 meanR | 5.7 trades/wk | +$778 | monthly 9/12
+#   T2  +0.021 -> +0.169 meanR | 5.0 trades/wk | +$438 | monthly 9/12
+#   T3  +0.056 -> +0.186 meanR | 4.6 trades/wk | +$222 | monthly 8/12
+# SKIPPING the bad trades beat down-SIZING them ($7 good/$3 bad) on every
+# engine. Do not re-introduce sizing.
+#
+# WINDOW IS NARROW - 1 HOUR. Measured on T1: 15m +0.058 | 30m +0.055 |
+# 1h +0.147 | 2h -0.032 | 24h +0.064. Do not drift off 1h.
+#
+# FAIL-OPEN BY DESIGN. The backtest used Binance's complete per-bar volume; live
+# we get BingX's recent-trades list, which covers a different span per coin. If
+# the call fails, or the trades returned span less than FLOW_MIN_COVER_S, we
+# return None and the caller TAKES the trade (today's behaviour). The gate can
+# only ever remove trades it is confident about. Every fill logs the flow value
+# and the seconds covered so the live good/bad split can be checked after 3-4
+# weeks - if coverage is short on most coins, turn the gate off.
+# ---------------------------------------------------------------------------
+FLOW_WINDOW_S    = 3600     # the measured-optimal 1h window
+FLOW_MIN_COVER_S = 1800     # need >=30min of real trades or we do not judge
+FLOW_MIN_TRADES  = 40
+FLOW_TRADE_LIMIT = 500      # BingX max per call
+_flow_cache = {}            # symbol -> (unix_ts, flow, covered_seconds)
+
+
+def get_flow(symbol):
+    """Return (flow, covered_seconds) or (None, 0) if we cannot judge.
+    Cached for one 15m bar so a scan pass costs at most one call per symbol."""
+    now = time.time()
+    hit = _flow_cache.get(symbol)
+    if hit and now - hit[0] < 900:
+        return hit[1], hit[2]
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/trades"
+        r = requests.get(url, params={"symbol": symbol, "limit": FLOW_TRADE_LIMIT},
+                         timeout=8).json()
+        data = r.get("data") or []
+        if not isinstance(data, list) or len(data) < FLOW_MIN_TRADES:
+            _flow_cache[symbol] = (now, None, 0)
+            return None, 0
+        cutoff_ms = (now - FLOW_WINDOW_S) * 1000
+        buy = sell = 0.0
+        oldest = None
+        newest = None
+        for t in data:
+            try:
+                ts_ms = float(t.get("time") or t.get("T") or 0)
+                qty   = float(t.get("qty") or t.get("q") or 0)
+                price = float(t.get("price") or t.get("p") or 0)
+            except Exception:
+                continue
+            if qty <= 0 or price <= 0 or ts_ms <= 0:
+                continue
+            if ts_ms < cutoff_ms:
+                continue
+            notional = qty * price
+            maker = t.get("buyerMaker")
+            if maker is None:
+                maker = t.get("isBuyerMaker")
+            if maker is None:
+                maker = t.get("m")
+            # buyerMaker True  -> the SELLER crossed the spread -> aggressive sell
+            if maker in (True, "true", "True", 1, "1"):
+                sell += notional
+            else:
+                buy += notional
+            oldest = ts_ms if oldest is None else min(oldest, ts_ms)
+            newest = ts_ms if newest is None else max(newest, ts_ms)
+        total = buy + sell
+        if total <= 0 or oldest is None:
+            _flow_cache[symbol] = (now, None, 0)
+            return None, 0
+        covered = (newest - oldest) / 1000.0
+        if covered < FLOW_MIN_COVER_S:
+            _flow_cache[symbol] = (now, None, covered)
+            return None, covered
+        flow = (buy - sell) / total
+        _flow_cache[symbol] = (now, flow, covered)
+        return flow, covered
+    except Exception as e:
+        print(f"[FLOW {symbol}] {e}")
+        _flow_cache[symbol] = (now, None, 0)
+        return None, 0
+
+
+def flow_allows(symbol, side, want_opposing, label=""):
+    """side is 'BUY'/'LONG' or 'SELL'/'SHORT'.
+    want_opposing=True  -> reversion engines: flow must be AGAINST the trade's
+                           direction of travel, i.e. flow must AGREE with our side.
+                           We short a pumped coin, so we want sellers aggressive
+                           (flow < 0) -> for a SELL we require flow < 0.
+    want_opposing=False -> T3 continuation: flow must back the break, so a LONG
+                           needs flow > 0 and a SHORT needs flow < 0.
+    Both cases reduce to the same test; they are named separately because the
+    MEANING differs and the two engines were validated independently.
+    Returns (ok, flow, covered). Fails OPEN: unknown flow -> ok=True."""
+    flow, covered = get_flow(symbol)
+    if flow is None:
+        return True, None, covered
+    is_long = side in ("BUY", "LONG")
+    # a dead-flat book is no evidence either way -> do not block on it
+    if abs(flow) < 0.01:
+        return True, flow, covered
+    ok = (flow > 0) if is_long else (flow < 0)
+    if not ok:
+        print(f"[FLOW SKIP]{label} {symbol} {side} flow={flow:+.3f} covered={int(covered)}s")
+    return ok, flow, covered
 
 
 def rev_check_signal(symbol, btc_ret, eng):
@@ -3159,6 +3312,13 @@ def rev_check_signal(symbol, btc_ret, eng):
 
     if risk <= 0 or risk / px > eng["sl_cap_pct"]:
         return None
+
+    # ORDER-FLOW GATE (reversion): only take it if the aggressors are on OUR side.
+    ok, flow, covered = flow_allows(symbol, side, True, label=" " + eng["name"])
+    if not ok:
+        return None
+    eng["last_flow"] = flow
+    eng["last_flow_cover"] = covered
     return side, px, sl, tp
 
 

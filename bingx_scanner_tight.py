@@ -2155,27 +2155,31 @@ def handle_telegram_commands():
                 # ---- Tight 3 = S/R Sweep SHORT (bear engine): /t3_start /t3_stop ----
                 elif text == "/t3_start":
                     if not T3_ENGINE_ENABLED:
-                        send_tg("Tight 3 (S/R Sweep SHORT) is disabled at build level (T3_ENGINE_ENABLED=0).")
+                        send_tg("Tight 3 (HTF clean-break retest) is disabled at build level (T3_ENGINE_ENABLED=0).")
                     else:
                         t3_scalp_auto_enabled = True
-                        send_tg("Tight 3 (S/R Sweep SHORT) Auto-trade ON.")
+                        send_tg("Tight 3 (HTF clean-break retest) Auto-trade ON.")
                 elif text == "/t3_stop":
                     t3_scalp_auto_enabled = False
-                    send_tg("Tight 3 (S/R Sweep SHORT) Auto-trade OFF.")
+                    send_tg("Tight 3 (HTF clean-break retest) Auto-trade OFF.")
                 elif text == "/t3_status":
-                    _t3btc = t3_btc_regime()
-                    lines_s = ("Tight 3 (S/R Sweep SHORT - bear engine): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
+                    lines_s = ("Tight 3 (HTF clean-break retest, both sides): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
                                " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
                                " | Pending: " + str(len(t3s_pending)) +
-                               "\nSweep: >=" + str(T3_MIN_TOUCHES) + " touches, wick>=" + str(round(T3_WICK_MIN*100)) + "%" + " | swing_lb " + str(T3_SWING_LB) + " | vol>=$" + str(int(T3_MIN_QUOTE_VOL/1e6)) + "M" +
-                               " -> MSS -> FVG limit | SL sweep-high TP " + str(T3_TP_R) + "R" +
-                               "\nBTC 4d: " + (f"{_t3btc*100:+.1f}%" if _t3btc is not None else "n/a") +
-                               (" (gate ON: short only if <= +" + str(round(T3_BTC_MAX*100)) + "%)" if T3_BTC_GATE else " (gate OFF)") +
-                               " | rf>=" + str(round(T3_RF_MIN*100,1)) + "% | risk $" + str(int(T3_RISK_USDT)) + " flat")
+                               "\nLevels: " + ",".join(T3B_TIMEFRAMES) + " pivots K=" + str(T3B_PIVOT_K) +
+                               " | clean break only (<=1 prior touch)" +
+                               "\nBreak vol >=" + str(T3B_VOL_MULT) + "x med | ext " +
+                               str(round(T3B_EXT_MIN*100)) + "-" + str(round(T3B_EXT_MAX*100)) + "%" +
+                               " | retest <=" + str(T3B_RETEST_MAX) + " bars, vol >= break vol" +
+                               "\nSL " + str(T3B_SL_ATR) + "xATR | TP " + str(T3B_TP_R) + "R | ATR%>=" +
+                               str(round(T3B_ATRP_MIN*100, 1)) + "% | vol>=$" + str(int(T3_MIN_QUOTE_VOL/1e6)) + "M" +
+                               " | risk $" + str(int(T3_RISK_USDT)) + " flat" +
+                               "\nCached levels: " + str(sum(len(x) for x in t3b_levels.values())) +
+                               " on " + str(len(t3b_levels)) + " coins")
                     for _sym, _p in list(t3s_pending.items()):
-                        lines_s += "\n[pending] " + _sym + " SHORT @ " + str(round(_p["entry"], 6))
+                        lines_s += "\n[pending] " + _sym + " " + _p.get("dir", "?") + " @ " + str(round(_p["entry"], 6))
                     for _oid, ts in list(t3s_open_trades.items()):
-                        lines_s += ("\n" + ts["symbol"] + " SHORT | entry " +
+                        lines_s += ("\n" + ts["symbol"] + " " + ts.get("dir", "?") + " | entry " +
                                     str(ts.get("entry_fill", ts["entry"])) + " | SL " + str(round(ts["sl"], 6)) +
                                     " | TP " + str(round(ts["tp"], 6)))
                     send_tg(lines_s)
@@ -2258,17 +2262,13 @@ def handle_telegram_commands():
 #     3. strong S/R cluster (>=2 swing-highs at one level), not just a double top.
 #
 # SIGNAL (all on 15m):
-#   - find the strongest RESISTANCE cluster in the last T3_LEVEL_LOOKBACK bars:
-#     the price level (built from swing-highs, +/-2 fractal) that the most swing-
-#     highs sit within T3_LEVEL_TOL of. Require >= T3_MIN_TOUCHES swing-highs.
-#   - SWEEP candle: this 15m bar's HIGH pierces the level but its CLOSE is back
-#     below the level, with an upper rejection wick >= T3_WICK_MIN of the range.
-#   - MSS: within T3_MSS_LOOK bars after the sweep, a 15m CLOSE breaks the recent
-#     swing-low (min low of the prior T3_SWING_LB bars) -> structure shift down.
-#   - ENTRY: resting LIMIT at the bearish FVG top (gap left by the MSS down-move),
-#     cancelled after T3_FILL_BARS bars if unfilled.
-#   - SL = the sweep candle HIGH.  TP = T3_TP_R * risk.  (risk = SL - entry)
-#   - rf = risk/entry must be within [T3_RF_MIN, T3_SL_CAP_PCT].
+#   - levels come from 12H/1D/2D fractal pivots (K=3), rebuilt every 6h from 1h
+#     klines; a pivot is only usable K+1 HTF bars after it printed (no lookahead).
+#   - CLEAN BREAK: a 15m close beyond the level, on a level touched <=1 time before.
+#   - the break bar's volume >= 2x the 96-bar median; price extends 1-12% past it.
+#   - within 8 bars price returns, touches the level and CLOSES holding it, on
+#     volume >= the break bar's volume -> resting LIMIT entry there, break direction.
+#   - SL = 2.5xATR(15m), TP = 2R, 72h time-stop, own cap separate from T1/T2.
 #   - BTC gate: skip if BTC 4d-return > T3_BTC_MAX (bear_soft = +3%).
 #
 # BACKTEST (8mo, 249-coin 15m, maker+taker fees, realistic slippage sim):
@@ -2283,50 +2283,79 @@ def handle_telegram_commands():
 T3_ENGINE_ENABLED   = os.environ.get("T3_ENGINE_ENABLED", "0") == "1"   # master build flag
 t3_scalp_auto_enabled = AUTO_RESUME_ON_START   # runtime on/off via /t3_start /t3_stop (name kept for /status wiring)
 
-T3_LEVEL_LOOKBACK   = int(os.environ.get("T3_LEVEL_LOOKBACK", 96))    # bars to search for the S/R cluster (~24h)
-T3_LEVEL_TOL        = float(os.environ.get("T3_LEVEL_TOL", 0.004))    # swing-highs within 0.4% = same level
-T3_MIN_TOUCHES      = int(os.environ.get("T3_MIN_TOUCHES", 2))        # >=2 swing-highs at the level (strong S/R)
-T3_WICK_MIN         = float(os.environ.get("T3_WICK_MIN", 0.5))       # sweep upper wick >= 50% of candle range
-T3_MSS_LOOK         = int(os.environ.get("T3_MSS_LOOK", 8))           # 2026-08-24: 16->8. Part of the deep-structure retune (see T3_SWING_LB).
-T3_SWING_LB         = int(os.environ.get("T3_SWING_LB", 20))          # 2026-08-24: 10->20. BIGGEST lever found: the MSS must break a 20-bar swing-low,
-                                                                      # not a 10-bar one - a real structure shift, not noise. On the untouched Mar-Jul half
-                                                                      # the old config made +$10 while this one made +$354 (30 trades/wk, win 34%).
-T3_FVG_EXPIRY       = int(os.environ.get("T3_FVG_EXPIRY", 10))        # 2026-08-24: 20->10. A stale FVG is a dead setup.
-T3_TP_R             = float(os.environ.get("T3_TP_R", 4.0))           # fixed take-profit in R
-T3_RF_MIN           = float(os.environ.get("T3_RF_MIN", 0.008))       # risk/entry floor - THE main fee fix, do not lower
-T3_SL_CAP_PCT       = float(os.environ.get("T3_SL_CAP_PCT", 0.02))    # 2026-08-24: 0.10->0.02. The rf CEILING had never been swept; capping it at 2%
-                                                                      # lifted the untouched-half result materially. Band is now rf 0.8%-2%.
-# 2026-08-24 BTC GATE NOW OFF BY DEFAULT. The old bear_soft gate (short only when BTC
-# 4d <= +3%) existed because the WEAK structure filter lost money in bull months. With
-# T3_SWING_LB=20 that is reversed: the BTC +5%..+10% bucket became the single BEST bucket
-# (+0.343R) while deep bear (-10%..-5%) is now the weak one. Keeping the gate would cut the
-# best trades - and it was doing exactly that live (BTC 4d = +11.8%, T3 fired=0 all day).
-# Set T3_BTC_GATE=1 in Render env to switch the old gate back on without a redeploy.
-T3_BTC_GATE         = os.environ.get("T3_BTC_GATE", "0") == "1"
-T3_BTC_MAX          = float(os.environ.get("T3_BTC_MAX", 0.03))       # only used when T3_BTC_GATE=1
-T3_BTC_WINDOW       = int(os.environ.get("T3_BTC_WINDOW", 384))       # 4 days of 15m bars
+# ---------------------------------------------------------------------------
+# TIGHT 3 = HTF CLEAN-BREAK RETEST  (2026-08-26 rebuild; replaces the S/R sweep
+# short, which was measured dead: 3,888-combo sweep, 2% of TEST cells positive).
+#
+# THE RULE
+#   1. Build fractal pivot levels on RESAMPLED higher-timeframe bars (12H / 1D / 2D)
+#      from 1h klines. A level = the extreme of +/-K HTF bars, and it is only
+#      knowable K+1 HTF bars later, so there is no lookahead.
+#   2. CLEAN BREAK: price closes beyond the level by > T3B_TOL, and the level had
+#      been touched EXACTLY ONCE before (i.e. it never turned price away). This is
+#      the core discovery and it is the OPPOSITE of the textbook - measured over
+#      all six timeframe x K combinations, "clean" levels were positive in BOTH
+#      halves while already-tested levels were negative on TEST in all six.
+#      A level with defenders behind it is a TRAP; a virgin level really breaks.
+#   3. The break bar's volume >= T3B_VOL_MULT x the 96-bar median.
+#   4. Price then extends T3B_EXT_MIN..T3B_EXT_MAX past the level.
+#   5. Within T3B_RETEST_MAX bars it comes back, touches the level and CLOSES
+#      holding it, on volume >= the break bar's volume.
+#   6. Resting LIMIT entry at that retest close, in the break direction.
+#      SL = T3B_SL_ATR x ATR(15m), TP = T3B_TP_R (RR 2.0 measured optimal).
+#
+# BACKTEST (Nov 2025 - Jul 2026, 15m, $2M excl-top-20, 20bps, flat $5)
+#   n=454 | 12.6 trades/wk | meanR +0.390 | win 48.0% | PnL +$884
+#   TRAIN +0.378 / TEST +0.405   (TEST is the better half - no decay)
+#   Monthly 9/9 positive (worst month +0.206)
+#   Side-flip -0.188 (Aug -0.289) -> gap +0.578 | placebo (tested levels) TEST -0.083
+#   Holdout A +0.325 / B +0.471 | 162 coins, 99 positive, top-3 only 15% of PnL
+#   SL x TP x hold grid, 36 cells: TEST median +0.279, 100% positive
+#   Slippage: 0bps +0.426 | 50bps +0.335 | 100bps +0.244  (very cost-tolerant)
+#   Untouched OOS 26 Jul-24 Aug 2026: n=19, meanR +0.695, win 57.9%
+#   Legs: LONG +0.306 / SHORT +0.460 - both positive in both halves, so BOTH run.
+#   Per timeframe: 12H +0.404 | 1D +0.352 | 2D +0.268 - all three work alone.
+# HONEST LIMITS: ext and retest-window bounds were chosen on the full 8mo (not
+# TRAIN-only); Aug OOS n is only 19. Keep T3_RISK_USDT small until live n grows.
+#
+# WHY THIS IS NOT A SCALP: shortening it destroys it (4h hold = +$40 vs 72h = +$884).
+# It is born from multi-day levels and needs 2-3 days to run.
+# ---------------------------------------------------------------------------
+T3B_TIMEFRAMES      = os.environ.get("T3B_TIMEFRAMES", "12H,1D,2D").split(",")
+T3B_PIVOT_K         = int(os.environ.get("T3B_PIVOT_K", 3))        # +/-3 HTF bars. BIGGEST lever: K1 +0.211 -> K3 +0.308
+T3B_TOL             = float(os.environ.get("T3B_TOL", 0.003))      # touch / break tolerance
+T3B_HOLD_TOL        = float(os.environ.get("T3B_HOLD_TOL", 0.0015))# retest must close within this of the level
+T3B_VOL_MULT        = float(os.environ.get("T3B_VOL_MULT", 2.0))   # break-bar volume vs 96-bar median
+T3B_RETEST_VOL_MULT = float(os.environ.get("T3B_RETEST_VOL_MULT", 1.0))  # retest vol >= this x break vol
+T3B_EXT_MIN         = float(os.environ.get("T3B_EXT_MIN", 0.01))   # must push >=1% past the level
+T3B_EXT_MAX         = float(os.environ.get("T3B_EXT_MAX", 0.12))   # but <=12% (further = stop too far away)
+T3B_RETEST_MAX      = int(os.environ.get("T3B_RETEST_MAX", 8))     # retest within 8 bars (2h) of the break
+T3B_ATRP_MIN        = float(os.environ.get("T3B_ATRP_MIN", 0.004)) # ATR14/price floor - cost in R
+T3B_MAX_LEVEL_AGE   = int(os.environ.get("T3B_MAX_LEVEL_AGE", 45)) # HTF bars a level stays live
+T3B_SL_ATR          = float(os.environ.get("T3B_SL_ATR", 2.5))
+T3B_TP_R            = float(os.environ.get("T3B_TP_R", 2.0))       # RR 2.0. Swept: 1.5 -> win 55% but PnL -17%; 2.5/3.0 both worse.
+T3B_LEVEL_REFRESH_S = int(os.environ.get("T3B_LEVEL_REFRESH_S", 21600))  # rebuild HTF levels every 6h
+T3B_LEVEL_1H_LIMIT  = int(os.environ.get("T3B_LEVEL_1H_LIMIT", 1000))    # 1h bars per symbol (~41 days)
+
 T3_ATR_LEN          = int(os.environ.get("T3_ATR_LEN", 14))
-T3_FILL_BARS        = int(os.environ.get("T3_FILL_BARS", 8))          # cancel resting limit after 8 bars (2h)
-T3_HOLD_SECONDS     = int(os.environ.get("T3_HOLD_SECONDS", 64 * 15 * 60))   # 16h max hold (matches backtest)
-T3_COOLDOWN_SECONDS = int(os.environ.get("T3_COOLDOWN_SECONDS", 7200))       # 2h per-coin after a signal
+T3_FILL_BARS        = int(os.environ.get("T3_FILL_BARS", 4))          # cancel resting limit after 4 bars (1h)
+T3_HOLD_SECONDS     = int(os.environ.get("T3_HOLD_SECONDS", 288 * 15 * 60))  # 72h max hold (matches backtest)
+T3_COOLDOWN_SECONDS = int(os.environ.get("T3_COOLDOWN_SECONDS", 21600))      # 6h per-coin after a signal
 T3_LOSS_COOLDOWN_S  = int(os.environ.get("T3_LOSS_COOLDOWN_S", 86400))       # 1d ban after an SL
-T3_RISK_USDT        = float(os.environ.get("T3_RISK_USDT", 3.0))      # small live test
+T3_SL_CAP_PCT       = float(os.environ.get("T3_SL_CAP_PCT", 0.06))    # skip if SL distance > 6% of price
+T3_RISK_USDT        = float(os.environ.get("T3_RISK_USDT", 3.0))      # small until live n grows
 T3_LEVERAGE         = int(os.environ.get("T3_LEVERAGE", 10))
 T3_MAX_CONCURRENT   = int(os.environ.get("T3_MAX_CONCURRENT", 5))     # own slot cap, separate from swing (T1/T2)
 T3_MAX_MARGIN_USDT  = float(os.environ.get("T3_MAX_MARGIN_USDT", 40))
-# 2026-08-24 LIQUIDITY FLOOR 2M -> 10M. This is the slippage decision, and it is the one
-# that actually matters. Backtest with a realistic execution model (resting-limit entry =
-# maker, but STOP-MARKET SL and time-stop exits slipping against us):
-#   $2M universe : 30 trades/wk, 8mo PnL -$40 at 20bps, -$1210 at 50bps, -$3159 at 100bps
-#   $10M universe: 2.2 trades/wk, 8mo PnL +$144 at 20bps, +$65 at 50bps, -$66 at 100bps
-# Live slippage on thin coins has hit ~100bps (ONG, VELVET), so the $2M version is a losing
-# engine in practice. Far fewer trades is the price of surviving the stop-market exit.
-# HONEST: even the $10M corner is only ~n80 trades over 8 months - a plausible edge, not a
-# proven one. Keep T3_RISK_USDT small.
-T3_MIN_QUOTE_VOL    = float(os.environ.get("T3_MIN_QUOTE_VOL", 10_000_000))
+T3_MIN_QUOTE_VOL    = float(os.environ.get("T3_MIN_QUOTE_VOL", 2_000_000))   # backtest floor was $2M
 T3_EXCLUDE_TOP_N    = int(os.environ.get("T3_EXCLUDE_TOP_N", 20))
 T3_MAX_SYMBOLS      = int(os.environ.get("T3_MAX_SYMBOLS", 600))
 T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 300))
+# legacy names kept so /status and old env vars do not break
+T3_BTC_GATE         = os.environ.get("T3_BTC_GATE", "0") == "1"
+T3_BTC_MAX          = float(os.environ.get("T3_BTC_MAX", 0.03))
+T3_BTC_WINDOW       = int(os.environ.get("T3_BTC_WINDOW", 384))
+T3_TP_R             = T3B_TP_R
 
 # globals named t3s_* so /status + command handlers are unchanged
 t3s_open_trades   = {}    # order_id -> live trade
@@ -2373,119 +2402,191 @@ def t3_btc_regime():
         return None
 
 
-def _t3_swing_high_idx(highs):
-    """Indices of +/-2 fractal swing-highs within the given window."""
+t3b_levels     = {}    # symbol -> list of level dicts, rebuilt every T3B_LEVEL_REFRESH_S
+t3b_levels_ts  = {}    # symbol -> unix ts of last rebuild
+
+
+def _t3b_resample(candles, group):
+    """Fold 1h candles into HTF bars of `group` hours. Returns (highs, lows)."""
+    n = (len(candles) // group) * group
+    highs, lows = [], []
+    for i in range(0, n, group):
+        chunk = candles[i:i + group]
+        highs.append(max(h(c) for c in chunk))
+        lows.append(min(l(c) for c in chunk))
+    return highs, lows
+
+
+def t3b_build_levels(symbol):
+    """Fractal pivot levels on 12H / 1D / 2D bars, built from 1h klines.
+    A pivot at index p is only KNOWABLE at p+K, so `ready_ms` marks the first
+    millisecond the level may be used - this is what keeps it lookahead-free."""
+    candles = get_candles(symbol, limit=T3B_LEVEL_1H_LIMIT, interval="1h")
+    if not candles or len(candles) < 120:
+        return []
+    try:
+        t0 = int(candles[0].get("time") or candles[0].get("T") or 0)
+        t1 = int(candles[1].get("time") or candles[1].get("T") or 0)
+        bar_ms = abs(t1 - t0) or 3600000
+    except Exception:
+        bar_ms = 3600000
+    base_ms = int(candles[0].get("time") or candles[0].get("T") or 0)
+    K = T3B_PIVOT_K
     out = []
-    for j in range(2, len(highs) - 2):
-        if (highs[j] >= highs[j - 1] and highs[j] >= highs[j - 2]
-                and highs[j] >= highs[j + 1] and highs[j] >= highs[j + 2]):
-            out.append(j)
+    for tf in T3B_TIMEFRAMES:
+        group = {"12H": 12, "1D": 24, "2D": 48}.get(tf.strip().upper())
+        if not group:
+            continue
+        highs, lows = _t3b_resample(candles, group)
+        nb = len(highs)
+        if nb < 2 * K + 4:
+            continue
+        for p in range(K, nb - K):
+            wh = highs[p - K:p + K + 1]
+            wl = lows[p - K:p + K + 1]
+            if highs[p] == max(wh) and wh.index(max(wh)) == K:
+                out.append({"tf": tf, "level": highs[p], "is_res": True,
+                            "ready_ms": base_ms + (p + K + 1) * group * bar_ms,
+                            "dead_ms": base_ms + (p + K + 1 + T3B_MAX_LEVEL_AGE) * group * bar_ms})
+            if lows[p] == min(wl) and wl.index(min(wl)) == K:
+                out.append({"tf": tf, "level": lows[p], "is_res": False,
+                            "ready_ms": base_ms + (p + K + 1) * group * bar_ms,
+                            "dead_ms": base_ms + (p + K + 1 + T3B_MAX_LEVEL_AGE) * group * bar_ms})
     return out
 
 
-def t3s_check_signal(symbol, btc_ret):
-    """S/R sweep SHORT setup. Returns (entry_px, sl_px, tp_px) or None.
-    Mirrors the backtest exactly: strong resistance cluster -> sweep candle
-    (pierce + close back below + rejection wick) -> MSS (swing-low break) ->
-    entry at the bearish FVG top, SL at the sweep high, TP fixed R."""
-    need = T3_LEVEL_LOOKBACK + T3_MSS_LOOK + T3_FVG_EXPIRY + T3_ATR_LEN + 5
-    candles = get_candles(symbol, limit=need, interval="15m")
-    if not candles or len(candles) < T3_LEVEL_LOOKBACK + T3_MSS_LOOK + 5:
+def t3b_levels_for(symbol):
+    now = time.time()
+    if now - t3b_levels_ts.get(symbol, 0) > T3B_LEVEL_REFRESH_S or symbol not in t3b_levels:
+        try:
+            t3b_levels[symbol] = t3b_build_levels(symbol)
+        except Exception as e:
+            print(f"[T3 LEVELS {symbol}] {e}")
+            t3b_levels.setdefault(symbol, [])
+        t3b_levels_ts[symbol] = now
+    return t3b_levels.get(symbol, [])
+
+
+def t3b_check_signal(symbol):
+    """Clean-break retest. Returns (side, entry, sl, tp) or None.
+    Mirrors the backtest exactly: the retest must be the LAST CLOSED 15m bar, so
+    the entry limit sits at a price that has just printed and nothing is peeked at."""
+    levels = t3b_levels_for(symbol)
+    if not levels:
         return None
-    highs = [h(c) for c in candles]
-    lows  = [l(c) for c in candles]
+    need = 96 + T3_ATR_LEN + T3B_RETEST_MAX + 40
+    candles = get_candles(symbol, limit=need, interval="15m")
+    if not candles or len(candles) < 96 + T3B_RETEST_MAX + 5:
+        return None
+    highs  = [h(c) for c in candles]
+    lows   = [l(c) for c in candles]
     closes = [cl(c) for c in candles]
-    opens = [o(c) for c in candles]
+    vols   = [v(c) for c in candles]
+    try:
+        times = [int(c.get("time") or c.get("T") or 0) for c in candles]
+    except Exception:
+        times = [0] * len(candles)
     n = len(candles)
+    t = n - 1                      # the retest must be THIS bar (last closed)
+    atr_vals = atr_series(highs, lows, closes, T3_ATR_LEN)
+    atr = atr_vals[-1] if atr_vals else 0
+    if not atr or atr <= 0:
+        return None
+    px = closes[t]
+    if px <= 0 or atr / px < T3B_ATRP_MIN:
+        return None
+    if (T3B_SL_ATR * atr) / px > T3_SL_CAP_PCT:
+        return None
+    med_vol = sorted(vols[-96:])[48] if len(vols) >= 96 else 0
+    if med_vol <= 0:
+        return None
 
-    # The sweep candle must be recent enough that the MSS + FVG could have formed
-    # AND be old enough to have T3_LEVEL_LOOKBACK bars of history behind it. We look
-    # for the sweep in the window [oldest_ok .. last_bar - 2] and require the whole
-    # MSS/FVG chain to complete on already-closed bars.
-    # Scan from the most recent qualifying sweep backwards; take the first that
-    # produces a still-valid (not-yet-filled, not expired) entry at the latest bar.
-    latest = n - 1
-    # search sweeps whose FVG entry window could still be open right now
-    earliest_sweep = max(T3_LEVEL_LOOKBACK, n - 1 - (T3_MSS_LOOK + T3_FVG_EXPIRY))
-    for i in range(latest - 1, earliest_sweep - 1, -1):
-        win_h = highs[i - T3_LEVEL_LOOKBACK:i]
-        if len(win_h) < 5:
+    best = None
+    for lv in levels:
+        level = lv["level"]
+        is_res = lv["is_res"]
+        if level <= 0:
             continue
-        sh = _t3_swing_high_idx(win_h)
-        if not sh:
-            continue
-        # strongest cluster
-        best_lvl = None; best_cnt = 0
-        for j in sh:
-            lvl = win_h[j]
-            cnt = sum(1 for k in sh if abs(win_h[k] - lvl) / lvl <= T3_LEVEL_TOL)
-            if cnt > best_cnt:
-                best_cnt = cnt; best_lvl = lvl
-        if best_lvl is None or best_cnt < T3_MIN_TOUCHES:
-            continue
-        cluster = [win_h[k] for k in sh if abs(win_h[k] - best_lvl) / best_lvl <= T3_LEVEL_TOL]
-        rlvl = max(cluster)
-
-        c_h, c_l, c_o, c_c = highs[i], lows[i], opens[i], closes[i]
-        rng = c_h - c_l
-        if rng <= 0:
-            continue
-        # sweep: pierce the level then close back below it
-        if not (c_h > rlvl and c_c < rlvl):
-            continue
-        upper = c_h - max(c_o, c_c)
-        if upper / rng < T3_WICK_MIN:
-            continue
-        sweep_high = c_h
-
-        # MSS: swing-low break within T3_MSS_LOOK bars after the sweep
-        pre = lows[max(0, i - T3_SWING_LB):i]
-        if not pre:
-            continue
-        swing_low = min(pre)
-        mss = None
-        for k in range(i + 1, min(i + 1 + T3_MSS_LOOK, n)):
-            if closes[k] < swing_low:
-                mss = k; break
-        if mss is None or mss < 2:
+        # the retest bar must touch the level and CLOSE holding it
+        if is_res:
+            touched = lows[t] <= level * (1 + T3B_TOL)
+            held    = closes[t] >= level * (1 - T3B_HOLD_TOL)
+        else:
+            touched = highs[t] >= level * (1 - T3B_TOL)
+            held    = closes[t] <= level * (1 + T3B_HOLD_TOL)
+        if not (touched and held):
             continue
 
-        # bearish FVG top (gap between low[mss-2] and high[mss]); fallback = order block
-        ft = lows[mss - 2]; fb = highs[mss]
-        if ft <= fb:
-            ft = max(highs[mss - 1], highs[mss])
-        entry = ft
-        sl = sweep_high
-        risk = sl - entry
-        if risk <= 0:
+        # walk back to find the break bar inside the retest window
+        brk = None
+        for j in range(t - 1, max(t - 1 - T3B_RETEST_MAX, 0) - 1, -1):
+            if times[j] and times[j] < lv["ready_ms"]:
+                break
+            if times[j] and lv["dead_ms"] and times[j] > lv["dead_ms"]:
+                continue
+            broke = (closes[j] > level * (1 + T3B_TOL)) if is_res \
+                    else (closes[j] < level * (1 - T3B_TOL))
+            if broke:
+                brk = j
+            elif brk is not None:
+                break            # found the start of the break run
+        if brk is None:
             continue
-        rf = risk / entry
-        if rf < T3_RF_MIN or rf > T3_SL_CAP_PCT:
+        # earliest bar of that break run
+        while brk - 1 >= 0 and brk - 1 > t - 1 - T3B_RETEST_MAX:
+            prev_broke = (closes[brk - 1] > level * (1 + T3B_TOL)) if is_res \
+                         else (closes[brk - 1] < level * (1 - T3B_TOL))
+            if prev_broke:
+                brk -= 1
+            else:
+                break
+        if times[brk] and times[brk] < lv["ready_ms"]:
+            continue
+        # the level must have been CLEAN: touched at most once before the break
+        touches = 0
+        start = max(0, brk - 96)
+        for j in range(start, brk):
+            if times[j] and times[j] < lv["ready_ms"]:
+                continue
+            ref = highs[j] if is_res else lows[j]
+            if abs(ref - level) / level < T3B_TOL:
+                touches += 1
+        if touches > 1:
+            continue
+        # break-bar volume
+        if vols[brk] < T3B_VOL_MULT * med_vol:
+            continue
+        # retest volume >= break volume
+        if vols[t] < T3B_RETEST_VOL_MULT * vols[brk]:
+            continue
+        # extension past the level between the break and the retest
+        ext = 0.0
+        for j in range(brk, t + 1):
+            e = (highs[j] - level) / level if is_res else (level - lows[j]) / level
+            if e > ext:
+                ext = e
+        if ext < T3B_EXT_MIN or ext > T3B_EXT_MAX:
             continue
 
-        # the FVG entry must not have already been touched between mss and now
-        # (if price already returned into the FVG on a closed bar, the setup is spent)
-        touched = False
-        for k in range(mss + 1, n):
-            if highs[k] >= entry:
-                touched = True; break
-        if touched:
-            continue
-        # and the setup must still be within its expiry window
-        if (n - 1) - mss > T3_FVG_EXPIRY:
-            continue
-
-        # BTC gate - OFF by default since 2026-08-24 (see T3_BTC_GATE above)
-        if T3_BTC_GATE and btc_ret is not None and btc_ret > T3_BTC_MAX:
-            return None
-
-        tp = entry - risk * T3_TP_R
-        return entry, sl, tp
-    return None
+        side = "LONG" if is_res else "SHORT"
+        entry = px
+        dist = T3B_SL_ATR * atr
+        sl = entry - dist if is_res else entry + dist
+        tp = entry + T3B_TP_R * dist if is_res else entry - T3B_TP_R * dist
+        cand = (side, entry, sl, tp, ext, lv["tf"])
+        # prefer the highest timeframe if several levels qualify at once
+        rank = {"2D": 3, "1D": 2, "12H": 1}.get(lv["tf"], 0)
+        if best is None or rank > best[0]:
+            best = (rank, cand)
+    if best is None:
+        return None
+    side, entry, sl, tp, ext, tf = best[1]
+    print(f"[T3 SIGNAL] {symbol} {side} tf={tf} ext={ext*100:.1f}% entry={entry}")
+    return side, entry, sl, tp
 
 
-def place_t3_limit(symbol, entry, sl, tp):
-    """RESTING LIMIT short at the FVG top (maker). Notifies on rest / margin / depth skip."""
+def place_t3_limit(symbol, side, entry, sl, tp):
+    """RESTING LIMIT (maker) at the retest close, LONG or SHORT."""
     try:
         set_leverage_api(symbol, T3_LEVERAGE)
         precision = symbol_precision.get(symbol, 4)
@@ -2497,8 +2598,11 @@ def place_t3_limit(symbol, entry, sl, tp):
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
-        side, pos_side, close_side = "SELL", "SHORT", "BUY"
-        if not depth_ok(symbol, entry, sl, qty, side):
+        if side == "LONG":
+            order_side, pos_side, close_side = "BUY", "LONG", "SELL"
+        else:
+            order_side, pos_side, close_side = "SELL", "SHORT", "BUY"
+        if not depth_ok(symbol, entry, sl, qty, order_side):
             print(f"[T3 DEPTH SKIP] {symbol}")
             return "DEPTH_SKIP"
         required_margin = qty * entry / T3_LEVERAGE
@@ -2511,7 +2615,7 @@ def place_t3_limit(symbol, entry, sl, tp):
             return "MARGIN_SKIP"
         url = BASE_URL + "/openApi/swap/v2/trade/order"
         params = build_signed_params({
-            "symbol": symbol, "side": side, "positionSide": pos_side,
+            "symbol": symbol, "side": order_side, "positionSide": pos_side,
             "type": "LIMIT", "price": round(entry, 6), "quantity": qty,
             "timeInForce": "GTC",
         })
@@ -2521,12 +2625,12 @@ def place_t3_limit(symbol, entry, sl, tp):
             print(f"[T3 LIMIT FAIL] {symbol} qty={qty} px={entry} - BingX: {r}")
             return None
         t3s_pending[symbol] = {
-            "order_id": oid, "symbol": symbol, "side": side, "pos_side": pos_side,
-            "close_side": close_side, "entry": entry, "sl": sl, "tp": tp,
+            "order_id": oid, "symbol": symbol, "side": order_side, "pos_side": pos_side,
+            "close_side": close_side, "dir": side, "entry": entry, "sl": sl, "tp": tp,
             "qty": qty, "placed_ts": time.time(),
         }
         send_tg(
-            f"\u23f3 TIGHT 3 {symbol} SHORT LIMIT RESTING (S/R sweep)\n"
+            f"\u23f3 TIGHT 3 {symbol} {side} LIMIT RESTING (clean-break retest)\n"
             f"Entry: {round(entry, 6)} | SL: {round(sl, 6)} | TP: {round(tp, 6)}\n"
             f"Risk: ${T3_RISK_USDT} | cancels in {T3_FILL_BARS * 15}m"
         )
@@ -2547,34 +2651,35 @@ def track_t3_pending():
         except Exception as e:
             print(f"[T3 PEND {sym}] {e}")
             continue
+        d = p.get("dir", "SHORT")
         if status == "FILLED":
             fill = get_fill_price(p["order_id"], sym, fallback=p["entry"])
-            risk = p["sl"] - fill
+            risk = (fill - p["sl"]) if d == "LONG" else (p["sl"] - fill)
             if risk <= 0:
-                # fill worse than SL somehow - close immediately, never run naked/inverted
                 try:
                     place_market_order(sym, p["close_side"], p["qty"], p["pos_side"])
                 except Exception as _e:
                     print(f"[T3 bad-fill close {sym}] {_e}")
-                send_tg(f"\u26a0\ufe0f TIGHT 3 {sym} SHORT bad fill (>= SL) - closed, no naked risk.")
+                send_tg(f"\u26a0\ufe0f TIGHT 3 {sym} {d} bad fill (beyond SL) - closed, no naked risk.")
                 t3s_last_fire[sym] = now
                 t3s_pending.pop(sym, None)
                 continue
-            tp = fill - risk * T3_TP_R
+            tp = fill + risk * T3B_TP_R if d == "LONG" else fill - risk * T3B_TP_R
             sl_id = place_sl_guarded(sym, p["close_side"], p["pos_side"], p["sl"], p["qty"])
             if sl_id is None:
                 try:
                     place_market_order(sym, p["close_side"], p["qty"], p["pos_side"])
                 except Exception as _e:
                     print(f"[T3 SL-FAIL emergency close {sym}] {_e}")
-                send_tg(f"\u26a0\ufe0f TIGHT 3 {sym} SHORT SL placement FAILED - position emergency-closed.")
+                send_tg(f"\u26a0\ufe0f TIGHT 3 {sym} {d} SL placement FAILED - position emergency-closed.")
                 t3s_last_fire[sym] = now
                 t3s_pending.pop(sym, None)
                 continue
             tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label="TIGHT 3")
             t3s_open_trades[p["order_id"]] = {
                 "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
-                "close_side": p["close_side"], "entry": p["entry"], "entry_fill": fill,
+                "close_side": p["close_side"], "dir": d,
+                "entry": p["entry"], "entry_fill": fill,
                 "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "risk_usdt": T3_RISK_USDT,
                 "sl_id": sl_id, "tp_id": tp_id, "open_ts": now, "gone_strikes": 0,
                 "label": "TIGHT 3",
@@ -2583,7 +2688,7 @@ def track_t3_pending():
             t3s_pending.pop(sym, None)
             slip = abs(fill - p["entry"]) / p["entry"] * 100 if p["entry"] else 0
             send_tg(
-                f"\u2705 TIGHT 3 {sym} SHORT FILLED (trade executed)\n"
+                f"\u2705 TIGHT 3 {sym} {d} FILLED (trade executed)\n"
                 f"Entry: {fill} (limit {round(p['entry'], 6)}, slip {slip:.2f}%)\n"
                 f"SL: {round(p['sl'], 6)} | TP: {round(tp, 6)} | Risk: ${T3_RISK_USDT}"
             )
@@ -2594,7 +2699,7 @@ def track_t3_pending():
             except Exception as e:
                 print(f"[T3 CANCEL {sym}] {e}")
             t3s_pending.pop(sym, None)
-            send_tg(f"\u274e TIGHT 3 {sym} SHORT LIMIT CANCELLED (unfilled {T3_FILL_BARS * 15}m) - margin released")
+            send_tg(f"\u274e TIGHT 3 {sym} {d} LIMIT CANCELLED (unfilled {T3_FILL_BARS * 15}m) - margin released")
 
 
 def track_t3_scalp_trades():
@@ -2606,7 +2711,7 @@ def track_t3_scalp_trades():
     now = time.time()
     for oid, t in list(t3s_open_trades.items()):
         sym = t["symbol"]
-        # time-stop
+        d = t.get("dir", "SHORT")
         if now - t.get("open_ts", now) > T3_HOLD_SECONDS:
             try:
                 place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
@@ -2622,12 +2727,13 @@ def track_t3_scalp_trades():
                 if px and ef:
                     rd = abs(ef - t["sl"])
                     if rd > 0:
-                        pnl = (ef - px) / rd * T3_RISK_USDT
-                        exit_r = round((ef - px) / rd, 2)
-                send_tg(f"\u23f1\ufe0f TIGHT 3 {sym} SHORT time-stop closed | entry {ef}"
+                        move = (px - ef) if d == "LONG" else (ef - px)
+                        pnl = move / rd * T3_RISK_USDT
+                        exit_r = round(move / rd, 2)
+                send_tg(f"\u23f1\ufe0f TIGHT 3 {sym} {d} time-stop closed | entry {ef}"
                         + (f" | {'+' if pnl >= 0 else '-'}${abs(round(pnl, 2))}" if pnl is not None else ""))
                 journal_closed_trade({
-                    "label": "TIGHT 3", "symbol": sym, "side": "SHORT", "entry": ef,
+                    "label": "TIGHT 3", "symbol": sym, "side": d, "entry": ef,
                     "result": "time-stop", "pnl": round(pnl, 2) if pnl is not None else 0,
                     "exit_r": exit_r,
                 })
@@ -2636,7 +2742,6 @@ def track_t3_scalp_trades():
             t3s_last_fire[sym] = now
             t3s_open_trades.pop(oid, None)
             continue
-        # reconcile: position gone => SL or TP hit
         gone = exchange_has_position(sym)
         if gone is None or gone:
             t["gone_strikes"] = 0
@@ -2648,7 +2753,7 @@ def track_t3_scalp_trades():
         ef = t.get("entry_fill", t.get("entry", 0))
         t.setdefault("symbol", sym)
         t.setdefault("risk_usdt", T3_RISK_USDT)
-        result, pnl, exit_r, exit_px = resolve_exit(t, "SELL", ef)
+        result, pnl, exit_r, exit_px = resolve_exit(t, "BUY" if d == "LONG" else "SELL", ef)
         if result == "SL":
             t3s_loss_until[sym] = now + T3_LOSS_COOLDOWN_S
         for k in ("sl_id", "tp_id"):
@@ -2659,9 +2764,9 @@ def track_t3_scalp_trades():
                     pass
         emoji = "\u2705" if result == "TP" else ("\u274c" if result == "SL" else "\u2139\ufe0f")
         held_min = int((now - t.get("open_ts", now)) / 60)
-        send_tg(f"{emoji} TIGHT 3 {sym} SHORT {result} | entry {ef} | held {held_min}m")
+        send_tg(f"{emoji} TIGHT 3 {sym} {d} {result} | entry {ef} | held {held_min}m")
         journal_closed_trade({
-            "label": "TIGHT 3", "symbol": sym, "side": "SHORT", "entry": ef,
+            "label": "TIGHT 3", "symbol": sym, "side": d, "entry": ef,
             "result": result, "pnl": round(pnl, 2), "exit_r": exit_r,
             "exit_px": round(exit_px, 8) if exit_px else 0,
         })
@@ -2670,7 +2775,7 @@ def track_t3_scalp_trades():
 
 
 def t3_scalp_loop():
-    print("Tight 3 loop started - S/R Sweep SHORT (bear engine, 15m, resting-limit entry, /t3_start /t3_stop)")
+    print("Tight 3 loop started - HTF CLEAN-BREAK RETEST (12H/1D/2D levels, both sides, resting-limit entry, /t3_start /t3_stop)")
     if not T3_ENGINE_ENABLED:
         print("[T3] disabled by env T3_ENGINE_ENABLED=0 - loop idle")
         while True:
@@ -2699,7 +2804,6 @@ def t3_scalp_loop():
                 get_futures_symbols() or [], min_quote_vol=T3_MIN_QUOTE_VOL,
                 max_n=T3_MAX_SYMBOLS, exclude_top_n=T3_EXCLUDE_TOP_N,
             )
-            btc_ret = t3_btc_regime()
             scanned = fired = 0
             for sym in universe:
                 if open_slots <= 0:
@@ -2712,14 +2816,14 @@ def t3_scalp_loop():
                     continue
                 scanned += 1
                 try:
-                    sig = t3s_check_signal(sym, btc_ret)
+                    sig = t3b_check_signal(sym)
                 except Exception as e:
                     print(f"[T3 SIG {sym}] {e}")
                     continue
                 if not sig:
                     continue
-                entry, sl, tp = sig
-                res = place_t3_limit(sym, entry, sl, tp)
+                side, entry, sl, tp = sig
+                res = place_t3_limit(sym, side, entry, sl, tp)
                 if res and res not in ("DEPTH_SKIP", "MARGIN_SKIP", "N/A"):
                     fired += 1
                     open_slots -= 1

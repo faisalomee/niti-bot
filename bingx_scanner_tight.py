@@ -1619,7 +1619,8 @@ def all_open_symbols():
     it from its dict and sent a "closed" Telegram - while the position stayed OPEN
     and unmanaged on BingX (COMP-USDT 2026-08-19). Every engine's dict belongs here."""
     syms = set()
-    for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades, rev2_open_trades):
+    for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades,
+              rev2_open_trades, rev4_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
@@ -2104,8 +2105,25 @@ def trailing_loop():
 
 
 # ==================== TELEGRAM COMMANDS ====================
+def _regime_line():
+    """One-line summary of which of the T3/T4 pair the current BTC regime has armed.
+    2026-08-28: they deliberately cover opposite regimes, so exactly one should be
+    armed at a time. If BTC can't be read, BOTH stand down rather than guess."""
+    try:
+        b = rev_btc_regime()
+    except Exception:
+        b = None
+    if b is None:
+        return "Regime: BTC 4d unreadable - T3 and T4 both standing down"
+    if b < T3_REGIME_MAX_BTC:
+        who = "T3 armed (bear)"
+    else:
+        who = "T4 armed (bull/flat)"
+    return f"Regime: BTC 4d {b*100:+.1f}% -> {who}"
+
+
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2219,6 +2237,36 @@ def handle_telegram_commands():
                                    str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
                                    " | TP " + str(round(_t["tp"], 6)))
                     send_tg(lines2)
+                # ---- Tight 4 = 4h range-extreme reversion SHORT: /t4_start /t4_stop ----
+                elif text == "/t4_start":
+                    if not REV4_ENGINE_ENABLED:
+                        send_tg("Tight 4 (4h-reversion short) is disabled at build level (REV4_ENGINE_ENABLED=0).")
+                    else:
+                        rev4_auto_enabled = True
+                        send_tg("Tight 4 (4h-reversion short) Auto-trade ON.")
+                elif text == "/t4_stop":
+                    rev4_auto_enabled = False
+                    send_tg("Tight 4 (4h-reversion short) Auto-trade OFF.")
+                elif text == "/t4_status":
+                    _btc4 = rev_btc_regime()
+                    _armed = (_btc4 is not None and _btc4 >= REV4_REGIME_MIN_BTC)
+                    lines4 = ("Tight 4 (4h-reversion, SHORT only): " + ("ON" if rev4_auto_enabled else "OFF") +
+                              " | Open: " + str(len(rev4_open_trades)) + "/" + str(REV4_MAX_CONCURRENT) +
+                              " | Pending: " + str(len(rev4_pending)) +
+                              "\nTrigger: " + str(round(REV4_RET_THR * 100, 1)) + "% over 4h + new 4h high + vol >=" +
+                              str(REV4_VOL_MULT) + "x" +
+                              "\nSL " + str(REV4_SL_ATR) + "xATR | TP " + str(REV4_TP_R) + "R | hold " +
+                              str(REV_HOLD_SECONDS // 3600) + "h | risk $" + str(int(REV4_RISK_USDT)) +
+                              "\nBTC 4d: " + (f"{_btc4*100:+.1f}%" if _btc4 is not None else "n/a") +
+                              " | regime: " + ("ARMED (bull/flat)" if _armed else "STANDBY - bear is T3's shift") +
+                              " (needs >= " + str(round(REV4_REGIME_MIN_BTC * 100)) + "%)")
+                    for _sym, _p in list(rev4_pending.items()):
+                        lines4 += "\n[pending] " + _sym + " " + _p["pos_side"] + " @ " + str(round(_p["entry"], 6))
+                    for _oid, _t in list(rev4_open_trades.items()):
+                        lines4 += ("\n" + _t["symbol"] + " " + _t["pos_side"] + " | entry " +
+                                   str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
+                                   " | TP " + str(round(_t["tp"], 6)))
+                    send_tg(lines4)
                 # ---- /status : everything at a glance ----
                 elif text == "/status":
                     backoff = ""
@@ -2234,7 +2282,16 @@ def handle_telegram_commands():
                         " | Open: " + str(len(rev2_open_trades)) + "/" + str(REV2_MAX_CONCURRENT) +
                         " | Pending: " + str(len(rev2_pending)) +
                         " | " + str(round(REV2_RET_THR*100)) + "% vol " + str(REV2_VOL_MULT) + "-" + str(REV2_VOL_MULT_MAX) + "x ATR%<" + str(round(REV2_ATRP_MAX*100,1)) + "% | risk $" + str(int(REV2_RISK_USDT)) + "\n"
-                        "Tight 3 (S/R Sweep SHORT): " + ("ON" if t3_scalp_auto_enabled else "OFF") + " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) + " | Pending: " + str(len(t3s_pending)) + " | TP " + str(T3_TP_R) + "R risk $" + str(int(T3_RISK_USDT)) + backoff
+                        "Tight 3 (HTF clean-break, BEAR only): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
+                        " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
+                        " | Pending: " + str(len(t3s_pending)) +
+                        " | TP " + str(T3_TP_R) + "R risk $" + str(int(T3_RISK_USDT)) + "\n"
+                        "Tight 4 (4h-reversion SHORT, bull/flat only): " + ("ON" if rev4_auto_enabled else "OFF") +
+                        " | Open: " + str(len(rev4_open_trades)) + "/" + str(REV4_MAX_CONCURRENT) +
+                        " | Pending: " + str(len(rev4_pending)) +
+                        " | " + str(round(REV4_RET_THR*100, 1)) + "%/4h vol>=" + str(REV4_VOL_MULT) +
+                        "x TP " + str(REV4_TP_R) + "R | risk $" + str(int(REV4_RISK_USDT)) + "\n" +
+                        _regime_line() + backoff
                     )
         except Exception as e:
             print(f"[TG CMD] error: {e}")
@@ -2356,6 +2413,8 @@ T3B_MIN_QUOTE_VOL   = 10_000_000   # 2026-08-27: $2M -> $10M. This is the fix fo
 T3_EXCLUDE_TOP_N    = int(os.environ.get("T3_EXCLUDE_TOP_N", 20))
 T3_MAX_SYMBOLS      = int(os.environ.get("T3_MAX_SYMBOLS", 600))
 T3_SCAN_SECONDS     = int(os.environ.get("T3_SCAN_SECONDS", 300))
+T3_REGIME_MAX_BTC   = -0.03   # 2026-08-28: T3 only scans when BTC 4d return < -3%.
+                              # See the long note in t3_scalp_loop for the numbers.
 # legacy names kept so /status and old env vars do not break
 T3_BTC_GATE         = os.environ.get("T3_BTC_GATE", "0") == "1"
 T3_BTC_MAX          = float(os.environ.get("T3_BTC_MAX", 0.03))
@@ -2815,6 +2874,23 @@ def t3_scalp_loop():
             if open_slots <= 0:
                 time.sleep(T3_SCAN_SECONDS)
                 continue
+            # 2026-08-28 BEAR-ONLY REGIME GATE. T3 is a continuation/breakout engine and
+            # it only pays in falling markets. Measured 12mo, 20bps, flat $5:
+            #   BEAR (BTC4d < -3%)  n=515  meanR +0.193  win 42.5%  +$497
+            #   BULL (BTC4d > +3%)  n=437  meanR -0.108           -$236
+            #   FLAT                n=1108 meanR -0.050           -$278
+            # Ungated over the full year that nets out to about zero (-$17), so the gate
+            # is what makes T3 pay - it is NOT optional. The cutoff was chosen on the
+            # TRAIN half and held on TEST (+0.170/+0.229), so it is not fitted to one
+            # period. Bull/flat is T4's shift; the two engines cover opposite regimes.
+            # If BTC can't be read we SKIP rather than guess (same rule as the T1/T2 gate).
+            _t3_btc = rev_btc_regime()
+            if _t3_btc is None or _t3_btc >= T3_REGIME_MAX_BTC:
+                _b = f"{_t3_btc * 100:+.1f}%" if _t3_btc is not None else "n/a"
+                print(f"[T3 SCAN] skipped - not bear regime (btc4d={_b}, "
+                      f"need < {T3_REGIME_MAX_BTC * 100:.0f}%)")
+                time.sleep(T3_SCAN_SECONDS)
+                continue
             universe = get_liquid_symbols(
                 get_futures_symbols() or [], min_quote_vol=T3B_MIN_QUOTE_VOL,
                 max_n=T3_MAX_SYMBOLS, exclude_top_n=T3_EXCLUDE_TOP_N,
@@ -2945,7 +3021,8 @@ REV_MARGIN_MIN_FREE   = float(os.environ.get("REV_MARGIN_MIN_FREE", 5.0))
 def rev_margin_in_use():
     """Margin currently committed across every engine's open + pending trades."""
     total = 0.0
-    for book in (rev_open_trades, rev_pending, rev2_open_trades, rev2_pending):
+    for book in (rev_open_trades, rev_pending, rev2_open_trades, rev2_pending,
+                 rev4_open_trades, rev4_pending):
         for t in list(book.values()):
             try:
                 total += float(t.get("margin_used", 0) or 0)
@@ -3005,8 +3082,12 @@ REV_T1 = {
 #      splitting them (ret band / liquidity / side) was measured and all three are worse. ----
 REV2_ENGINE_ENABLED   = os.environ.get("REV2_ENGINE_ENABLED", "1") == "1"
 rev2_auto_enabled     = AUTO_RESUME_ON_START   # /t2_start /t2_stop
-REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.08))
-REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.3))
+# 2026-08-28: ret 0.08 -> 0.07 and vol 1.3 -> 1.1, from a fresh independent grid.
+# Same-sim before/after (12mo, 20bps, flat $5): tr/wk 5.6 -> 7.8, win 47.3% -> 47.4%,
+# PnL $193 -> $273. Everything up or flat, no trade-off. TRAIN +0.180 / TEST +0.062,
+# flip control -0.210, survives 50bps, top-3 33%.
+REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.07))
+REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.1))
 REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 0.0))
 REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.0))
 REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 20))
@@ -3040,6 +3121,56 @@ REV_T2 = {
 }
 
 
+# ---- Tight 4 = 4h RANGE-EXTREME REVERSION SHORT (2026-08-28). Same code path as
+#      T1/T2, but the range/return window is 4h (16 bars) instead of 24h (96), which is
+#      the whole point: `pos >= 0.999` on a 24h window is what starves T1 of trades
+#      (it cuts ~1.3M candidate bars down to ~3.6k). Shrinking the window to 4h gives
+#      ~20 trades/wk instead of ~6.
+#      WHY SHORT-ONLY: the long leg was negative in every regime; skipping beats sizing.
+#      WHY THE BEAR GATE: this engine earns in bull/flat (BULL +$421, FLAT +$121) and
+#      is ~flat in bear (+$41). T3's clean-break engine covers bear instead - the two
+#      are near-perfect regime complements and that pairing is the reason both are on.
+#      Measured 12mo Aug2025-Jul2026, 20bps, flat $5, strict sim, gated:
+#      834 trades, meanR +0.130, +$542. Ungated short-only was 20/wk +0.110 +$584,
+#      TRAIN +0.140 / TEST +0.073, top-3 only 25%, survives 50bps.
+#      DO NOT retune: TP 0.5-2.0R and SL 1.5-3.0xATR x hold 24/48/72h were all swept;
+#      TP 2.0R + SL 2.0xATR + 48h is the grid optimum and the only cell that holds at
+#      50bps. Loosening ret below 2.5% raises trade count but breaks TEST/slippage. ----
+REV4_ENGINE_ENABLED   = os.environ.get("REV4_ENGINE_ENABLED", "1") == "1"
+rev4_auto_enabled     = AUTO_RESUME_ON_START   # /t4_start /t4_stop
+REV4_RET_THR          = 0.025   # 2.5% over 4h
+REV4_VOL_MULT         = 1.3
+REV4_RET_WINDOW       = 16      # 16 x 15m = 4h
+REV4_RANGE_WINDOW     = 16
+REV4_SL_ATR           = 2.0
+REV4_TP_R             = 2.0
+REV4_REGIME_MIN_BTC   = -0.03   # only run when BTC 4d >= -3% (bull/flat); bear is T3's
+REV4_MAX_CONCURRENT   = int(os.environ.get("REV4_MAX_CONCURRENT", 20))
+REV4_RISK_USDT        = float(os.environ.get("REV4_RISK_USDT", 5.0))
+REV4_MAX_MARGIN_USDT  = float(os.environ.get("REV4_MAX_MARGIN_USDT", 40))
+REV4_SCAN_SECONDS     = int(os.environ.get("REV4_SCAN_SECONDS", 300))
+REV4_COOLDOWN_SECONDS = int(os.environ.get("REV4_COOLDOWN_SECONDS", 6 * 3600))
+
+rev4_open_trades = {}
+rev4_pending     = {}
+rev4_last_fire   = {}
+
+REV_T4 = {
+    "name": "TIGHT 4", "tag": "t4",
+    "ret_thr": REV4_RET_THR, "vol_mult": REV4_VOL_MULT, "vol_mult_max": 0.0,
+    "atrp_max": 0.0,
+    "ret_window": REV4_RET_WINDOW, "range_window": REV4_RANGE_WINDOW,
+    "side_only": "SELL",
+    "regime_min_btc": REV4_REGIME_MIN_BTC,
+    "long_sl_atr": REV4_SL_ATR, "long_tp_r": REV4_TP_R,
+    "short_sl_atr": REV4_SL_ATR, "short_tp_r": REV4_TP_R,
+    "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV4_RISK_USDT, "leverage": REV_LEVERAGE,
+    "max_concurrent": REV4_MAX_CONCURRENT, "max_margin": REV4_MAX_MARGIN_USDT,
+    "cooldown_s": REV4_COOLDOWN_SECONDS,
+    "open": rev4_open_trades, "pending": rev4_pending, "last_fire": rev4_last_fire,
+}
+
+
 def rev_in_cooldown(symbol, eng):
     cd = eng.get("cooldown_s", REV_COOLDOWN_SECONDS)
     return (time.time() - eng["last_fire"].get(symbol, 0)) < cd
@@ -3057,7 +3188,8 @@ def rev_try_claim(symbol):
     another rev engine already holds/reserved it."""
     with _rev_claim_lock:
         if (symbol in rev_claimed or symbol in all_open_symbols()
-                or symbol in rev_pending or symbol in rev2_pending):
+                or symbol in rev_pending or symbol in rev2_pending
+                or symbol in rev4_pending):
             return False
         rev_claimed.add(symbol)
         return True
@@ -3071,7 +3203,8 @@ def rev_release_claim(symbol):
 def rev_symbol_busy(symbol, eng):
     # A coin held/pending/claimed by ANY engine is off-limits (prevents T1 and T2 both grabbing it).
     return (symbol in all_open_symbols() or symbol in eng["pending"]
-            or symbol in rev_pending or symbol in rev2_pending or symbol in rev_claimed)
+            or symbol in rev_pending or symbol in rev2_pending
+            or symbol in rev4_pending or symbol in rev_claimed)
 
 
 def rev_btc_regime():
@@ -3222,7 +3355,11 @@ def flow_allows(symbol, side, want_opposing, label=""):
 def rev_check_signal(symbol, btc_ret, eng):
     """Return (side, entry_px, sl_px, tp_px) or None. side 'BUY' (long) / 'SELL' (short).
     Config-driven so Tight 1 (wide) and Tight 2 (ceiling filters) share one code path."""
-    need = max(REV_RET_WINDOW, REV_RANGE_WINDOW) + REV_ATR_LEN + 5
+    # 2026-08-28: windows are engine-configurable so T4 can use a 4h (16-bar) window
+    # while T1/T2 keep 24h (96 bars). Engines that don't set them fall back to the globals.
+    ret_win   = eng.get("ret_window", REV_RET_WINDOW)
+    range_win = eng.get("range_window", REV_RANGE_WINDOW)
+    need = max(ret_win, range_win) + REV_ATR_LEN + 5
     candles = get_candles(symbol, limit=need, interval="15m")
     if not candles or len(candles) < need:
         return None
@@ -3235,7 +3372,7 @@ def rev_check_signal(symbol, btc_ret, eng):
     if px <= 0 or px < 0.001:
         return None
 
-    past = closes[-(REV_RET_WINDOW + 1)]
+    past = closes[-(ret_win + 1)]
     if past <= 0:
         return None
     ret = px / past - 1.0
@@ -3253,14 +3390,14 @@ def rev_check_signal(symbol, btc_ret, eng):
     # off-by-one on the range window and included current volume in its own median
     # (a big current-bar volume was inflating the very median it's compared against,
     # making vr>=1.3 harder to reach). Both now match the backtest precisely.
-    win_hi = max(highs[-(REV_RANGE_WINDOW + 1):])
-    win_lo = min(lows[-(REV_RANGE_WINDOW + 1):])
+    win_hi = max(highs[-(range_win + 1):])
+    win_lo = min(lows[-(range_win + 1):])
     if win_hi <= win_lo:
         return None
     pos = (px - win_lo) / (win_hi - win_lo)
 
-    vol_window = vols[-(REV_RANGE_WINDOW + 1):-1]   # prior N bars, excludes current
-    if len(vol_window) < REV_RANGE_WINDOW:
+    vol_window = vols[-(range_win + 1):-1]   # prior N bars, excludes current
+    if len(vol_window) < range_win:
         return None
     med_vol = sorted(vol_window)[len(vol_window) // 2]
     if med_vol <= 0:
@@ -3295,10 +3432,24 @@ def rev_check_signal(symbol, btc_ret, eng):
     if side is None:
         return None
 
+    # 2026-08-28: T4 is SHORT-ONLY. Its long leg measured negative in EVERY regime
+    # (bear -0.101, flat -0.101, bull +0.024) so it is skipped, not down-sized.
+    # T1/T2 leave side_only unset and keep both legs.
+    if eng.get("side_only") and side != eng["side_only"]:
+        return None
+
     if btc_ret is not None:
         if side == "BUY" and btc_ret < -REV_BTC_THR:
             return None
         if side == "SELL" and btc_ret > REV_BTC_THR:
+            return None
+        # 2026-08-28 REGIME GATE (T4 only): the 4h-reversion short is a BULL/FLAT
+        # engine. Measured over 12mo: BULL +$421, FLAT +$121, BEAR only +$41. In bear
+        # T3's clean-break engine takes over instead. Cutoff -3% was picked on the
+        # TRAIN half and held on TEST (+0.181/+0.069 at >=-3%), so it is not fitted
+        # to one period. Engines without regime_min_btc are unaffected.
+        rmin = eng.get("regime_min_btc")
+        if rmin is not None and btc_ret < rmin:
             return None
 
     if side == "BUY":
@@ -3609,6 +3760,13 @@ def rev2_loop():
         return
     _rev_engine_loop(REV_T2, lambda: rev2_auto_enabled, REV2_SCAN_SECONDS)
 
+
+def rev4_loop():
+    if not REV4_ENGINE_ENABLED:
+        print("[REV] Tight 4 disabled by env REV4_ENGINE_ENABLED=0 - loop idle")
+        return
+    _rev_engine_loop(REV_T4, lambda: rev4_auto_enabled, REV4_SCAN_SECONDS)
+
 # ==================== END TIGHT 1 (24h-reversion) ====================
 
 
@@ -3708,4 +3866,5 @@ if __name__ == "__main__":
     Thread(target=oi_collector_loop,        daemon=True).start()   # OI logger -> Supabase (2026-08-10)
     Thread(target=t3_scalp_loop,            daemon=True).start()   # Tight 3 = S/R Sweep SHORT bear engine (2026-08-23)
     Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
+    Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

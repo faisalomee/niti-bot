@@ -442,7 +442,12 @@ def get_candles(symbol, limit=350, interval="15m", end_time=None):
         else:
             print(f"[CANDLES ERROR] {symbol} {interval} limit={limit} - non-list response: {str(r)[:300]}")
         return []
-    if len(candles) < min(limit, 50):
+    # 2026-08-28: the threshold used to be `min(limit, 50)`, which meant a caller asking
+    # for 115 and getting 114 - or even getting 51 - never logged anything. That blind
+    # spot is what let the rev-engine candle bug run unnoticed. Now it reports any
+    # shortfall worth acting on, while tolerating the routine off-by-a-couple that
+    # happens when the newest bar has not closed yet.
+    if len(candles) < limit - 2:
         print(f"[CANDLES SHORT] {symbol} {interval} requested={limit} got={len(candles)} - raw: {str(r)[:300]}")
     candles.sort(key=lambda x: x["time"])
     return candles
@@ -3352,6 +3357,23 @@ def flow_allows(symbol, side, want_opposing, label=""):
     return ok, flow, covered
 
 
+REV_CANDLE_BUFFER = 15   # 2026-08-28: extra candles requested over the strict minimum.
+                         # See the note in rev_check_signal - a zero-margin request was
+                         # silently starving all three rev engines. Surplus is never read.
+
+_rev_thin_logged = {}    # symbol -> last time we complained it had too few candles
+
+def _rev_log_thin(symbol, eng, got, need):
+    """Say it out loud when an engine skips a coin for want of candles, throttled to
+    once per symbol per 10 min so a market-wide API problem is visible in the Render
+    log without flooding it. Silence here is exactly what hid the bug above."""
+    now = time.time()
+    if now - _rev_thin_logged.get(symbol, 0) < 600:
+        return
+    _rev_thin_logged[symbol] = now
+    print(f"[REV THIN] {eng['tag'].upper()} {symbol} skipped - got {got} candles, needs {need}")
+
+
 def rev_check_signal(symbol, btc_ret, eng):
     """Return (side, entry_px, sl_px, tp_px) or None. side 'BUY' (long) / 'SELL' (short).
     Config-driven so Tight 1 (wide) and Tight 2 (ceiling filters) share one code path."""
@@ -3360,8 +3382,19 @@ def rev_check_signal(symbol, btc_ret, eng):
     ret_win   = eng.get("ret_window", REV_RET_WINDOW)
     range_win = eng.get("range_window", REV_RANGE_WINDOW)
     need = max(ret_win, range_win) + REV_ATR_LEN + 5
-    candles = get_candles(symbol, limit=need, interval="15m")
+    # 2026-08-28 BUGFIX - this line is why the engines could scan 148 coins and fire 0.
+    # It used to request EXACTLY `need` and then reject on `len < need`, i.e. zero
+    # margin: BingX returning even ONE candle fewer than asked killed the signal, on
+    # every coin, every cycle, silently. Caught in the Render log as
+    #   [CANDLES SHORT] PENGU-USDT 15m requested=35 got=34
+    # for T4 (need=35). T1/T2 (need=115) had the same hole but never logged it - the
+    # old log threshold only fired under 50 candles, so a 114-of-115 came back clean.
+    # Fix is to ask for a cushion and keep requiring `need`. Asking for extra is free:
+    # every calculation below indexes from the END (closes[-1], closes[-(ret_win+1)],
+    # highs[-(range_win+1):]), so surplus leading candles are simply never read.
+    candles = get_candles(symbol, limit=need + REV_CANDLE_BUFFER, interval="15m")
     if not candles or len(candles) < need:
+        _rev_log_thin(symbol, eng, len(candles) if candles else 0, need)
         return None
     closes = [cl(c) for c in candles]
     highs  = [h(c)  for c in candles]

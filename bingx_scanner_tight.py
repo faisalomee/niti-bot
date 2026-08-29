@@ -555,6 +555,19 @@ def o(c):  return float(c["open"])
 def v(c):  return float(c["volume"])
 
 
+def _bar_ms(c):
+    """Open-time of a candle in ms, or 0 if the field is missing/unparseable.
+    Callers use `ts % interval_ms == 0` to tell a CLOSED bar from a still-forming
+    one: a real kline open_time is always a multiple of the interval, while BingX
+    stamps the live bar with the current server time (observed 2026-08-28:
+    ...914000000, i.e. 100s past a 15m boundary). Returning 0 on failure makes the
+    caller treat the bar as closed, i.e. change nothing - fail safe, not fail open."""
+    try:
+        return int(c.get("time") or c.get("T") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 # ==================== TELEGRAM ====================
 def send_tg(msg, chat_id=None):
     cid = chat_id or TG_CHAT_ID
@@ -3150,6 +3163,20 @@ REV4_RANGE_WINDOW     = 16
 REV4_SL_ATR           = 2.0
 REV4_TP_R             = 2.0
 REV4_REGIME_MIN_BTC   = -0.03   # only run when BTC 4d >= -3% (bull/flat); bear is T3's
+# 2026-08-29: T4 ONLY - liquidity floor $2M -> $1M. T4's edge lives in thin coins
+# (measured: excluding the top-80 liquid names gives TEST +0.123, keeping only those
+# 80 gives TEST -0.022), so lowering the floor sends it further into where the edge
+# actually is rather than diluting it. Measured 12mo Aug25-Jul26, 20bps, flat $5,
+# same sim both sides: tr/wk 16.2 -> 19.4 (+20%), PnL $566 -> $654 (+16%), meanR
+# +0.134 -> +0.129, win 40.3% -> 40.2%, TRAIN +0.191/+0.190, TEST +0.066/+0.068,
+# positive months 7/12 -> 8/12, coins 189 -> 195, top-3 share 24% -> 28%.
+# RISK, stated plainly: the extra trades are in THINNER books. At 50bps the new floor
+# is actually slightly WORSE ($1.86/wk vs $2.12/wk) and at 100bps clearly worse
+# (-$15.95 vs -$12.42). The +16% is real only if live slippage stays near 20bps.
+# Faisal's own live slippage has hit ~100bps on thin names (ONG, VELVET), so if the
+# journal starts showing SL fills far past the trigger, put this back to 2_000_000.
+# $0.2M was also measured (20.9/wk, $14.1/wk) and deliberately NOT taken - too thin.
+REV4_MIN_QUOTE_VOL    = float(os.environ.get("REV4_MIN_QUOTE_VOL", 1_000_000))
 REV4_MAX_CONCURRENT   = int(os.environ.get("REV4_MAX_CONCURRENT", 20))
 REV4_RISK_USDT        = float(os.environ.get("REV4_RISK_USDT", 5.0))
 REV4_MAX_MARGIN_USDT  = float(os.environ.get("REV4_MAX_MARGIN_USDT", 40))
@@ -3167,6 +3194,7 @@ REV_T4 = {
     "ret_window": REV4_RET_WINDOW, "range_window": REV4_RANGE_WINDOW,
     "side_only": "SELL",
     "regime_min_btc": REV4_REGIME_MIN_BTC,
+    "min_quote_vol": REV4_MIN_QUOTE_VOL,
     "long_sl_atr": REV4_SL_ATR, "long_tp_r": REV4_TP_R,
     "short_sl_atr": REV4_SL_ATR, "short_tp_r": REV4_TP_R,
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV4_RISK_USDT, "leverage": REV_LEVERAGE,
@@ -3374,6 +3402,35 @@ def _rev_log_thin(symbol, eng, got, need):
     print(f"[REV THIN] {eng['tag'].upper()} {symbol} skipped - got {got} candles, needs {need}")
 
 
+_rev_diag_last = 0
+
+def _rev_candle_diag():
+    """Print, at most every 30 min, whether BingX's newest 15m candle is a CLOSED bar
+    or a still-forming one. This exists to SETTLE that question with evidence instead
+    of inference - the conditional drop in rev_check_signal was written without being
+    able to verify it from the dev container. Read this line in the Render log:
+      last_bar aligned=True  -> BingX returns closed bars; nothing is being dropped
+      last_bar aligned=False -> the live bar was being used as if closed; now dropped
+    Cost is one BTC candle fetch per half hour."""
+    global _rev_diag_last
+    now = time.time()
+    if now - _rev_diag_last < 1800:
+        return
+    _rev_diag_last = now
+    try:
+        cs = get_candles("BTC-USDT", limit=3, interval="15m")
+        if not cs:
+            print("[REV DIAG] no BTC candles returned")
+            return
+        t = _bar_ms(cs[-1])
+        aligned = bool(t) and (t % 900000 == 0)
+        age_s = int(now - t / 1000) if t else -1
+        print(f"[REV DIAG] last_bar ts={t} aligned={aligned} age={age_s}s "
+              f"-> {'closed bar' if aligned else 'FORMING bar (dropped)'}")
+    except Exception as e:
+        print(f"[REV DIAG] failed: {e}")
+
+
 def rev_check_signal(symbol, btc_ret, eng):
     """Return (side, entry_px, sl_px, tp_px) or None. side 'BUY' (long) / 'SELL' (short).
     Config-driven so Tight 1 (wide) and Tight 2 (ceiling filters) share one code path."""
@@ -3393,6 +3450,29 @@ def rev_check_signal(symbol, btc_ret, eng):
     # every calculation below indexes from the END (closes[-1], closes[-(ret_win+1)],
     # highs[-(range_win+1):]), so surplus leading candles are simply never read.
     candles = get_candles(symbol, limit=need + REV_CANDLE_BUFFER, interval="15m")
+    # 2026-08-28: work on CLOSED bars only. The backtest that produced every number for
+    # T1/T2/T4 measured closed 15m bars, but this function was reading candles[-1]
+    # directly. If BingX includes the still-forming bar, that mismatch is severe:
+    #   - vols[-1] is a PARTIAL bar's volume compared against a median of FULL bars.
+    #     Scanning every 5 min on a 15m bar means ~1/3 of the volume has printed, so a
+    #     1.3x filter really demands ~3.9x. On the T4 backtest signals that alone cuts
+    #     1078 -> 244, i.e. ~77% of signals never fire.
+    #   - pos >= 0.999 compares the live price against a window whose high includes the
+    #     forming bar's own running high, so it asks "is price within 0.1% of this bar's
+    #     high at this instant" instead of "did the bar CLOSE at its high".
+    # Every other engine in this file already guards this (see candles[:-1] "closed
+    # candles only" in get_btc_direction and the T1 daily logic); the rev path never did.
+    #
+    # CONDITIONAL BY DESIGN. I could not verify from here whether BingX returns the
+    # forming bar, so this does not assume it. A real kline open_time is always a
+    # multiple of the interval; the forming bar in Faisal's PENGU log carried a
+    # non-aligned timestamp (10:46:40, 100s past the boundary). So drop the last bar
+    # ONLY when its timestamp proves it is unclosed. If BingX already returns closed
+    # bars, nothing is dropped and behaviour is unchanged - correct either way.
+    if candles:
+        _t = _bar_ms(candles[-1])
+        if _t and (_t % 900000) != 0:
+            candles = candles[:-1]
     if not candles or len(candles) < need:
         _rev_log_thin(symbol, eng, len(candles) if candles else 0, need)
         return None
@@ -3717,7 +3797,12 @@ def rev_track_trades(eng):
 def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
     """Shared scan/track loop for a rev engine descriptor."""
     name = eng["name"]
-    print(f"{name} loop started - 24h-reversion, resting-limit entry")
+    # 2026-08-28: was hardcoded "24h-reversion" for every engine, which mislabelled T4
+    # (a 4h window) in the Render log. Describe the engine actually starting.
+    _win_h = eng.get("range_window", REV_RANGE_WINDOW) * 15 // 60
+    _sides = eng.get("side_only") or "both sides"
+    print(f"{name} loop started - {_win_h}h range-extreme reversion, {_sides}, "
+          f"resting-limit entry")
     while True:
         try:
             rev_track_pending(eng)
@@ -3736,11 +3821,16 @@ def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
                 continue
 
             all_syms = get_futures_symbols()
+            # 2026-08-29: the floor is per-engine now. It used to be REV_MIN_QUOTE_VOL for
+            # everyone, so lowering it for T4 would silently have moved T1 and T2 too -
+            # and neither of those was tested at a lower floor. Engines that don't set
+            # min_quote_vol keep the shared $2M default, i.e. T1/T2 are untouched.
             symbols = get_liquid_symbols(
-                all_syms, min_quote_vol=REV_MIN_QUOTE_VOL,
+                all_syms, min_quote_vol=eng.get("min_quote_vol", REV_MIN_QUOTE_VOL),
                 max_n=REV_MAX_SYMBOLS, exclude_top_n=REV_EXCLUDE_TOP_N,
             )
             btc_ret = rev_btc_regime()
+            _rev_candle_diag()
             scanned = fired = 0
             for sym in symbols:
                 if open_slots <= 0:

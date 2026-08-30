@@ -1638,7 +1638,7 @@ def all_open_symbols():
     and unmanaged on BingX (COMP-USDT 2026-08-19). Every engine's dict belongs here."""
     syms = set()
     for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades,
-              rev2_open_trades, rev4_open_trades):
+              rev2_open_trades, rev4_open_trades, rev5_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
@@ -2141,7 +2141,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2262,6 +2262,15 @@ def handle_telegram_commands():
                     else:
                         rev4_auto_enabled = True
                         send_tg("Tight 4 (4h-reversion short) Auto-trade ON.")
+                elif text == "/t5_start":
+                    if not REV5_ENGINE_ENABLED:
+                        send_tg("Tight 5 (crash-continuation short) is disabled at build level (REV5_ENGINE_ENABLED=0).")
+                    else:
+                        rev5_auto_enabled = True
+                        send_tg("Tight 5 (crash-continuation short) Auto-trade ON.")
+                elif text == "/t5_stop":
+                    rev5_auto_enabled = False
+                    send_tg("Tight 5 (crash-continuation short) Auto-trade OFF.")
                 elif text == "/t4_stop":
                     rev4_auto_enabled = False
                     send_tg("Tight 4 (4h-reversion short) Auto-trade OFF.")
@@ -2304,6 +2313,9 @@ def handle_telegram_commands():
                         " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
                         " | Pending: " + str(len(t3s_pending)) +
                         " | TP " + str(T3_TP_R) + "R risk $" + str(int(T3_RISK_USDT)) + "\n"
+                        "Tight 5 (crash-continuation SHORT, wide-range only): " + ("ON" if rev5_auto_enabled else "OFF") +
+                        " | Open: " + str(len(rev5_open_trades)) + "/" + str(REV5_MAX_CONCURRENT) +
+                        " | risk $" + str(REV5_RISK_USDT) + "\n" +
                         "Tight 4 (4h-reversion SHORT, bull/flat only): " + ("ON" if rev4_auto_enabled else "OFF") +
                         " | Open: " + str(len(rev4_open_trades)) + "/" + str(REV4_MAX_CONCURRENT) +
                         " | Pending: " + str(len(rev4_pending)) +
@@ -3017,13 +3029,14 @@ REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 2.5))
 REV_SL_CAP_PCT       = float(os.environ.get("REV_SL_CAP_PCT", 0.06))  # skip if SL > 6% away
 REV_BTC_WINDOW       = int(os.environ.get("REV_BTC_WINDOW", 384))     # 384 x 15m = 4 days
 REV_BTC_THR          = float(os.environ.get("REV_BTC_THR", 0.12))     # regime gate at +/-12%
-REV_HOLD_SECONDS     = 48 * 3600   # 2026-08-27: 24h -> 48h. Same grid; the winner
+REV_HOLD_SECONDS     = int(os.environ.get("REV_HOLD_SECONDS", 12 * 3600))  # 2026-08-30: 48h -> 12h (slot turnover; sweep 6/12/24/48h)
+_REV_HOLD_OLD_NOTE   = 48 * 3600   # 2026-08-27: 24h -> 48h. Same grid; the winner
                                    # at every robust setting held 48h. Shared by T1/T2.
 REV_COOLDOWN_SECONDS = int(os.environ.get("REV_COOLDOWN_SECONDS", 6 * 3600))
 REV_FILL_BARS        = int(os.environ.get("REV_FILL_BARS", 4))        # cancel the resting limit after 4 bars (1h)
-REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 5.0))
+REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 1.5))   # 2026-08-30: sized for a $150 account at 10x (margin-bound, not drawdown-bound)
 REV_LEVERAGE         = int(os.environ.get("REV_LEVERAGE", 10))
-REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 20))
+REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 30))   # 2026-08-30: 20 -> 30 (cap sweep with both filters on)
 REV_MAX_MARGIN_USDT  = float(os.environ.get("REV_MAX_MARGIN_USDT", 40))
 
 # ---- 2026-08-25 SHARED MARGIN BUDGET -------------------------------------------------
@@ -3083,6 +3096,7 @@ REV_T1 = {
     "short_sl_atr": REV_SHORT_SL_ATR, "short_tp_r": REV_SHORT_TP_R,
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV_RISK_USDT, "leverage": REV_LEVERAGE,
     "max_concurrent": REV_MAX_CONCURRENT, "max_margin": REV_MAX_MARGIN_USDT,
+    "cvd_filter": True, "range_regime": "CALM",   # 2026-08-30: reversion -> calm + CVD
     "open": rev_open_trades, "pending": rev_pending, "last_fire": rev_last_fire,
 }
 
@@ -3108,8 +3122,8 @@ REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.07))
 REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.1))
 REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 0.0))
 REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.0))
-REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 20))
-REV2_RISK_USDT        = float(os.environ.get("REV2_RISK_USDT", 5.0))
+REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 30))  # 2026-08-30: 20 -> 30
+REV2_RISK_USDT        = float(os.environ.get("REV2_RISK_USDT", 1.5))
 REV2_MAX_MARGIN_USDT  = float(os.environ.get("REV2_MAX_MARGIN_USDT", 40))
 REV2_SCAN_SECONDS     = int(os.environ.get("REV2_SCAN_SECONDS", 300))
 
@@ -3135,6 +3149,7 @@ REV_T2 = {
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV2_RISK_USDT, "leverage": REV_LEVERAGE,
     "max_concurrent": REV2_MAX_CONCURRENT, "max_margin": REV2_MAX_MARGIN_USDT,
     "cooldown_s": REV2_COOLDOWN_SECONDS,
+    "cvd_filter": True, "range_regime": None,     # 2026-08-30: CVD yes, range filter measured WORSE for T2
     "open": rev2_open_trades, "pending": rev2_pending, "last_fire": rev2_last_fire,
 }
 
@@ -3177,8 +3192,8 @@ REV4_REGIME_MIN_BTC   = -0.03   # only run when BTC 4d >= -3% (bull/flat); bear 
 # journal starts showing SL fills far past the trigger, put this back to 2_000_000.
 # $0.2M was also measured (20.9/wk, $14.1/wk) and deliberately NOT taken - too thin.
 REV4_MIN_QUOTE_VOL    = float(os.environ.get("REV4_MIN_QUOTE_VOL", 1_000_000))
-REV4_MAX_CONCURRENT   = int(os.environ.get("REV4_MAX_CONCURRENT", 20))
-REV4_RISK_USDT        = float(os.environ.get("REV4_RISK_USDT", 5.0))
+REV4_MAX_CONCURRENT   = int(os.environ.get("REV4_MAX_CONCURRENT", 30))  # 2026-08-30: 20 -> 30
+REV4_RISK_USDT        = float(os.environ.get("REV4_RISK_USDT", 1.5))
 REV4_MAX_MARGIN_USDT  = float(os.environ.get("REV4_MAX_MARGIN_USDT", 40))
 REV4_SCAN_SECONDS     = int(os.environ.get("REV4_SCAN_SECONDS", 300))
 REV4_COOLDOWN_SECONDS = int(os.environ.get("REV4_COOLDOWN_SECONDS", 6 * 3600))
@@ -3200,7 +3215,223 @@ REV_T4 = {
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV4_RISK_USDT, "leverage": REV_LEVERAGE,
     "max_concurrent": REV4_MAX_CONCURRENT, "max_margin": REV4_MAX_MARGIN_USDT,
     "cooldown_s": REV4_COOLDOWN_SECONDS,
+    "cvd_filter": True, "range_regime": "CALM",   # 2026-08-30: reversion -> calm + CVD
     "open": rev4_open_trades, "pending": rev4_pending, "last_fire": rev4_last_fire,
+}
+
+
+# ============================================================================
+# ==================== TIGHT 5 = CRASH-CONTINUATION SHORT ====================
+# 2026-08-30. Derived from a retail "Heikin-Ashi + Supertrend + EMA200" doc that
+# measured -0.41 meanR exactly as written. Keeping only the SHORT leg, gating it
+# on a large prior fall, fixing the Supertrend parameters and sweeping the exits
+# took it to +0.245. It is the only one of thirteen retail docs that produced a
+# usable engine.
+#
+# SIGNAL (SHORT only, all coins, qv24 >= $2M, one per coin per day):
+#   Gate:      24h return <= -20%   (the crash that makes the setup rare)
+#   Trigger A: Heikin-Ashi Supertrend(period 7, factor 2.0) flips DOWN and
+#              close < EMA200
+#   Trigger B: EMA/CCI/MACD bearish zero-cross - close < EMA250, MACD hist < 0,
+#              CCI(14) crosses from >=0 to <0, and CCI was above +100 in the
+#              last 12 bars
+#   Fire on EITHER (A OR B). They almost never coincide on the same bar (n=20 in
+#   12 months) even though they share ~70% of the same coin-days: same crash,
+#   different moment. AND is not viable; OR is.
+# EXIT: SL 3.0 x ATR14, TP 1.5R, hold 4 days. TP distance is 4.5 ATR, so this is
+#   NOT a small-TP artifact. The 36-cell SL x TP x hold grid was ALL positive on
+#   the untouched test half - do not retune.
+#
+# MEASURED (12mo Aug2025-Jul2026, 459 coins, 20bps, flat $5, strict sim):
+#   A only  780 trades, 15.7/wk, meanR +0.244, TRAIN +0.313 / TEST +0.147
+#   B only  305 trades,  6.1/wk, meanR +0.423, TRAIN +0.534 / TEST +0.186
+#   A OR B  872 trades, 17.5/wk, meanR +0.255, TRAIN +0.320 / TEST +0.168
+#   Bootstrap P(edge>0) = 100%. Slippage: 0bps +0.281, 50bps +0.192, 100bps
+#   +0.103 - by far the most slippage-tolerant engine here, because the stop is
+#   wide (median 6.4% of price) so cost in R is small.
+#
+# THE CAVEAT, AND IT MUST BE REPEATED WHENEVER THIS ENGINE IS QUOTED:
+#   October 2025 alone is 88% of the PnL (277 of 872 trades, meanR +0.609) - it
+#   was the big crash month. EXCLUDING it, meanR falls +0.245 -> +0.046 and the
+#   train half turns NEGATIVE. This is a CRASH/TAIL engine, not an all-weather
+#   one. Quiet months are ~zero. Its value in the portfolio is that it pays
+#   exactly when T1/T2/T4 (bull/flat reversion bets) lose: adding it moved
+#   positive months 7/12 -> 9/12 and closed the train/test gap. Judge it on
+#   drawdown smoothing, never on standalone PnL.
+#
+# Range regime WIDE (continuation engine). NO CVD filter - crash entries never
+# print a new high so the divergence flag can never fire.
+# ============================================================================
+
+REV5_ENGINE_ENABLED   = os.environ.get("REV5_ENGINE_ENABLED", "1") == "1"
+rev5_auto_enabled     = AUTO_RESUME_ON_START   # /t5_start /t5_stop
+REV5_CRASH_RET        = float(os.environ.get("REV5_CRASH_RET", -0.20))   # 24h return gate
+REV5_RET_WINDOW       = 96      # 96 x 15m = 24h
+REV5_ST_PERIOD        = 7
+REV5_ST_FACTOR        = 2.0
+REV5_SL_ATR           = 3.0
+REV5_TP_R             = 1.5
+REV5_HOLD_SECONDS     = int(os.environ.get("REV5_HOLD_SECONDS", 96 * 3600))   # 4 days
+REV5_MIN_QUOTE_VOL    = float(os.environ.get("REV5_MIN_QUOTE_VOL", 2_000_000))
+REV5_MAX_CONCURRENT   = int(os.environ.get("REV5_MAX_CONCURRENT", 30))
+REV5_RISK_USDT        = float(os.environ.get("REV5_RISK_USDT", 1.5))
+REV5_MAX_MARGIN_USDT  = float(os.environ.get("REV5_MAX_MARGIN_USDT", 40))
+REV5_SCAN_SECONDS     = int(os.environ.get("REV5_SCAN_SECONDS", 300))
+REV5_COOLDOWN_SECONDS = int(os.environ.get("REV5_COOLDOWN_SECONDS", 24 * 3600))
+
+rev5_open_trades = {}
+rev5_pending     = {}
+rev5_last_fire   = {}
+
+
+def _ema_list(vals, n):
+    if not vals:
+        return []
+    k = 2.0 / (n + 1.0)
+    out = [vals[0]]
+    for x in vals[1:]:
+        out.append(x * k + out[-1] * (1.0 - k))
+    return out
+
+
+def _heikin(opens, highs, lows, closes):
+    ha_c = [(opens[i] + highs[i] + lows[i] + closes[i]) / 4.0 for i in range(len(closes))]
+    ha_o = [(opens[0] + closes[0]) / 2.0]
+    for i in range(1, len(closes)):
+        ha_o.append((ha_o[-1] + ha_c[i - 1]) / 2.0)
+    ha_h = [max(highs[i], ha_o[i], ha_c[i]) for i in range(len(closes))]
+    ha_l = [min(lows[i], ha_o[i], ha_c[i]) for i in range(len(closes))]
+    return ha_o, ha_h, ha_l, ha_c
+
+
+def _supertrend_dir(highs, lows, closes, period, factor):
+    """Wilder-smoothed ATR Supertrend. Returns the direction list (+1 up, -1 down)."""
+    n = len(closes)
+    if n < period + 2:
+        return None
+    trs = []
+    for i in range(n):
+        pc = closes[i - 1] if i > 0 else closes[0]
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - pc), abs(lows[i] - pc)))
+    a = [trs[0]]
+    k = 1.0 / period
+    for x in trs[1:]:
+        a.append(x * k + a[-1] * (1.0 - k))
+    fu = [(highs[0] + lows[0]) / 2.0 + factor * a[0]]
+    fl = [(highs[0] + lows[0]) / 2.0 - factor * a[0]]
+    d  = [1]
+    for i in range(1, n):
+        hl2 = (highs[i] + lows[i]) / 2.0
+        ub, lb = hl2 + factor * a[i], hl2 - factor * a[i]
+        fu.append(ub if (ub < fu[-1] or closes[i - 1] > fu[-1]) else fu[-1])
+        fl.append(lb if (lb > fl[-1] or closes[i - 1] < fl[-1]) else fl[-1])
+        if d[-1] == 1:
+            d.append(-1 if closes[i] < fl[-1] else 1)
+        else:
+            d.append(1 if closes[i] > fu[-1] else -1)
+    return d
+
+
+def _cci_list(highs, lows, closes, n=14):
+    out = []
+    for i in range(len(closes)):
+        if i < n - 1:
+            out.append(None); continue
+        tps = [(highs[j] + lows[j] + closes[j]) / 3.0 for j in range(i - n + 1, i + 1)]
+        sma = sum(tps) / n
+        md = sum(abs(x - sma) for x in tps) / n
+        out.append(None if md == 0 else (tps[-1] - sma) / (0.015 * md))
+    return out
+
+
+def rev5_check_signal(symbol, btc_ret, eng):
+    """T5 crash-continuation SHORT. Returns (side, entry, sl, tp) or None."""
+    need = 300
+    candles = get_candles(symbol, limit=need + REV_CANDLE_BUFFER, interval="15m")
+    if candles:
+        _t = _bar_ms(candles[-1])
+        if _t and (_t % 900000) != 0:
+            candles = candles[:-1]           # closed bars only
+    if not candles or len(candles) < need:
+        return None
+    opens  = [float(c["open"]) for c in candles]
+    closes = [cl(c) for c in candles]
+    highs  = [h(c)  for c in candles]
+    lows   = [l(c)  for c in candles]
+
+    px = closes[-1]
+    if px <= 0 or px < 0.001:
+        return None
+
+    # ---- crash gate: 24h return <= -20% ----
+    past = closes[-(REV5_RET_WINDOW + 1)]
+    if past <= 0:
+        return None
+    if (px / past - 1.0) > REV5_CRASH_RET:
+        return None
+
+    atr = atr_series(highs, lows, closes, REV_ATR_LEN)
+    if not atr or atr[-1] is None or atr[-1] <= 0:
+        return None
+    atr_now = atr[-1]
+
+    ema200 = _ema_list(closes, 200)
+    ema250 = _ema_list(closes, 250)
+
+    # ---- trigger A: Heikin-Ashi Supertrend flip DOWN + close < EMA200 ----
+    trigger = None
+    ha_o, ha_h, ha_l, ha_c = _heikin(opens, highs, lows, closes)
+    d = _supertrend_dir(ha_h, ha_l, ha_c, REV5_ST_PERIOD, REV5_ST_FACTOR)
+    if d and len(d) >= 2 and d[-1] == -1 and d[-2] == 1 and px < ema200[-1]:
+        trigger = "ST"
+
+    # ---- trigger B: EMA/CCI/MACD bearish zero-cross ----
+    if trigger is None:
+        e12 = _ema_list(closes, 12); e26 = _ema_list(closes, 26)
+        macd = [e12[i] - e26[i] for i in range(len(closes))]
+        sig9 = _ema_list(macd, 9)
+        hist = macd[-1] - sig9[-1]
+        cci = _cci_list(highs, lows, closes, 14)
+        recent = [x for x in cci[-13:-1] if x is not None]
+        if (px < ema250[-1] and hist < 0 and cci[-1] is not None
+                and cci[-2] is not None and cci[-2] >= 0 and cci[-1] < 0
+                and recent and max(recent) > 100):
+            trigger = "ECM"
+
+    if trigger is None:
+        return None
+
+    # range regime: continuation engine wants WIDE
+    _ok, _reg = range_allows(symbol, eng.get("range_regime"), label=" T5")
+    if not _ok:
+        return None
+
+    risk = REV5_SL_ATR * atr_now
+    if risk <= 0 or (risk / px) > eng.get("sl_cap_pct", REV_SL_CAP_PCT):
+        return None
+    entry = px
+    sl = entry + risk
+    tp = entry - REV5_TP_R * risk
+    print(f"[T5] {symbol} crash-short trigger={trigger} regime={_reg} "
+          f"entry={entry} sl={round(sl,8)} tp={round(tp,8)}")
+    return ("SELL", entry, sl, tp)
+
+
+REV_T5 = {
+    "name": "TIGHT 5", "tag": "t5",
+    "signal_fn": rev5_check_signal,
+    "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0, "atrp_max": 0.0,
+    "side_only": "SELL",
+    "range_regime": "WIDE",     # continuation engine
+    "cvd_filter": False,        # crash entries never print a new high
+    "min_quote_vol": REV5_MIN_QUOTE_VOL,
+    "long_sl_atr": REV5_SL_ATR, "long_tp_r": REV5_TP_R,
+    "short_sl_atr": REV5_SL_ATR, "short_tp_r": REV5_TP_R,
+    "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV5_RISK_USDT, "leverage": REV_LEVERAGE,
+    "max_concurrent": REV5_MAX_CONCURRENT, "max_margin": REV5_MAX_MARGIN_USDT,
+    "cooldown_s": REV5_COOLDOWN_SECONDS,
+    "hold_seconds": REV5_HOLD_SECONDS,
+    "open": rev5_open_trades, "pending": rev5_pending, "last_fire": rev5_last_fire,
 }
 
 
@@ -3222,7 +3453,7 @@ def rev_try_claim(symbol):
     with _rev_claim_lock:
         if (symbol in rev_claimed or symbol in all_open_symbols()
                 or symbol in rev_pending or symbol in rev2_pending
-                or symbol in rev4_pending):
+                or symbol in rev4_pending or symbol in rev5_pending):
             return False
         rev_claimed.add(symbol)
         return True
@@ -3237,7 +3468,8 @@ def rev_symbol_busy(symbol, eng):
     # A coin held/pending/claimed by ANY engine is off-limits (prevents T1 and T2 both grabbing it).
     return (symbol in all_open_symbols() or symbol in eng["pending"]
             or symbol in rev_pending or symbol in rev2_pending
-            or symbol in rev4_pending or symbol in rev_claimed)
+            or symbol in rev4_pending or symbol in rev5_pending
+            or symbol in rev_claimed)
 
 
 def rev_btc_regime():
@@ -3359,6 +3591,177 @@ def get_flow(symbol):
         print(f"[FLOW {symbol}] {e}")
         _flow_cache[symbol] = (now, None, 0)
         return None, 0
+
+
+# ============================================================================
+# ============ CVD DIVERGENCE + RANGE-REGIME FILTERS (2026-08-30) =============
+# Two filters measured on 12 months / 459 coins / 20bps. Applied together they
+# took the portfolio from meanR +0.146 to +0.248 and the drawdown from 35.9R to
+# 22.6R, i.e. the account needed for a given weekly target fell ~45%.
+#
+# 1) CVD DIVERGENCE (reversion engines only: T1, T2, T4)
+#    CVD = cumulative sum of signed volume, signed by taker side. Over the last
+#    24 closed 15m bars: BEARISH divergence = this bar printed the window's HIGH
+#    while CVD did NOT print its window max (buyers pushed price up but the tape
+#    did not follow). BULLISH is the mirror at the window low.
+#    Take a SHORT only on bearish divergence, a LONG only on bullish.
+#    Measured per engine (uncapped, 20bps): T1 +0.132 -> +0.196, T2 +0.263 ->
+#    +0.316, T4 +0.131 -> +0.185, losing only 10-13% of trades. The removed
+#    trades are strongly NEGATIVE (T1 -0.310, T4 -0.365), i.e. it cuts losers,
+#    not trades at random. TRAIN and TEST both improve, which is the opposite of
+#    an overfit signature.
+#    NOT applied to T3/T5: T3 is a continuation bet and loses 88% of its trades
+#    with TEST collapsing +0.146 -> +0.034; T5 enters on crashes, which never
+#    print a new high, so the flag can never fire.
+#
+#    WHY BINANCE KLINES AND NOT BingX: this needs 24 bars (6 HOURS) of signed
+#    volume. BingX klines carry no taker-buy field, and get_flow() below reads
+#    /quote/trades which only reaches back ~1 hour - it cannot build this series.
+#    Binance's public futures klines DO carry taker_buy_volume, need no API key,
+#    and are exactly what the backtest used. So the FILTER reads Binance; the
+#    TRADE still executes on BingX. Symbols map by stripping the dash
+#    (ADA-USDT -> ADAUSDT). If Binance has no such symbol or the call fails we
+#    TAKE the trade and log it - same fail-open policy as the flow gate, so a
+#    Binance outage can never silently stop the bot.
+#
+# 2) RANGE REGIME (all five engines, direction depends on the bet type)
+#    Per coin: 96-bar range as a fraction of price, versus its own trailing
+#    480-bar 75th percentile. Above it = WIDE (volatile), else CALM.
+#    Reversion engines (T1, T4) trade CALM only; continuation engines (T3, T5)
+#    trade WIDE only; T2 is unfiltered (every variant hurt it).
+#    Measured: T4 +0.131 -> +0.306 in calm and -0.045 in wide; T5 +0.266 ->
+#    +0.368 in wide; T3 +0.143 -> +0.199 in wide. Mechanically sensible: in a
+#    volatile tape price does not revert to the extreme it came from, and in a
+#    calm tape breakouts die.
+#    Computed from 1h candles (120 x 1h = the 480 x 15m window, 24 x 1h = the
+#    96 x 15m window) so it costs ONE extra call per coin per bar, cached.
+#
+# Both windows/quantiles were swept (CVD 12/24/48 bars x range quantile
+# 40/50/60/75) and 24 + 75 is the best cell by a clear margin - do not retune.
+# ============================================================================
+
+BINANCE_FAPI        = "https://fapi.binance.com"
+CVD_WINDOW_BARS     = 24        # swept 12/24/48 - 24 wins
+CVD_ENABLED         = os.environ.get("CVD_FILTER_ENABLED", "1") == "1"
+RANGE_Q             = 0.75      # swept 0.40/0.50/0.60/0.75 - 0.75 wins
+RANGE_WIN_1H        = 24        # 24 x 1h == 96 x 15m
+RANGE_LOOKBACK_1H   = 120       # 120 x 1h == 480 x 15m
+RANGE_ENABLED       = os.environ.get("RANGE_REGIME_ENABLED", "1") == "1"
+
+_cvd_cache   = {}   # symbol -> (unix_ts, "BEAR"/"BULL"/"NONE"/None)
+_range_cache = {}   # symbol -> (unix_ts, "WIDE"/"CALM"/None)
+
+
+def _binance_symbol(symbol):
+    return symbol.replace("-", "").upper()
+
+
+def get_cvd_divergence(symbol):
+    """Return 'BEAR', 'BULL', 'NONE' (no divergence this bar), or None (unknown).
+    None means we could not judge -> callers FAIL OPEN and take the trade."""
+    now = time.time()
+    hit = _cvd_cache.get(symbol)
+    if hit and now - hit[0] < 900:
+        return hit[1]
+    try:
+        r = requests.get(BINANCE_FAPI + "/fapi/v1/klines",
+                         params={"symbol": _binance_symbol(symbol), "interval": "15m",
+                                 "limit": CVD_WINDOW_BARS + 2},
+                         timeout=8)
+        if r.status_code != 200:
+            _cvd_cache[symbol] = (now, None)
+            return None
+        data = r.json()
+        if not isinstance(data, list) or len(data) < CVD_WINDOW_BARS + 1:
+            _cvd_cache[symbol] = (now, None)
+            return None
+        # Binance kline: [open_time, o, h, l, c, volume, close_time, quote_volume,
+        #                 trades, taker_buy_base, taker_buy_quote, ignore]
+        # Drop the last element: it is the still-forming bar.
+        rows = data[:-1][-CVD_WINDOW_BARS:]
+        if len(rows) < CVD_WINDOW_BARS:
+            _cvd_cache[symbol] = (now, None)
+            return None
+        highs, lows, cvd, run = [], [], [], 0.0
+        for k in rows:
+            hi = float(k[2]); lo = float(k[3])
+            qv = float(k[7]); tb = float(k[10])
+            # signed volume = taker buy minus taker sell = 2*taker_buy - total
+            run += (2.0 * tb - qv)
+            highs.append(hi); lows.append(lo); cvd.append(run)
+        cur_h, cur_l, cur_cvd = highs[-1], lows[-1], cvd[-1]
+        out = "NONE"
+        if cur_h >= max(highs) and cur_cvd < max(cvd):
+            out = "BEAR"
+        elif cur_l <= min(lows) and cur_cvd > min(cvd):
+            out = "BULL"
+        _cvd_cache[symbol] = (now, out)
+        return out
+    except Exception as e:
+        print(f"[CVD {symbol}] {e}")
+        _cvd_cache[symbol] = (now, None)
+        return None
+
+
+def cvd_allows(symbol, side, label=""):
+    """True if the CVD divergence agrees with `side`. Fails OPEN on unknown."""
+    if not CVD_ENABLED:
+        return True, None
+    d = get_cvd_divergence(symbol)
+    if d is None:
+        print(f"[CVD{label}] {symbol} unavailable - taking trade (fail-open)")
+        return True, None
+    want = "BEAR" if side in ("SELL", "SHORT") else "BULL"
+    return (d == want), d
+
+
+def get_range_regime(symbol):
+    """'WIDE', 'CALM', or None if unknown (callers fail OPEN)."""
+    now = time.time()
+    hit = _range_cache.get(symbol)
+    if hit and now - hit[0] < 900:
+        return hit[1]
+    try:
+        candles = get_candles(symbol, limit=RANGE_LOOKBACK_1H + RANGE_WIN_1H + 5,
+                              interval="1h")
+        need = RANGE_LOOKBACK_1H + RANGE_WIN_1H
+        if not candles or len(candles) < need:
+            _range_cache[symbol] = (now, None)
+            return None
+        hs = [h(c) for c in candles]
+        ls = [l(c) for c in candles]
+        cs = [cl(c) for c in candles]
+        rngs = []
+        for i in range(RANGE_WIN_1H, len(candles)):
+            w_hi = max(hs[i - RANGE_WIN_1H:i + 1])
+            w_lo = min(ls[i - RANGE_WIN_1H:i + 1])
+            px = cs[i]
+            if px > 0 and w_hi > w_lo:
+                rngs.append((w_hi - w_lo) / px)
+        if len(rngs) < 30:
+            _range_cache[symbol] = (now, None)
+            return None
+        cur = rngs[-1]
+        hist = sorted(rngs[:-1])
+        thr = hist[min(len(hist) - 1, int(RANGE_Q * len(hist)))]
+        out = "WIDE" if cur > thr else "CALM"
+        _range_cache[symbol] = (now, out)
+        return out
+    except Exception as e:
+        print(f"[RANGE {symbol}] {e}")
+        _range_cache[symbol] = (now, None)
+        return None
+
+
+def range_allows(symbol, want, label=""):
+    """want is 'CALM', 'WIDE' or None (no filter). Fails OPEN on unknown."""
+    if not want or not RANGE_ENABLED:
+        return True, None
+    reg = get_range_regime(symbol)
+    if reg is None:
+        print(f"[RANGE{label}] {symbol} unavailable - taking trade (fail-open)")
+        return True, None
+    return (reg == want), reg
 
 
 def flow_allows(symbol, side, want_opposing, label=""):
@@ -3551,6 +3954,22 @@ def rev_check_signal(symbol, btc_ret, eng):
     if eng.get("side_only") and side != eng["side_only"]:
         return None
 
+    # 2026-08-30 RANGE-REGIME ROUTER. Reversion engines (T1, T4) only trade CALM
+    # ranges, continuation engines trade WIDE. T2 sets nothing and is unfiltered
+    # (every range variant measured worse for it). Fails OPEN if unreadable.
+    _want_reg = eng.get("range_regime")
+    if _want_reg:
+        _ok, _reg = range_allows(symbol, _want_reg, label=" " + eng["tag"].upper())
+        if not _ok:
+            return None
+
+    # 2026-08-30 CVD DIVERGENCE. Reversion engines only. Requires the tape to
+    # DISAGREE with the price extreme we are fading. Fails OPEN if unreadable.
+    if eng.get("cvd_filter"):
+        _ok, _dv = cvd_allows(symbol, side, label=" " + eng["tag"].upper())
+        if not _ok:
+            return None
+
     if btc_ret is not None:
         if side == "BUY" and btc_ret < -REV_BTC_THR:
             return None
@@ -3728,7 +4147,7 @@ def rev_track_trades(eng):
     for oid, t in list(trades.items()):
         sym = t["symbol"]
 
-        if now - t.get("open_ts", now) > REV_HOLD_SECONDS:
+        if now - t.get("open_ts", now) > eng.get("hold_seconds", REV_HOLD_SECONDS):
             try:
                 place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
                 for k in ("sl_id", "tp_id"):
@@ -3841,7 +4260,7 @@ def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
                     continue
                 scanned += 1
                 try:
-                    sig = rev_check_signal(sym, btc_ret, eng)
+                    sig = eng.get("signal_fn", rev_check_signal)(sym, btc_ret, eng)
                 except Exception as e:
                     print(f"[REV SIG {sym}] {e}")
                     continue
@@ -3889,6 +4308,13 @@ def rev4_loop():
         print("[REV] Tight 4 disabled by env REV4_ENGINE_ENABLED=0 - loop idle")
         return
     _rev_engine_loop(REV_T4, lambda: rev4_auto_enabled, REV4_SCAN_SECONDS)
+
+
+def rev5_loop():
+    if not REV5_ENGINE_ENABLED:
+        print("[REV] Tight 5 disabled by env REV5_ENGINE_ENABLED=0 - loop idle")
+        return
+    _rev_engine_loop(REV_T5, lambda: rev5_auto_enabled, REV5_SCAN_SECONDS)
 
 # ==================== END TIGHT 1 (24h-reversion) ====================
 
@@ -3990,4 +4416,5 @@ if __name__ == "__main__":
     Thread(target=t3_scalp_loop,            daemon=True).start()   # Tight 3 = S/R Sweep SHORT bear engine (2026-08-23)
     Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
     Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
+    Thread(target=rev5_loop,                daemon=True).start()   # Tight 5 = crash-continuation SHORT (2026-08-30)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

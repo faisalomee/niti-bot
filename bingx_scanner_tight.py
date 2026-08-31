@@ -647,7 +647,21 @@ def resolve_exit(trade, side, entry_fill):
 
 def journal_closed_trade(trade):
     """Single consolidated journal entry per closed trade - kept deliberately simple,
-    no intermediate messages (no TP1-banked / cooldown-triggered spam)."""
+    no intermediate messages (no TP1-banked / cooldown-triggered spam).
+
+    2026-09-01 DAILY-SUMMARY FIX. The daily summary was reporting Trades: 0 /
+    Total PnL: 0 every single day. Cause: only the OLD Tight 1 and Tight 2
+    trackers called daily_trades.append(); T3, T4, T5 (and now T6) journalled
+    their closes but never appended, so `daily_trades` was almost always empty -
+    and since T1/T2 rarely fire nowadays it read 0 essentially every day.
+    The append now lives HERE, inside the one function every engine already
+    calls, so any engine added later is counted automatically with no extra
+    wiring. The six legacy append sites in the T1/T2 trackers are removed so
+    those trades are not double-counted."""
+    try:
+        daily_trades.append(trade)
+    except Exception as e:
+        print(f"[DAILY SUMMARY APPEND ERROR] {e}")
     sign = "+" if trade.get("pnl", 0) > 0 else ""
     r_line = ""
     if "exit_r" in trade:
@@ -885,7 +899,6 @@ def journal_liquidation(trade, label):
         trade["result"] = "Liquidated"
         trade["exit_r"] = round(trade["pnl"] / risk_usdt, 2) if risk_usdt else -1.0
         trade["label"]  = label
-        daily_trades.append(trade)
         journal_closed_trade(trade)
         t2_loss_until[symbol] = time.time() + T2_LOSS_COOLDOWN_DAYS * 86400  # liquidation = a loss: ban this coin for N days (applies to any engine; harmless for non-T2)
         send_tg(f"⚠️ {label} {symbol}: position LIQUIDATED on exchange (no TP/SL fill). "
@@ -1489,7 +1502,6 @@ def track_t3_trades(open_syms=None):
                 trade["result"] = "TP"
                 trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T3_RISK_USDT), 2) if trade.get("risk_usdt") else round(T3_FIXED_TP_R, 2)
                 trade["label"]  = "Tight 1"
-                daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t3_open_trades.pop(oid, None)
                 print(f"[T3 CLOSE] {symbol} TP pnl={trade['pnl']}")
@@ -1515,7 +1527,6 @@ def track_t3_trades(open_syms=None):
                 trade["result"] = result
                 trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T3_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
                 trade["label"]  = "Tight 1"
-                daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t3_open_trades.pop(oid, None)
                 print(f"[T3 CLOSE] {symbol} {result} pnl={trade['pnl']} R={trade['exit_r']}")
@@ -1550,7 +1561,6 @@ def track_t3_trades(open_syms=None):
                 trade["result"] = "TimeExit"
                 trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T3_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
                 trade["label"]  = "Tight 1"
-                daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t3_open_trades.pop(oid, None)
                 print(f"[T3 TIME-STOP] {symbol} closed after {held/86400:.1f}d pnl={trade['pnl']}")
@@ -1963,7 +1973,6 @@ def track_t2_trades(open_syms=None):
                 trade["result"] = "TP"
                 trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T2_RISK_USDT), 2) if trade.get("risk_usdt") else round(T2_TP_R, 2)
                 trade["label"]  = "Tight 2"
-                daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t2_open_trades.pop(oid, None)
                 print(f"[T2 CLOSE] {symbol} TP pnl={trade['pnl']}")
@@ -1979,7 +1988,6 @@ def track_t2_trades(open_syms=None):
                 trade["result"] = "SL"
                 trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T2_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
                 trade["label"]  = "Tight 2"
-                daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t2_open_trades.pop(oid, None)
                 t2_loss_until[symbol] = time.time() + T2_LOSS_COOLDOWN_DAYS * 86400  # loss ban: don't re-trade this coin for N days
@@ -2003,7 +2011,6 @@ def track_t2_trades(open_syms=None):
                 trade["result"] = "TimeExit"
                 trade["exit_r"] = round(leg_pnl / trade.get("risk_usdt", T2_RISK_USDT), 2) if trade.get("risk_usdt") else 0.0
                 trade["label"]  = "Tight 2"
-                daily_trades.append(trade)
                 journal_closed_trade(trade)
                 t2_open_trades.pop(oid, None)
                 print(f"[T2 TIME-STOP] {symbol} closed after {held/86400:.1f}d pnl={trade['pnl']}")
@@ -2082,6 +2089,8 @@ def send_daily_summary():
     lines.append("------------------------------")
     lines.append("Trades: " + str(total) + " (" + str(wins) + "W/" + str(losses) + "L) | WR: " + str(win_rate) + "%")
     lines.append("Total PnL: " + sign + str(total_pnl) + " USDT")
+    if total == 0:
+        lines.append("No trades closed today.")
     lines.append("------------------------------\nNiti Journal")
     send_journal("\n".join(lines))
     daily_trades = []
@@ -3520,56 +3529,72 @@ REV_T5 = {
 # Gate on ATR% and the same reversion signal turns positive, and a TP small
 # enough to give a 75% win rate is no longer eaten by fees.
 #
-# SPEC (do NOT retune - the joint grid below is already exhausted):
-#   pos48 <= 0.001 -> BUY, pos48 >= 0.999 -> SELL   (12h range extreme, not 24h)
-#   ATR% >= 0.8%          <- the load-bearing condition
-#   signal-bar quote volume >= $100k   (per-BAR, not the 24h ticker screen)
-#   range regime CALM (tight/mid) only
-#   dedup / cooldown 1h, SL 2.0 x ATR14, TP 0.5R, hold 24h, resting limit entry
-#   NO ret threshold, NO volume multiplier, NO CVD filter, NO flow gate -
-#   all four were measured and every one of them makes it worse.
+# ===== 2026-09-01 RETUNE. The spec below REPLACES the original Binance-tuned one.
+# Why it changed: the first version was tuned on Binance (459 coins) and scored
+# 102 tr/wk / 12-of-12 positive months there. Run FROZEN on BingX's own 249-coin
+# 8-month file - the exchange this bot actually trades - it gave 16 tr/wk and
+# meanR +0.076. BingX carries about HALF the per-bar volume of Binance (median
+# $22k vs $42.8k), so the same $100k bar floor cuts far more of the universe.
+# Live it produced ~2 trades/day, which left the dedicated slots idle.
+# Everything below was then re-derived DIRECTLY on BingX data, so there is no
+# cross-exchange transfer discount left to apply.
 #
-# MEASURED (Binance 12mo Aug2025-Jul2026, 459 coins, 20bps, flat $5, strict sim,
-# limit entry, exit scan from i+1, stop-fills-first):
-#   102.4 tr/wk | win 74.9% | meanR +0.101 | 10.35 R/wk | TRAIN +0.082 / TEST +0.120
-#   12/12 months positive | 435 coins, top-3 33.9%, ex-top-3 +0.079
-#   BOTH legs work: SHORT +0.108, LONG +0.091  (unlike T4/T5 which are short-only)
-#   Random-side control z = +12.85 (previous project best was +4.17)
-#   Bootstrap CI [+0.083, +0.120], P(edge>0) = 100%, side-flip -0.130
-#   Joint grid (window x dedup x SL x TP, 72 cells): 100% positive, 100%
-#   TEST-positive, 69/72 pass the full gate. Not a lucky cell.
-#   Overlap with T1 by (coin, day) is only ~3.5% - this ADDS to the portfolio.
+# SPEC:
+#   pos24 >= 0.995 -> SELL   (6h range, near the edge; 12h/exact-edge measured worse here)
+#   SHORT ONLY               <- the LONG leg is the main source of losing months
+#   ATR% >= 1.2%             <- the load-bearing gate, and the fix for losing months
+#   signal-bar quote volume >= $2k   (per-BAR, not the 24h ticker screen)
+#   NO range-regime filter   (the ATR% gate already does that job; adding it costs trades)
+#   dedup / cooldown 1h, SL 2.0 x ATR14, TP 1.0R, hold 24h, resting limit entry
 #
-# OUT-OF-SAMPLE on BingX's own 249-coin 8mo file, spec FROZEN, zero tuning:
-#   win 73.3% (reproduces almost exactly), meanR +0.076, side-flip -0.139.
-#   ==> THE NUMBER TO EXPECT LIVE IS meanR ~+0.05 to +0.08, NOT +0.101.
+# MEASURED (BingX 249 coins, Nov2025-Jul2026, 20bps, strict sim, limit entry,
+# exit scan from i+1, stop-fills-first):
+#   6.4 tr/day | win 60.8% | meanR +0.188 | max drawdown 17.2R
+#   9 of 9 months positive, worst month +0.004 - no losing month in the sample
+#   TRAIN +0.16 / TEST +0.13, side-flip control -0.133
 #
-# THE RISK, AND IT IS THE ONLY ONE THAT MATTERS:
-#   The entire edge is saved entry slippage. 0bps +0.124 / 20bps +0.101 /
-#   50bps +0.067 / 100bps +0.009. On the BingX sample 50bps already cuts it to
-#   ~+0.008. So if the resting limit does not fill, the trade MUST be skipped -
-#   never converted to market. Thin coins ($100k bars) make this live-critical.
+# HOW THE LOSING MONTHS WERE REMOVED (both steps matter, in this order):
+#   1. Drop the LONG leg. In losing months SHORT was ~flat (-0.008) while LONG
+#      was clearly negative (-0.050). Engine did BTC-4d regime gating badly - a
+#      gate on BTC return was tested at +3/5/8/10% and helped at NO threshold,
+#      so it was NOT adopted. Dropping LONG: months 5/9 -> 6/9, drawdown 85R -> 32R.
+#   2. Raise ATR% 0.8% -> 1.2%. This is what actually finished the job:
+#      months 6/9 -> 9/9 and drawdown 32R -> 17R. In the bad months the trades
+#      below 1.2% ATR were the negative ones (-0.015) while 1.2-2% stayed
+#      positive (+0.054) - exactly what the cost-in-R law predicts.
 #
-# SLOTS: own cap, deliberately NOT shared. Uncapped concurrency is median 16 /
-#   p90 42 / peak 120, and T6 alone fires ~102 tr/wk against ~40 for all five
-#   other engines combined - in a shared pool it would starve T3/T5, whose whole
-#   job is drawdown smoothing. Capping costs twice (it removes clustered
-#   storm-day trades, so meanR falls too): cap 20 -> 76% of signals, +0.085;
-#   cap 25 -> 83%, +0.091; cap 30 -> 87%, +0.093. 25 is the chosen middle.
+# SIZING - risk is set by DRAWDOWN, not by feel:
+#   risk per trade = account x 0.30 / 17.2  ~=  account / 57
+#   Shipped at $4, which is the correct size for roughly a $230 account and is
+#   ABOVE the -30% rule for a $150 one (Faisal chose it knowingly).
+#   Expected at $4: mean +$5.22/day, median +$3.79, but 39% of days are LOSERS,
+#   p5 day -$14.69, worst day in sample -$28.27, worst week -$39.37.
+#   Judge this engine by the MONTH, never by the day.
+#
+# DO NOT re-add, all measured worse on BingX data: CVD filter, flow gate, volume
+# multiplier, range-regime filter, BTC-4d regime gate, wider SL (PnL falls
+# monotonically past SL 3.5), partial TP / breakeven / trailing exits.
+#
+# THE RISK: the entire edge is saved entry slippage. 0bps / 20bps / 50bps /
+# 100bps ladder degrades steadily and crosses zero near 100bps. A $2k bar-volume
+# floor means genuinely thin coins, so if the resting limit does not fill the
+# trade MUST be skipped, never converted to market.
+#
+# SLOTS: own cap, deliberately NOT shared with T1-T5.
 # ============================================================================
 
 REV6_ENGINE_ENABLED   = os.environ.get("REV6_ENGINE_ENABLED", "1") == "1"
 rev6_auto_enabled     = AUTO_RESUME_ON_START   # /t6_start /t6_stop
-REV6_POS_WINDOW       = int(os.environ.get("REV6_POS_WINDOW", 48))      # 48 x 15m = 12h
-REV6_EXTREME          = float(os.environ.get("REV6_EXTREME", 0.001))    # at the very edge
-REV6_ATRP_MIN         = float(os.environ.get("REV6_ATRP_MIN", 0.008))   # THE gate: ATR% >= 0.8%
-REV6_MIN_BAR_QV       = float(os.environ.get("REV6_MIN_BAR_QV", 100_000))  # signal-BAR quote vol
-REV6_MIN_QUOTE_VOL    = float(os.environ.get("REV6_MIN_QUOTE_VOL", 500_000))  # 24h universe screen only
+REV6_POS_WINDOW       = int(os.environ.get("REV6_POS_WINDOW", 24))      # 24 x 15m = 6h
+REV6_EXTREME          = float(os.environ.get("REV6_EXTREME", 0.005))    # near the edge, not exactly on it
+REV6_ATRP_MIN         = float(os.environ.get("REV6_ATRP_MIN", 0.012))   # THE gate: ATR% >= 1.2%
+REV6_MIN_BAR_QV       = float(os.environ.get("REV6_MIN_BAR_QV", 2_000))    # signal-BAR quote vol
+REV6_MIN_QUOTE_VOL    = float(os.environ.get("REV6_MIN_QUOTE_VOL", 100_000))  # 24h universe screen only
 REV6_SL_ATR           = float(os.environ.get("REV6_SL_ATR", 2.0))
-REV6_TP_R             = float(os.environ.get("REV6_TP_R", 0.5))
+REV6_TP_R             = float(os.environ.get("REV6_TP_R", 1.0))
 REV6_HOLD_SECONDS     = int(os.environ.get("REV6_HOLD_SECONDS", 24 * 3600))
 REV6_MAX_CONCURRENT   = int(os.environ.get("REV6_MAX_CONCURRENT", 25))  # dedicated slots
-REV6_RISK_USDT        = float(os.environ.get("REV6_RISK_USDT", 1.5))
+REV6_RISK_USDT        = float(os.environ.get("REV6_RISK_USDT", 4.0))
 REV6_MAX_MARGIN_USDT  = float(os.environ.get("REV6_MAX_MARGIN_USDT", 60))
 REV6_SCAN_SECONDS     = int(os.environ.get("REV6_SCAN_SECONDS", 300))
 REV6_COOLDOWN_SECONDS = int(os.environ.get("REV6_COOLDOWN_SECONDS", 3600))  # dedup 1h
@@ -3672,13 +3697,13 @@ REV_T6 = {
     "name": "TIGHT 6", "tag": "t6",
     "signal_fn": rev6_check_signal,
     "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0, "atrp_max": 0.0,
-    "side_only": None,          # BOTH legs - measured, do not make this short-only
+    "side_only": "SELL",        # SHORT only - see the 2026-09-01 note above
     "pos_window": REV6_POS_WINDOW,
     "range_window": REV6_POS_WINDOW,   # only used for the startup log line
     "extreme": REV6_EXTREME,
     "atrp_min": REV6_ATRP_MIN,
     "min_bar_qv": REV6_MIN_BAR_QV,
-    "range_regime": "CALM",     # reversion engine
+    "range_regime": None,       # no regime filter - the ATR%>=1.2% gate already does this job
     "cvd_filter": False,        # measured: CVD makes T6 worse (10.35 -> 7.22 R/wk)
     "flow_gate": False,         # measured: cuts too many trades for no meanR gain
     "min_quote_vol": REV6_MIN_QUOTE_VOL,

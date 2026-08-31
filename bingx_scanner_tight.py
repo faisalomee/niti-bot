@@ -1638,7 +1638,7 @@ def all_open_symbols():
     and unmanaged on BingX (COMP-USDT 2026-08-19). Every engine's dict belongs here."""
     syms = set()
     for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades,
-              rev2_open_trades, rev4_open_trades, rev5_open_trades):
+              rev2_open_trades, rev4_open_trades, rev5_open_trades, rev6_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
@@ -2141,7 +2141,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2168,14 +2168,49 @@ def handle_telegram_commands():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != str(TG_CHAT_ID):
                     continue
-                # ---- Tight 2 Trapped-Block Fade: /t2_start /t2_stop (/start /stop alias) ----
-                if text in ("/t2_start", "/start"):
+                # ---- MASTER SWITCH: /start turns EVERY engine on, /stop turns every
+                #      engine off, in one message (2026-08-31, Faisal's request - going
+                #      one-by-one took too long). The per-engine /tN_start /tN_stop
+                #      commands are unchanged and still work individually.
+                #      NOTE: /start used to be a T2-only alias. It is now global.
+                #      An engine disabled at BUILD level (REVn_ENGINE_ENABLED=0) is
+                #      skipped and reported, never silently "turned on".
+                if text in ("/start", "/all_start"):
+                    _on, _off = [], []
+                    if REV_ENGINE_ENABLED:  rev_auto_enabled  = True; _on.append("T1")
+                    else: _off.append("T1")
+                    if REV2_ENGINE_ENABLED: rev2_auto_enabled = True; _on.append("T2")
+                    else: _off.append("T2")
+                    if T3_ENGINE_ENABLED:   t3_scalp_auto_enabled = True; _on.append("T3")
+                    else: _off.append("T3")
+                    if REV4_ENGINE_ENABLED: rev4_auto_enabled = True; _on.append("T4")
+                    else: _off.append("T4")
+                    if REV5_ENGINE_ENABLED: rev5_auto_enabled = True; _on.append("T5")
+                    else: _off.append("T5")
+                    if REV6_ENGINE_ENABLED: rev6_auto_enabled = True; _on.append("T6")
+                    else: _off.append("T6")
+                    _m = "ALL ENGINES ON: " + (", ".join(_on) if _on else "none")
+                    if _off:
+                        _m += "\nSkipped (disabled at build level): " + ", ".join(_off)
+                    send_tg(_m)
+                elif text in ("/stop", "/all_stop"):
+                    rev_auto_enabled = False
+                    rev2_auto_enabled = False
+                    t3_scalp_auto_enabled = False
+                    rev4_auto_enabled = False
+                    rev5_auto_enabled = False
+                    rev6_auto_enabled = False
+                    send_tg("ALL ENGINES OFF: T1, T2, T3, T4, T5, T6.\n"
+                            "Open positions are NOT closed - they keep being tracked "
+                            "and will exit on their own SL / TP / time-stop.")
+                # ---- Tight 2 Trapped-Block Fade: /t2_start /t2_stop ----
+                elif text == "/t2_start":
                     if not REV2_ENGINE_ENABLED:
                         send_tg("Tight 2 (24h-reversion ceiling) is disabled at build level (REV2_ENGINE_ENABLED=0).")
                     else:
                         rev2_auto_enabled = True
                         send_tg("Tight 2 (24h-reversion) Auto-trade ON.")
-                elif text in ("/t2_stop", "/stop"):
+                elif text == "/t2_stop":
                     rev2_auto_enabled = False
                     send_tg("Tight 2 (24h-reversion) Auto-trade OFF.")
                 # ---- Tight 1 = 24h-reversion: /t1_start /t1_stop (/rev_* kept as alias) ----
@@ -2271,6 +2306,36 @@ def handle_telegram_commands():
                 elif text == "/t5_stop":
                     rev5_auto_enabled = False
                     send_tg("Tight 5 (crash-continuation short) Auto-trade OFF.")
+                # ---- Tight 6 = ATR%-gated range-extreme reversion: /t6_start /t6_stop ----
+                elif text == "/t6_start":
+                    if not REV6_ENGINE_ENABLED:
+                        send_tg("Tight 6 (ATR-gated reversion) is disabled at build level (REV6_ENGINE_ENABLED=0).")
+                    else:
+                        rev6_auto_enabled = True
+                        send_tg("Tight 6 (ATR-gated range-extreme reversion) Auto-trade ON.")
+                elif text == "/t6_stop":
+                    rev6_auto_enabled = False
+                    send_tg("Tight 6 (ATR-gated range-extreme reversion) Auto-trade OFF.")
+                elif text == "/t6_status":
+                    lines6 = ("Tight 6 (ATR-gated range-extreme reversion, BOTH legs): " +
+                              ("ON" if rev6_auto_enabled else "OFF") +
+                              " | Open: " + str(len(rev6_open_trades)) + "/" + str(REV6_MAX_CONCURRENT) +
+                              " | Pending: " + str(len(rev6_pending)) +
+                              "\nTrigger: close at the edge of its " + str(REV6_POS_WINDOW * 15 // 60) +
+                              "h range (pos<=" + str(REV6_EXTREME) + " or >=" + str(round(1 - REV6_EXTREME, 4)) + ")" +
+                              "\nGates: ATR% >= " + str(round(REV6_ATRP_MIN * 100, 2)) + "% | bar qv >= $" +
+                              f"{REV6_MIN_BAR_QV:,.0f}" + " | range regime CALM" +
+                              "\nSL " + str(REV6_SL_ATR) + "xATR | TP " + str(REV6_TP_R) + "R | hold " +
+                              str(REV6_HOLD_SECONDS // 3600) + "h | cooldown " +
+                              str(REV6_COOLDOWN_SECONDS // 60) + "m | risk $" + str(REV6_RISK_USDT) +
+                              "\nNo CVD, no flow gate, no volume filter - all three measured WORSE here.")
+                    for _sym, _p in list(rev6_pending.items()):
+                        lines6 += "\n[pending] " + _sym + " " + _p["pos_side"] + " @ " + str(round(_p["entry"], 6))
+                    for _oid, _t in list(rev6_open_trades.items()):
+                        lines6 += ("\n" + _t["symbol"] + " " + _t["pos_side"] + " | entry " +
+                                   str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
+                                   " | TP " + str(round(_t["tp"], 6)))
+                    send_tg(lines6)
                 elif text == "/t4_stop":
                     rev4_auto_enabled = False
                     send_tg("Tight 4 (4h-reversion short) Auto-trade OFF.")
@@ -2321,6 +2386,12 @@ def handle_telegram_commands():
                         " | Pending: " + str(len(rev4_pending)) +
                         " | " + str(round(REV4_RET_THR*100, 1)) + "%/4h vol>=" + str(REV4_VOL_MULT) +
                         "x TP " + str(REV4_TP_R) + "R | risk $" + str(int(REV4_RISK_USDT)) + "\n" +
+                        "Tight 6 (ATR-gated reversion, BOTH legs): " + ("ON" if rev6_auto_enabled else "OFF") +
+                        " | Open: " + str(len(rev6_open_trades)) + "/" + str(REV6_MAX_CONCURRENT) +
+                        " | Pending: " + str(len(rev6_pending)) +
+                        " | ATR%>=" + str(round(REV6_ATRP_MIN * 100, 2)) + "% pos" +
+                        str(REV6_POS_WINDOW * 15 // 60) + "h TP " + str(REV6_TP_R) +
+                        "R | risk $" + str(REV6_RISK_USDT) + "\n" +
                         _regime_line() + backoff
                     )
         except Exception as e:
@@ -3435,6 +3506,193 @@ REV_T5 = {
 }
 
 
+# ============================================================================
+# ==================== TIGHT 6 = ATR%-GATED RANGE-EXTREME REVERSION ==========
+# Found 2026-08-31. This is the "scalping" engine, and it is the first small-TP
+# strategy in this project that is net-positive. It exists because of ONE idea:
+#
+#   THE COST-IN-R LAW:   cost in R = slippage / (SL_ATR x ATR%)
+#
+# Every earlier strategy was scored on all coins POOLED. But at 20bps on a
+# 2xATR stop, the cost is 0.32R in the calmest ATR decile and 0.023R in the
+# wildest - a 14x spread. Pooling averages a harvestable high-ATR subset with an
+# unharvestable low-ATR majority, which is why ~70 families measured "dead".
+# Gate on ATR% and the same reversion signal turns positive, and a TP small
+# enough to give a 75% win rate is no longer eaten by fees.
+#
+# SPEC (do NOT retune - the joint grid below is already exhausted):
+#   pos48 <= 0.001 -> BUY, pos48 >= 0.999 -> SELL   (12h range extreme, not 24h)
+#   ATR% >= 0.8%          <- the load-bearing condition
+#   signal-bar quote volume >= $100k   (per-BAR, not the 24h ticker screen)
+#   range regime CALM (tight/mid) only
+#   dedup / cooldown 1h, SL 2.0 x ATR14, TP 0.5R, hold 24h, resting limit entry
+#   NO ret threshold, NO volume multiplier, NO CVD filter, NO flow gate -
+#   all four were measured and every one of them makes it worse.
+#
+# MEASURED (Binance 12mo Aug2025-Jul2026, 459 coins, 20bps, flat $5, strict sim,
+# limit entry, exit scan from i+1, stop-fills-first):
+#   102.4 tr/wk | win 74.9% | meanR +0.101 | 10.35 R/wk | TRAIN +0.082 / TEST +0.120
+#   12/12 months positive | 435 coins, top-3 33.9%, ex-top-3 +0.079
+#   BOTH legs work: SHORT +0.108, LONG +0.091  (unlike T4/T5 which are short-only)
+#   Random-side control z = +12.85 (previous project best was +4.17)
+#   Bootstrap CI [+0.083, +0.120], P(edge>0) = 100%, side-flip -0.130
+#   Joint grid (window x dedup x SL x TP, 72 cells): 100% positive, 100%
+#   TEST-positive, 69/72 pass the full gate. Not a lucky cell.
+#   Overlap with T1 by (coin, day) is only ~3.5% - this ADDS to the portfolio.
+#
+# OUT-OF-SAMPLE on BingX's own 249-coin 8mo file, spec FROZEN, zero tuning:
+#   win 73.3% (reproduces almost exactly), meanR +0.076, side-flip -0.139.
+#   ==> THE NUMBER TO EXPECT LIVE IS meanR ~+0.05 to +0.08, NOT +0.101.
+#
+# THE RISK, AND IT IS THE ONLY ONE THAT MATTERS:
+#   The entire edge is saved entry slippage. 0bps +0.124 / 20bps +0.101 /
+#   50bps +0.067 / 100bps +0.009. On the BingX sample 50bps already cuts it to
+#   ~+0.008. So if the resting limit does not fill, the trade MUST be skipped -
+#   never converted to market. Thin coins ($100k bars) make this live-critical.
+#
+# SLOTS: own cap, deliberately NOT shared. Uncapped concurrency is median 16 /
+#   p90 42 / peak 120, and T6 alone fires ~102 tr/wk against ~40 for all five
+#   other engines combined - in a shared pool it would starve T3/T5, whose whole
+#   job is drawdown smoothing. Capping costs twice (it removes clustered
+#   storm-day trades, so meanR falls too): cap 20 -> 76% of signals, +0.085;
+#   cap 25 -> 83%, +0.091; cap 30 -> 87%, +0.093. 25 is the chosen middle.
+# ============================================================================
+
+REV6_ENGINE_ENABLED   = os.environ.get("REV6_ENGINE_ENABLED", "1") == "1"
+rev6_auto_enabled     = AUTO_RESUME_ON_START   # /t6_start /t6_stop
+REV6_POS_WINDOW       = int(os.environ.get("REV6_POS_WINDOW", 48))      # 48 x 15m = 12h
+REV6_EXTREME          = float(os.environ.get("REV6_EXTREME", 0.001))    # at the very edge
+REV6_ATRP_MIN         = float(os.environ.get("REV6_ATRP_MIN", 0.008))   # THE gate: ATR% >= 0.8%
+REV6_MIN_BAR_QV       = float(os.environ.get("REV6_MIN_BAR_QV", 100_000))  # signal-BAR quote vol
+REV6_MIN_QUOTE_VOL    = float(os.environ.get("REV6_MIN_QUOTE_VOL", 500_000))  # 24h universe screen only
+REV6_SL_ATR           = float(os.environ.get("REV6_SL_ATR", 2.0))
+REV6_TP_R             = float(os.environ.get("REV6_TP_R", 0.5))
+REV6_HOLD_SECONDS     = int(os.environ.get("REV6_HOLD_SECONDS", 24 * 3600))
+REV6_MAX_CONCURRENT   = int(os.environ.get("REV6_MAX_CONCURRENT", 25))  # dedicated slots
+REV6_RISK_USDT        = float(os.environ.get("REV6_RISK_USDT", 1.5))
+REV6_MAX_MARGIN_USDT  = float(os.environ.get("REV6_MAX_MARGIN_USDT", 60))
+REV6_SCAN_SECONDS     = int(os.environ.get("REV6_SCAN_SECONDS", 300))
+REV6_COOLDOWN_SECONDS = int(os.environ.get("REV6_COOLDOWN_SECONDS", 3600))  # dedup 1h
+REV6_MAX_SYMBOLS      = int(os.environ.get("REV6_MAX_SYMBOLS", 600))
+
+rev6_open_trades = {}
+rev6_pending     = {}
+rev6_last_fire   = {}
+
+
+def rev6_check_signal(symbol, btc_ret, eng):
+    """T6 ATR%-gated range-extreme reversion, BOTH legs.
+    Returns (side, entry, sl, tp) or None.
+
+    NOTE ON THE VOLUME TEST: the backtest's $100k floor was the SIGNAL BAR's own
+    quote volume, not the 24h ticker figure that get_liquid_symbols screens on.
+    Those are different quantities, so the bar-level test is done here and the
+    engine's min_quote_vol is only a loose universe bound. BingX klines carry
+    BASE volume, so quote volume is rebuilt as volume * close - the same way the
+    backtest built it from the BingX CSV."""
+    win  = eng.get("pos_window", REV6_POS_WINDOW)
+    need = win + REV_ATR_LEN + 5
+    candles = get_candles(symbol, limit=need + REV_CANDLE_BUFFER, interval="15m")
+    # closed bars only - a forming bar would make pos48 mean "is price at this
+    # instant's running high" instead of "did the bar CLOSE at the high".
+    if candles:
+        _t = _bar_ms(candles[-1])
+        if _t and (_t % 900000) != 0:
+            candles = candles[:-1]
+    if not candles or len(candles) < need:
+        _rev_log_thin(symbol, eng, len(candles) if candles else 0, need)
+        return None
+
+    closes = [cl(c) for c in candles]
+    highs  = [h(c)  for c in candles]
+    lows   = [l(c)  for c in candles]
+
+    px = closes[-1]
+    if px <= 0 or px < 0.001:
+        return None
+
+    # ---- signal-bar quote volume floor ----
+    bar_qv = v(candles[-1]) * px
+    if bar_qv < eng.get("min_bar_qv", REV6_MIN_BAR_QV):
+        return None
+
+    # ---- ATR% gate: THE condition this whole engine rests on ----
+    atr = atr_series(highs, lows, closes, REV_ATR_LEN)
+    if not atr or atr[-1] is None or atr[-1] <= 0:
+        return None
+    atr_now = atr[-1]
+    if (atr_now / px) < eng.get("atrp_min", REV6_ATRP_MIN):
+        return None
+
+    # ---- 12h range extreme, on HIGHS/LOWS (never the close-range; see the
+    #      2026-08-25 note in rev_check_signal - a close-range fires ~6x too often) ----
+    win_hi = max(highs[-win:])
+    win_lo = min(lows[-win:])
+    if win_hi <= win_lo:
+        return None
+    pos = (px - win_lo) / (win_hi - win_lo)
+
+    ext = eng.get("extreme", REV6_EXTREME)
+    if pos <= ext:
+        side = "BUY"
+    elif pos >= (1.0 - ext):
+        side = "SELL"
+    else:
+        return None
+
+    so = eng.get("side_only")
+    if so and side != so:
+        return None
+
+    # ---- range regime: reversion needs a range to revert inside ----
+    _ok, _reg = range_allows(symbol, eng.get("range_regime"), label=" T6")
+    if not _ok:
+        return None
+
+    risk = eng.get("long_sl_atr", REV6_SL_ATR) * atr_now
+    if risk <= 0 or (risk / px) > eng.get("sl_cap_pct", REV_SL_CAP_PCT):
+        return None
+
+    entry = px
+    tp_r = eng.get("long_tp_r", REV6_TP_R)
+    if side == "BUY":
+        sl = entry - risk
+        tp = entry + tp_r * risk
+    else:
+        sl = entry + risk
+        tp = entry - tp_r * risk
+
+    print(f"[T6] {symbol} {side} pos{win}={pos:.4f} atr%={100*atr_now/px:.2f} "
+          f"barqv=${bar_qv:,.0f} regime={_reg} entry={entry} "
+          f"sl={round(sl,8)} tp={round(tp,8)}")
+    return (side, entry, sl, tp)
+
+
+REV_T6 = {
+    "name": "TIGHT 6", "tag": "t6",
+    "signal_fn": rev6_check_signal,
+    "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0, "atrp_max": 0.0,
+    "side_only": None,          # BOTH legs - measured, do not make this short-only
+    "pos_window": REV6_POS_WINDOW,
+    "range_window": REV6_POS_WINDOW,   # only used for the startup log line
+    "extreme": REV6_EXTREME,
+    "atrp_min": REV6_ATRP_MIN,
+    "min_bar_qv": REV6_MIN_BAR_QV,
+    "range_regime": "CALM",     # reversion engine
+    "cvd_filter": False,        # measured: CVD makes T6 worse (10.35 -> 7.22 R/wk)
+    "flow_gate": False,         # measured: cuts too many trades for no meanR gain
+    "min_quote_vol": REV6_MIN_QUOTE_VOL,
+    "long_sl_atr": REV6_SL_ATR, "long_tp_r": REV6_TP_R,
+    "short_sl_atr": REV6_SL_ATR, "short_tp_r": REV6_TP_R,
+    "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV6_RISK_USDT, "leverage": REV_LEVERAGE,
+    "max_concurrent": REV6_MAX_CONCURRENT, "max_margin": REV6_MAX_MARGIN_USDT,
+    "cooldown_s": REV6_COOLDOWN_SECONDS,
+    "hold_seconds": REV6_HOLD_SECONDS,
+    "max_symbols": REV6_MAX_SYMBOLS,
+    "open": rev6_open_trades, "pending": rev6_pending, "last_fire": rev6_last_fire,
+}
+
+
 def rev_in_cooldown(symbol, eng):
     cd = eng.get("cooldown_s", REV_COOLDOWN_SECONDS)
     return (time.time() - eng["last_fire"].get(symbol, 0)) < cd
@@ -3453,7 +3711,8 @@ def rev_try_claim(symbol):
     with _rev_claim_lock:
         if (symbol in rev_claimed or symbol in all_open_symbols()
                 or symbol in rev_pending or symbol in rev2_pending
-                or symbol in rev4_pending or symbol in rev5_pending):
+                or symbol in rev4_pending or symbol in rev5_pending
+                or symbol in rev6_pending):
             return False
         rev_claimed.add(symbol)
         return True
@@ -3469,6 +3728,7 @@ def rev_symbol_busy(symbol, eng):
     return (symbol in all_open_symbols() or symbol in eng["pending"]
             or symbol in rev_pending or symbol in rev2_pending
             or symbol in rev4_pending or symbol in rev5_pending
+            or symbol in rev6_pending
             or symbol in rev_claimed)
 
 
@@ -4246,7 +4506,8 @@ def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
             # min_quote_vol keep the shared $2M default, i.e. T1/T2 are untouched.
             symbols = get_liquid_symbols(
                 all_syms, min_quote_vol=eng.get("min_quote_vol", REV_MIN_QUOTE_VOL),
-                max_n=REV_MAX_SYMBOLS, exclude_top_n=REV_EXCLUDE_TOP_N,
+                max_n=eng.get("max_symbols", REV_MAX_SYMBOLS),
+                exclude_top_n=eng.get("exclude_top_n", REV_EXCLUDE_TOP_N),
             )
             btc_ret = rev_btc_regime()
             _rev_candle_diag()
@@ -4308,6 +4569,13 @@ def rev4_loop():
         print("[REV] Tight 4 disabled by env REV4_ENGINE_ENABLED=0 - loop idle")
         return
     _rev_engine_loop(REV_T4, lambda: rev4_auto_enabled, REV4_SCAN_SECONDS)
+
+
+def rev6_loop():
+    if not REV6_ENGINE_ENABLED:
+        print("Tight 6 disabled at build level (REV6_ENGINE_ENABLED=0)")
+        return
+    _rev_engine_loop(REV_T6, lambda: rev6_auto_enabled, REV6_SCAN_SECONDS)
 
 
 def rev5_loop():
@@ -4417,4 +4685,5 @@ if __name__ == "__main__":
     Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
     Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
     Thread(target=rev5_loop,                daemon=True).start()   # Tight 5 = crash-continuation SHORT (2026-08-30)
+    Thread(target=rev6_loop,                daemon=True).start()   # Tight 6 = ATR%-gated range-extreme reversion (2026-08-31)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

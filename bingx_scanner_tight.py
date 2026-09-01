@@ -3329,6 +3329,7 @@ REV4_TP_MULT          = float(os.environ.get("REV4_TP_MULT", 3.0))            # 
 # cutting notional would have doubled the account's exposure, which is not what
 # "more slots" was asked for. If the account can carry more, raise REV4_NOTIONAL_USDT
 # deliberately - do not let it drift up as a side effect of the slot change.
+REV4_LEVERAGE         = int(os.environ.get("REV4_LEVERAGE", 5))   # see the note on REV_T4["leverage"]
 REV4_NOTIONAL_USDT    = float(os.environ.get("REV4_NOTIONAL_USDT", 75.0))
 REV4_RISK_USDT        = REV4_NOTIONAL_USDT * REV4_DSTOP_PCT   # derived, do NOT set directly
 REV4_MAX_CONCURRENT   = int(os.environ.get("REV4_MAX_CONCURRENT", 60))
@@ -3448,7 +3449,11 @@ REV_T4 = {
     # A 15% stop must clear the shared 6% cap, so this engine carries its OWN.
     # T1/T2/T3/T5/T6 keep REV_SL_CAP_PCT and are untouched.
     "sl_cap_pct": max(REV4_DSTOP_PCT * 1.5, REV_SL_CAP_PCT),
-    "risk_usdt": REV4_RISK_USDT, "leverage": REV_LEVERAGE,
+    # 2026-09-01: T4 MUST run lower leverage than the other engines. Its stop is a
+    # flat 15%, and at 10x BingX liquidates a short near +9.4% - the stop would
+    # never be reached. Do not raise this without moving REV4_DSTOP_PCT down too:
+    # the rule is  DSTOP < liquidation distance ~= (1/leverage) - maintenance.
+    "risk_usdt": REV4_RISK_USDT, "leverage": REV4_LEVERAGE,
     "max_concurrent": REV4_MAX_CONCURRENT, "max_margin": REV4_MAX_MARGIN_USDT,
     "cooldown_s": REV4_COOLDOWN_SECONDS,
     "hold_seconds": REV4_HOLD_SECONDS,
@@ -4527,7 +4532,16 @@ def rev_track_pending(eng):
 
         if status == "FILLED":
             fill = get_fill_price(p["order_id"], sym, fallback=p["entry"])
-            if p["side"] == "BUY":
+            # ---- 2026-09-01 BUGFIX: do NOT rebuild the TP from the R multiple for
+            # engines whose TP is a flat percentage of price (T4's no-stop design).
+            # T4 has short_tp_r = 0.0, so the old line put the TP exactly on the
+            # entry and every position closed at breakeven within minutes.
+            _tpm = eng.get("tp_mult")
+            _ds  = eng.get("dstop_pct")
+            if _tpm and _ds:
+                risk = abs(p["sl"] - fill)
+                tp   = fill * (1.0 + _ds * _tpm) if p["side"] == "BUY" else fill * (1.0 - _ds * _tpm)
+            elif p["side"] == "BUY":
                 risk = fill - p["sl"]
                 tp   = fill + risk * eng["long_tp_r"]
             else:

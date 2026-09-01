@@ -1648,7 +1648,8 @@ def all_open_symbols():
     and unmanaged on BingX (COMP-USDT 2026-08-19). Every engine's dict belongs here."""
     syms = set()
     for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades,
-              rev2_open_trades, rev4_open_trades, rev5_open_trades, rev6_open_trades):
+              rev2_open_trades, rev4_open_trades, rev5_open_trades, rev6_open_trades,
+              rev7_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
@@ -2150,7 +2151,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev7_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2197,6 +2198,7 @@ def handle_telegram_commands():
                     if REV5_ENGINE_ENABLED: rev5_auto_enabled = True; _on.append("T5")
                     else: _off.append("T5")
                     if REV6_ENGINE_ENABLED: rev6_auto_enabled = True; _on.append("T6")
+                    if REV7_ENGINE_ENABLED: rev7_auto_enabled = True; _on.append("T7")
                     else: _off.append("T6")
                     _m = "ALL ENGINES ON: " + (", ".join(_on) if _on else "none")
                     if _off:
@@ -2209,6 +2211,7 @@ def handle_telegram_commands():
                     rev4_auto_enabled = False
                     rev5_auto_enabled = False
                     rev6_auto_enabled = False
+                    rev7_auto_enabled = False
                     send_tg("ALL ENGINES OFF: T1, T2, T3, T4, T5, T6.\n"
                             "Open positions are NOT closed - they keep being tracked "
                             "and will exit on their own SL / TP / time-stop.")
@@ -2315,6 +2318,40 @@ def handle_telegram_commands():
                 elif text == "/t5_stop":
                     rev5_auto_enabled = False
                     send_tg("Tight 5 (crash-continuation short) Auto-trade OFF.")
+                # ---- Tight 7 = NO-STOP fixed-time reversion SHORT: /t7_start /t7_stop ----
+                elif text == "/t7_start":
+                    if not REV7_ENGINE_ENABLED:
+                        send_tg("Tight 7 (no-stop fixed-time reversion) is disabled at build level (REV7_ENGINE_ENABLED=0).")
+                    else:
+                        rev7_auto_enabled = True
+                        send_tg("Tight 7 (no-stop fixed-time reversion SHORT) Auto-trade ON.")
+                elif text == "/t7_stop":
+                    rev7_auto_enabled = False
+                    send_tg("Tight 7 (no-stop fixed-time reversion SHORT) Auto-trade OFF. "
+                            "Open T7 positions keep running to their 24h timer.")
+                elif text == "/t7_status":
+                    lines7 = ("Tight 7 (no-stop fixed-time reversion, SHORT only): " +
+                              ("ON" if rev7_auto_enabled else "OFF") +
+                              " | Open: " + str(len(rev7_open_trades)) + "/" + str(REV7_MAX_CONCURRENT) +
+                              " | Pending: " + str(len(rev7_pending)) +
+                              "\nTrigger: close AT the high of its " + str(REV7_POS_WINDOW * 15 // 60) +
+                              "h range (pos >= " + str(round(1 - REV7_EXTREME, 4)) + ")" +
+                              "\nGates: ATR% >= " + str(round(REV7_ATRP_MIN * 100, 2)) + "% | bar qv >= $" +
+                              f"{REV7_MIN_BAR_QV:,.0f}" +
+                              "\nEXIT: market close after " + str(REV7_HOLD_SECONDS // 3600) +
+                              "h. No TP. Disaster stop only, " + str(round(REV7_DSTOP_PCT * 100)) + "% away." +
+                              "\nSize: $" + f"{REV7_NOTIONAL_USDT:,.0f}" + " notional/position (risk field $" +
+                              f"{REV7_RISK_USDT:,.2f}" + " = notional x dstop) | cooldown " +
+                              str(REV7_COOLDOWN_SECONDS // 60) + "m" +
+                              "\nThe 24h timer is the real exit - a position sitting far from its SL is NORMAL here.")
+                    for _sym, _p in list(rev7_pending.items()):
+                        lines7 += "\n[pending] " + _sym + " " + _p["pos_side"] + " @ " + str(round(_p["entry"], 6))
+                    for _oid, _t in list(rev7_open_trades.items()):
+                        _left = REV7_HOLD_SECONDS - (time.time() - _t.get("open_ts", time.time()))
+                        lines7 += ("\n" + _t["symbol"] + " " + _t["pos_side"] + " | entry " +
+                                   str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
+                                   " | closes in " + str(max(0, int(_left // 60))) + "m")
+                    send_tg(lines7)
                 # ---- Tight 6 = ATR%-gated range-extreme reversion: /t6_start /t6_stop ----
                 elif text == "/t6_start":
                     if not REV6_ENGINE_ENABLED:
@@ -2395,6 +2432,12 @@ def handle_telegram_commands():
                         " | Pending: " + str(len(rev4_pending)) +
                         " | " + str(round(REV4_RET_THR*100, 1)) + "%/4h vol>=" + str(REV4_VOL_MULT) +
                         "x TP " + str(REV4_TP_R) + "R | risk $" + str(int(REV4_RISK_USDT)) + "\n" +
+                        "Tight 7 (no-stop 24h reversion SHORT): " + ("ON" if rev7_auto_enabled else "OFF") +
+                        " | Open: " + str(len(rev7_open_trades)) + "/" + str(REV7_MAX_CONCURRENT) +
+                        " | Pending: " + str(len(rev7_pending)) +
+                        " | ATR%>=" + str(round(REV7_ATRP_MIN * 100, 2)) + "% pos" +
+                        str(REV7_POS_WINDOW * 15 // 60) + "h | exit " + str(REV7_HOLD_SECONDS // 3600) +
+                        "h timer, no TP | $" + f"{REV7_NOTIONAL_USDT:,.0f}" + " notional\n" +
                         "Tight 6 (ATR-gated reversion, BOTH legs): " + ("ON" if rev6_auto_enabled else "OFF") +
                         " | Open: " + str(len(rev6_open_trades)) + "/" + str(REV6_MAX_CONCURRENT) +
                         " | Pending: " + str(len(rev6_pending)) +
@@ -3133,7 +3176,7 @@ def rev_margin_in_use():
     """Margin currently committed across every engine's open + pending trades."""
     total = 0.0
     for book in (rev_open_trades, rev_pending, rev2_open_trades, rev2_pending,
-                 rev4_open_trades, rev4_pending):
+                 rev4_open_trades, rev4_pending, rev7_open_trades, rev7_pending):
         for t in list(book.values()):
             try:
                 total += float(t.get("margin_used", 0) or 0)
@@ -3249,7 +3292,13 @@ REV_T2 = {
 #      DO NOT retune: TP 0.5-2.0R and SL 1.5-3.0xATR x hold 24/48/72h were all swept;
 #      TP 2.0R + SL 2.0xATR + 48h is the grid optimum and the only cell that holds at
 #      50bps. Loosening ret below 2.5% raises trade count but breaks TEST/slippage. ----
-REV4_ENGINE_ENABLED   = os.environ.get("REV4_ENGINE_ENABLED", "1") == "1"
+REV4_ENGINE_ENABLED   = os.environ.get("REV4_ENGINE_ENABLED", "0") == "1"
+# 2026-09-01: T4 RETIRED, replaced by T7. Measured on BingX 36wk: 100% of T4's
+# (coin, day) signals are also taken by T7, so T4 added ZERO unique trades to the
+# portfolio - the "all four" and "T7 instead of T4" portfolios scored identically
+# (102 tr/wk, +92.7%/yr, 19.9% maxDD). T4 also had the weakest evidence of the three
+# stop-based engines (Binance TRAIN +0.226 / TEST +0.009; BingX 4/9 months positive).
+# Set REV4_ENGINE_ENABLED=1 to bring it back - no code change needed.
 rev4_auto_enabled     = AUTO_RESUME_ON_START   # /t4_start /t4_stop
 REV4_RET_THR          = 0.025   # 2.5% over 4h
 REV4_VOL_MULT         = 1.3
@@ -3718,6 +3767,196 @@ REV_T6 = {
 }
 
 
+# ==================================================================================
+# TIGHT 7 = NO-STOP, FIXED-TIME RANGE-EXTREME REVERSION SHORT  (2026-09-01)
+# ==================================================================================
+# WHY THIS ENGINE EXISTS - the measurement that produced it:
+#   Every strategy in this project was scored in R units. That hides the real
+#   arithmetic, because in R units the edge AND the cost both scale with the stop
+#   distance. Re-measuring every family in BPS OF PRICE instead (459 coins, 12mo,
+#   with an ALL-SHORT drift control subtracted) showed:
+#       - the dead families carry  0 to 10 bps of edge per trade
+#       - round-trip cost is       20 to 40 bps
+#     i.e. they are 3-5x short, which no parameter tuning can close.
+#       - simply shorting any bar earns +9 to +11 bps of free alt drift, so several
+#         historical "edges" were only that.
+#   The surviving range-extreme reversion signal carries 30-70 bps. But the MFE/MAE
+#   surface showed why it still underperforms: over 24h the median FAVOURABLE move is
+#   ~400 bps and the median ADVERSE move is ~-320 bps, while a 2xATR stop sits at only
+#   ~200 bps. The stop is INSIDE the noise, so most trades are stopped out by noise
+#   rather than by being wrong - which mechanically caps the win rate near 35-40%.
+#
+# THE FIX: stop trying to control risk with a tight stop, and control it with position
+# SIZE and DIVERSIFICATION instead. Same signal pool, same BingX data, only the exit
+# changed (36 weeks):
+#       SL 1.5xATR / TP 1.5R  ->  meanR +0.112, win 47.4%, 6/9 months
+#       SL 2.0xATR / TP 1.0R  ->  meanR +0.057, win 37.4%, 4/9 months
+#       NO STOP, 24h exit     ->  meanR +0.484, win 62.7%, 7/9 months
+#
+# SPEC (tuned on the Binance TRAIN half over a 528-cell joint grid - window x ATR floor
+# x qv floor x hold x disaster-stop, never one lever at a time - then confirmed ONCE on
+# untouched BingX data):
+#   pos48 >= 0.999 (close AT the 12h high) + ATR% >= 0.6% + signal-bar qv >= $20k,
+#   SHORT only, exit at market exactly 24h later, 15% disaster stop, dedup 1h.
+#   Binance 12mo : 224 tr/wk, +42.6 bps/trade, TRAIN +48.8 / TEST +36.2, 10/12 months,
+#                  top-3 coins 9.6% of PnL, return/drawdown 4.15
+#   BingX  36wk  : 152 tr/wk, +48.1 bps/trade, TRAIN +55.7 / TEST +39.2, 8/9 months,
+#                  top-3 12%, side-flip control -82.8 bps (fails cleanly)
+#
+# THE DISASTER STOP IS DELIBERATE AND COSTS MONEY. Without it BingX scores +48.1 bps and
+# 8/9 months; with it +40.2 bps and 6/9 months. It is bought anyway because the WORST
+# single trade without it was -160% of position notional, which at a 3.3% position is
+# -5.3% of the whole account in one trade. ~17% of PnL is being paid for a hard cap on
+# the tail. This engine has no other risk control.
+#
+# HOW SIZING WORKS HERE, AND WHY IT LOOKS ODD:
+#   Every other engine sizes by ATR risk. T7 sizes by NOTIONAL, because with no real
+#   stop there is no "1R". The existing sizing code computes qty = risk_usdt / |entry-sl|,
+#   so setting risk_usdt = NOTIONAL x DISASTER_STOP_PCT makes notional come out exactly
+#   right with no change to the order machinery. REV7_NOTIONAL_USDT is the number to
+#   tune; REV7_RISK_USDT is derived from it and should not be set directly.
+#   Target: about 3.3% of account per position at 30 concurrent slots.
+#
+# THE TP IS INTENTIONALLY UNREACHABLE. The machinery requires a TP order, so it is
+# placed at 3x the disaster-stop distance (45% in our favour). The best single trade
+# observed in 12 months was +36%, so it never fills; the real exit is the 24h timer.
+# ==================================================================================
+REV7_ENGINE_ENABLED   = os.environ.get("REV7_ENGINE_ENABLED", "1") == "1"
+rev7_auto_enabled     = AUTO_RESUME_ON_START   # /t7_start /t7_stop
+
+REV7_POS_WINDOW       = int(os.environ.get("REV7_POS_WINDOW", 48))       # 48 x 15m = 12h
+REV7_EXTREME          = float(os.environ.get("REV7_EXTREME", 0.001))     # pos >= 0.999
+REV7_ATRP_MIN         = float(os.environ.get("REV7_ATRP_MIN", 0.006))    # ATR% >= 0.6%
+REV7_MIN_BAR_QV       = float(os.environ.get("REV7_MIN_BAR_QV", 20_000)) # signal-BAR quote vol
+REV7_MIN_QUOTE_VOL    = float(os.environ.get("REV7_MIN_QUOTE_VOL", 100_000))  # 24h universe screen only
+
+# --- the exit, which is the whole point of this engine ---
+REV7_HOLD_SECONDS     = int(os.environ.get("REV7_HOLD_SECONDS", 24 * 3600))   # THE exit
+REV7_DSTOP_PCT        = float(os.environ.get("REV7_DSTOP_PCT", 0.15))         # 15% disaster stop
+REV7_TP_MULT          = float(os.environ.get("REV7_TP_MULT", 3.0))            # TP = 3x dstop = unreachable
+
+# --- sizing: notional-based, see the note above ---
+REV7_NOTIONAL_USDT    = float(os.environ.get("REV7_NOTIONAL_USDT", 150.0))
+REV7_RISK_USDT        = REV7_NOTIONAL_USDT * REV7_DSTOP_PCT   # derived, do NOT set directly
+REV7_MAX_CONCURRENT   = int(os.environ.get("REV7_MAX_CONCURRENT", 30))
+REV7_MAX_MARGIN_USDT  = float(os.environ.get("REV7_MAX_MARGIN_USDT", 200))
+REV7_SCAN_SECONDS     = int(os.environ.get("REV7_SCAN_SECONDS", 300))
+REV7_COOLDOWN_SECONDS = int(os.environ.get("REV7_COOLDOWN_SECONDS", 3600))    # dedup 1/coin/hour
+REV7_MAX_SYMBOLS      = int(os.environ.get("REV7_MAX_SYMBOLS", 600))
+
+rev7_open_trades = {}
+rev7_pending     = {}
+rev7_last_fire   = {}
+
+
+def rev7_check_signal(symbol, btc_ret, eng):
+    """T7 no-stop range-extreme reversion SHORT. Returns (side, entry, sl, tp) or None.
+
+    Deliberately does NOT reuse the ATR-based stop: sl is a flat percentage from entry
+    (the disaster stop), and tp is placed far enough away that it never fills. The real
+    exit is the hold_seconds timer handled by _rev_engine_loop.
+
+    Volume test mirrors T6: the backtest's floor was the SIGNAL BAR's own quote volume,
+    not the 24h ticker figure get_liquid_symbols screens on. BingX klines carry BASE
+    volume, so quote volume is rebuilt as volume * close, exactly as the backtest did.
+    """
+    win  = eng.get("pos_window", REV7_POS_WINDOW)
+    need = win + REV_ATR_LEN + 5
+    candles = get_candles(symbol, limit=need + REV_CANDLE_BUFFER, interval="15m")
+    # closed bars only - a forming bar would turn "did the bar CLOSE at the 12h high"
+    # into "is price at this instant's running high", which fires far too often.
+    if candles:
+        _t = _bar_ms(candles[-1])
+        if _t and (_t % 900000) != 0:
+            candles = candles[:-1]
+    if not candles or len(candles) < need:
+        _rev_log_thin(symbol, eng, len(candles) if candles else 0, need)
+        return None
+
+    closes = [cl(c) for c in candles]
+    highs  = [h(c)  for c in candles]
+    lows   = [l(c)  for c in candles]
+
+    px = closes[-1]
+    if px <= 0 or px < 0.001:
+        return None
+
+    # ---- signal-bar quote volume floor ($20k) ----
+    # This is the lever that halved coin concentration (top-3 19% -> 9.6%) and is also
+    # the one that protects against the thin-book slippage that has burned us live.
+    bar_qv = v(candles[-1]) * px
+    if bar_qv < eng.get("min_bar_qv", REV7_MIN_BAR_QV):
+        return None
+
+    # ---- ATR% floor (0.6%): keeps cost-in-bps small relative to the move ----
+    atr = atr_series(highs, lows, closes, REV_ATR_LEN)
+    if not atr or atr[-1] is None or atr[-1] <= 0:
+        return None
+    atr_now = atr[-1]
+    if (atr_now / px) < eng.get("atrp_min", REV7_ATRP_MIN):
+        return None
+
+    # ---- 12h range extreme, on HIGHS/LOWS (never the close-range) ----
+    win_hi = max(highs[-win:])
+    win_lo = min(lows[-win:])
+    if win_hi <= win_lo:
+        return None
+    pos = (px - win_lo) / (win_hi - win_lo)
+
+    ext = eng.get("extreme", REV7_EXTREME)
+    if pos < (1.0 - ext):
+        return None
+    side = "SELL"          # SHORT only - the long leg was not part of the validated spec
+
+    so = eng.get("side_only")
+    if so and side != so:
+        return None
+
+    # ---- flat disaster stop + unreachable TP ----
+    dstop = eng.get("dstop_pct", REV7_DSTOP_PCT)
+    sl = px * (1.0 + dstop)
+    tp = px * (1.0 - dstop * eng.get("tp_mult", REV7_TP_MULT))
+    if tp <= 0:
+        return None
+
+    print(f"[T7] {symbol} SELL pos{win}={pos:.4f} atr%={100*atr_now/px:.2f} "
+          f"barqv=${bar_qv:,.0f} entry={px} dstop={dstop*100:.0f}% "
+          f"sl={round(sl,8)} tp={round(tp,8)} hold={eng.get('hold_seconds', REV7_HOLD_SECONDS)//3600}h")
+    return (side, px, sl, tp)
+
+
+REV_T7 = {
+    "name": "TIGHT 7", "tag": "t7",
+    "signal_fn": rev7_check_signal,
+    "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0, "atrp_max": 0.0,
+    "side_only": "SELL",
+    "pos_window": REV7_POS_WINDOW,
+    "range_window": REV7_POS_WINDOW,   # only used for the startup log line
+    "extreme": REV7_EXTREME,
+    "atrp_min": REV7_ATRP_MIN,
+    "min_bar_qv": REV7_MIN_BAR_QV,
+    "dstop_pct": REV7_DSTOP_PCT,
+    "tp_mult": REV7_TP_MULT,
+    "range_regime": None,       # no regime filter in the validated spec
+    "cvd_filter": False,        # not in the validated spec
+    "flow_gate": False,         # not in the validated spec
+    "min_quote_vol": REV7_MIN_QUOTE_VOL,
+    # long_* are never used (SELL only) but are kept so any generic helper that reads
+    # them cannot KeyError.
+    "long_sl_atr": 0.0, "long_tp_r": 0.0,
+    "short_sl_atr": 0.0, "short_tp_r": 0.0,
+    # 15% stop must clear the shared 6% cap, so this engine carries its own.
+    # T1/T2/T4/T5/T6 keep REV_SL_CAP_PCT and are untouched.
+    "sl_cap_pct": max(REV7_DSTOP_PCT * 1.5, REV_SL_CAP_PCT),
+    "risk_usdt": REV7_RISK_USDT, "leverage": REV_LEVERAGE,
+    "max_concurrent": REV7_MAX_CONCURRENT, "max_margin": REV7_MAX_MARGIN_USDT,
+    "cooldown_s": REV7_COOLDOWN_SECONDS,
+    "hold_seconds": REV7_HOLD_SECONDS,
+    "max_symbols": REV7_MAX_SYMBOLS,
+    "open": rev7_open_trades, "pending": rev7_pending, "last_fire": rev7_last_fire,
+}
+
+
 def rev_in_cooldown(symbol, eng):
     cd = eng.get("cooldown_s", REV_COOLDOWN_SECONDS)
     return (time.time() - eng["last_fire"].get(symbol, 0)) < cd
@@ -3737,7 +3976,7 @@ def rev_try_claim(symbol):
         if (symbol in rev_claimed or symbol in all_open_symbols()
                 or symbol in rev_pending or symbol in rev2_pending
                 or symbol in rev4_pending or symbol in rev5_pending
-                or symbol in rev6_pending):
+                or symbol in rev6_pending or symbol in rev7_pending):
             return False
         rev_claimed.add(symbol)
         return True
@@ -3753,7 +3992,7 @@ def rev_symbol_busy(symbol, eng):
     return (symbol in all_open_symbols() or symbol in eng["pending"]
             or symbol in rev_pending or symbol in rev2_pending
             or symbol in rev4_pending or symbol in rev5_pending
-            or symbol in rev6_pending
+            or symbol in rev6_pending or symbol in rev7_pending
             or symbol in rev_claimed)
 
 
@@ -4596,6 +4835,13 @@ def rev4_loop():
     _rev_engine_loop(REV_T4, lambda: rev4_auto_enabled, REV4_SCAN_SECONDS)
 
 
+def rev7_loop():
+    if not REV7_ENGINE_ENABLED:
+        print("Tight 7 disabled at build level (REV7_ENGINE_ENABLED=0)")
+        return
+    _rev_engine_loop(REV_T7, lambda: rev7_auto_enabled, REV7_SCAN_SECONDS)
+
+
 def rev6_loop():
     if not REV6_ENGINE_ENABLED:
         print("Tight 6 disabled at build level (REV6_ENGINE_ENABLED=0)")
@@ -4711,4 +4957,5 @@ if __name__ == "__main__":
     Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
     Thread(target=rev5_loop,                daemon=True).start()   # Tight 5 = crash-continuation SHORT (2026-08-30)
     Thread(target=rev6_loop,                daemon=True).start()   # Tight 6 = ATR%-gated range-extreme reversion (2026-08-31)
+    Thread(target=rev7_loop,                daemon=True).start()   # Tight 7 = NO-STOP fixed-time reversion SHORT, replaces T4 (2026-09-01)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

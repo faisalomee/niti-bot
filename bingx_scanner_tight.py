@@ -2358,6 +2358,10 @@ def handle_telegram_commands():
                               "h range (pos >= " + str(round(1 - REV4_EXTREME, 4)) + ")" +
                               "\nGates: ATR% >= " + str(round(REV4_ATRP_MIN * 100, 2)) + "% | bar qv >= $" +
                               f"{REV4_MIN_BAR_QV:,.0f}" +
+                              ("\nAsia filter: ON (" + str(REV4_ASIA_HOUR) + ":00 UTC range must have broken DOWN)"
+                               if REV4_ASIA_FILTER else "\nAsia filter: OFF") +
+                              ("\nSMC filter: ON (skip if a liquidity sweep of the highs already fired)"
+                               if REV4_SMC_FILTER else "\nSMC filter: OFF") +
                               "\nEXIT: market close after " + str(REV4_HOLD_SECONDS // 3600) +
                               "h. No TP. Disaster stop only, " + str(round(REV4_DSTOP_PCT * 100)) + "% away." +
                               "\nSize: $" + f"{REV4_NOTIONAL_USDT:,.0f}" + " notional/position x " +
@@ -3108,19 +3112,24 @@ REV_VOL_MULT         = 2.0   # 2026-08-27: 1.3 -> 2.0. With the flow gate on, th
                              # IF LIVE TRADES ARE TOO FEW, this is the first lever
                              # to move back to 1.3 (8.3/wk, +$709, still robust).     # volume >= 1.3x 96-bar median
 REV_ATR_LEN          = int(os.environ.get("REV_ATR_LEN", 14))
-REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 2.0))
-REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 2.5))
-REV_SHORT_SL_ATR     = float(os.environ.get("REV_SHORT_SL_ATR", 2.0))
-REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 2.5))
+REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 3.0))   # 2026-09-03
+REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 0.50))  # 2026-09-03
+REV_SHORT_SL_ATR     = float(os.environ.get("REV_SHORT_SL_ATR", 3.0))   # 2026-09-03
+REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 1.00))  # 2026-09-03
 REV_SL_CAP_PCT       = float(os.environ.get("REV_SL_CAP_PCT", 0.06))  # skip if SL > 6% away
 REV_BTC_WINDOW       = int(os.environ.get("REV_BTC_WINDOW", 384))     # 384 x 15m = 4 days
 REV_BTC_THR          = float(os.environ.get("REV_BTC_THR", 0.12))     # regime gate at +/-12%
-REV_HOLD_SECONDS     = int(os.environ.get("REV_HOLD_SECONDS", 12 * 3600))  # 2026-08-30: 48h -> 12h (slot turnover; sweep 6/12/24/48h)
+REV_HOLD_SECONDS     = int(os.environ.get("REV_HOLD_SECONDS", 48 * 3600))
+# 2026-09-03: BACK TO 48h (shared by T1 and T2). The 2026-08-30 cut to 12h is what
+# broke T1: with TP at 2.5R (= 5xATR away) a 12h window almost never reached it, so
+# win rate fell to 18.7% against a 28.6% breakeven and T1 bled about $7.5/wk.
+# Hold sweep at the OLD exits was monotone: 6h -0.682, 12h -0.422, 24h -0.155,
+# 48h -0.010, 96h +0.038. Both retuned legs were measured at 48h.
 _REV_HOLD_OLD_NOTE   = 48 * 3600   # 2026-08-27: 24h -> 48h. Same grid; the winner
                                    # at every robust setting held 48h. Shared by T1/T2.
 REV_COOLDOWN_SECONDS = int(os.environ.get("REV_COOLDOWN_SECONDS", 6 * 3600))
 REV_FILL_BARS        = int(os.environ.get("REV_FILL_BARS", 4))        # cancel the resting limit after 4 bars (1h)
-REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 1.5))   # 2026-08-30: sized for a $150 account at 10x (margin-bound, not drawdown-bound)
+REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 5.0))   # 2026-08-30: sized for a $150 account at 10x (margin-bound, not drawdown-bound)
 REV_LEVERAGE         = int(os.environ.get("REV_LEVERAGE", 10))
 REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 30))   # 2026-08-30: 20 -> 30 (cap sweep with both filters on)
 REV_MAX_MARGIN_USDT  = float(os.environ.get("REV_MAX_MARGIN_USDT", 40))
@@ -3182,7 +3191,21 @@ REV_T1 = {
     "short_sl_atr": REV_SHORT_SL_ATR, "short_tp_r": REV_SHORT_TP_R,
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV_RISK_USDT, "leverage": REV_LEVERAGE,
     "max_concurrent": REV_MAX_CONCURRENT, "max_margin": REV_MAX_MARGIN_USDT,
-    "cvd_filter": True, "range_regime": "CALM",   # 2026-08-30: reversion -> calm + CVD
+    # ---- 2026-09-03 RETUNE: the legs are tuned separately ----
+    # SHORT: pos>=0.99, move>=4 ATR, vol>=1.5x, ATR%>=1.0%, CALM ON, CVD ON
+    #        12.6 tr/wk, meanR +0.138, win 58.0%, R/wk 1.74, maxDD 14R, 11/12 months.
+    #        Holdout +0.137 / +0.140 on the two coin groups; still +0.050 at 100bps.
+    # LONG : pos<=0.02, ret<=-6%, vol>=2.0x, ATR%>=0.6%, CALM OFF, CVD ON
+    #        47.6 tr/wk, win 71.5%, R/wk 2.55 at cap 15, maxDD 39R, 10/12 months.
+    #        Dropping CALM is what took the long leg from 3.3 to 63 tr/wk.
+    "pos_extreme_short": 0.99, "pos_extreme_long": 0.02,
+    "mv_atr_short": 4.0, "mv_atr_long": 0.0,
+    "vol_mult_short": 1.5, "vol_mult_long": 2.0,
+    "atrp_min_short": 0.010, "atrp_min_long": 0.006,
+    "ret_thr_short": 0.0, "ret_thr_long": REV_RET_THR,
+    "range_regime_short": "CALM", "range_regime_long": None,
+    "cvd_filter_short": True, "cvd_filter_long": True,
+    "cvd_filter": True, "range_regime": "CALM",
     "open": rev_open_trades, "pending": rev_pending, "last_fire": rev_last_fire,
 }
 
@@ -3209,7 +3232,7 @@ REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.1))
 REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 0.0))
 REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.0))
 REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 30))  # 2026-08-30: 20 -> 30
-REV2_RISK_USDT        = float(os.environ.get("REV2_RISK_USDT", 1.5))
+REV2_RISK_USDT        = float(os.environ.get("REV2_RISK_USDT", 5.0))
 REV2_MAX_MARGIN_USDT  = float(os.environ.get("REV2_MAX_MARGIN_USDT", 40))
 REV2_SCAN_SECONDS     = int(os.environ.get("REV2_SCAN_SECONDS", 300))
 
@@ -3217,13 +3240,13 @@ rev2_open_trades = {}
 rev2_pending     = {}
 rev2_last_fire   = {}
 
-REV2_LONG_SL_ATR      = float(os.environ.get("REV2_LONG_SL_ATR", 2.0))
-REV2_SHORT_SL_ATR     = float(os.environ.get("REV2_SHORT_SL_ATR", 2.0))
-REV2_LONG_TP_R        = 1.5   # 2026-08-27: 1.0 -> 1.5. Not for the headline PnL but
-                              # for concentration: at TP 1.0R the top-3 coins were 84%
-                              # of all PnL (i.e. everything else lost); at 1.5R that
-                              # falls to 23%. meanR +0.024 -> +0.169, PnL +$142 -> +$438.
-REV2_SHORT_TP_R       = 1.5   # see REV2_LONG_TP_R
+REV2_LONG_SL_ATR      = float(os.environ.get("REV2_LONG_SL_ATR", 3.5))   # 2026-09-03
+REV2_SHORT_SL_ATR     = float(os.environ.get("REV2_SHORT_SL_ATR", 3.0))   # 2026-09-03
+REV2_LONG_TP_R        = float(os.environ.get("REV2_LONG_TP_R", 1.0))    # 2026-09-03 retune
+REV2_SHORT_TP_R       = float(os.environ.get("REV2_SHORT_TP_R", 0.75))  # 2026-09-03 retune
+# The 2026-08-27 note (1.0 -> 1.5 for concentration) is superseded: with the new
+# ATR-unit entry gates the concentration problem is gone anyway (top-3 = 14% short,
+# 9% long), and the shorter TPs are what lift win rate to 62-64%.
 REV2_COOLDOWN_SECONDS = int(os.environ.get("REV2_COOLDOWN_SECONDS", 6 * 3600))
 
 REV_T2 = {
@@ -3235,7 +3258,20 @@ REV_T2 = {
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV2_RISK_USDT, "leverage": REV_LEVERAGE,
     "max_concurrent": REV2_MAX_CONCURRENT, "max_margin": REV2_MAX_MARGIN_USDT,
     "cooldown_s": REV2_COOLDOWN_SECONDS,
-    "cvd_filter": True, "range_regime": None,     # 2026-08-30: CVD yes, range filter measured WORSE for T2
+    # ---- 2026-09-03 RETUNE, both legs gridded with the cap applied ----
+    # SHORT: pos>=0.999, move>=4 ATR, vol>=1.1x, ATR%>=0.6%, CALM ON, CVD OFF
+    #        30.9 tr/wk, meanR +0.092, win 64.1%, R/wk 2.84, ret/DD 7.39, 10/12 months.
+    # LONG : pos<=0.02, move>=8 ATR, vol>=1.1x, ATR%>=0.6%, CALM OFF, CVD OFF
+    #        10.0 tr/wk, meanR +0.227, win 62.6%, R/wk 2.28, ret/DD 10.02, 10/12 months.
+    #        Still +0.124 at 100bps - the most slippage-tolerant leg measured.
+    "pos_extreme_short": 0.999, "pos_extreme_long": 0.02,
+    "mv_atr_short": 4.0, "mv_atr_long": 8.0,
+    "vol_mult_short": 1.1, "vol_mult_long": 1.1,
+    "atrp_min_short": 0.006, "atrp_min_long": 0.006,
+    "ret_thr_short": 0.0, "ret_thr_long": 0.0,
+    "range_regime_short": "CALM", "range_regime_long": None,
+    "cvd_filter_short": False, "cvd_filter_long": False,
+    "cvd_filter": False, "range_regime": None,
     "open": rev2_open_trades, "pending": rev2_pending, "last_fire": rev2_last_fire,
 }
 
@@ -3329,6 +3365,11 @@ REV4_TP_MULT          = float(os.environ.get("REV4_TP_MULT", 3.0))            # 
 # cutting notional would have doubled the account's exposure, which is not what
 # "more slots" was asked for. If the account can carry more, raise REV4_NOTIONAL_USDT
 # deliberately - do not let it drift up as a side effect of the slot change.
+REV4_ASIA_FILTER      = os.environ.get("REV4_ASIA_FILTER", "0") == "1"   # 2026-09-03: superseded by the SMC filter below
+REV4_SMC_FILTER       = os.environ.get("REV4_SMC_FILTER", "1") == "1"
+REV4_SMC_LOOKBACK     = int(os.environ.get("REV4_SMC_LOOKBACK", 8))     # bars after the sweep to look for the break
+REV4_ASIA_HOUR        = int(os.environ.get("REV4_ASIA_HOUR", 5))      # 05:00-05:59 UTC = 11am-12pm BD
+REV4_ASIA_BUFFER      = float(os.environ.get("REV4_ASIA_BUFFER", 0.002))
 REV4_LEVERAGE         = int(os.environ.get("REV4_LEVERAGE", 5))   # see the note on REV_T4["leverage"]
 REV4_NOTIONAL_USDT    = float(os.environ.get("REV4_NOTIONAL_USDT", 75.0))
 REV4_RISK_USDT        = REV4_NOTIONAL_USDT * REV4_DSTOP_PCT   # derived, do NOT set directly
@@ -3341,6 +3382,77 @@ REV4_MAX_SYMBOLS      = int(os.environ.get("REV4_MAX_SYMBOLS", 600))
 rev4_open_trades = {}
 rev4_pending     = {}
 rev4_last_fire   = {}
+
+
+def _rev4_asia_short_confirmed(candles):
+    """True if today's 05:00-05:59 UTC range has already broken DOWNWARD.
+
+    Range = high/low of the four 15m bars in the REV4_ASIA_HOUR UTC hour of the CURRENT
+    UTC day. Confirmation = any later CLOSED bar closing below low*(1-buffer). Only bars
+    strictly after that hour are considered, so there is no lookahead. Returns False
+    before the hour completes, which correctly blocks trades early in the UTC day.
+    """
+    if not candles:
+        return False
+    try:
+        now_ms = _bar_ms(candles[-1])
+        if not now_ms:
+            return False
+        day0 = (now_ms // 86400000) * 86400000
+        lo_ms = day0 + REV4_ASIA_HOUR * 3600000
+        hi_ms = lo_ms + 3600000
+        rng_lo = None
+        broke = False
+        for cd in candles:
+            t = _bar_ms(cd)
+            if not t or t < lo_ms:
+                continue
+            if t < hi_ms:
+                lv = l(cd)
+                rng_lo = lv if rng_lo is None else min(rng_lo, lv)
+            else:
+                if rng_lo is None:
+                    return False          # the range hour is missing from the data
+                if cl(cd) < rng_lo * (1.0 - REV4_ASIA_BUFFER):
+                    broke = True
+                    break
+        return broke
+    except Exception:
+        return False
+
+
+def _rev4_smc_sweep_fired(candles):
+    """True if a liquidity sweep of the highs has already happened recently.
+
+    Sweep  = a bar whose HIGH takes out the pool level (max of the prior 96-bar high
+             and the prior 16-bar swing high) but whose BODY closes back inside it.
+    Break  = within REV4_SMC_LOOKBACK bars after that sweep, a close below the low of
+             the previous 3 bars.
+    Both conditions use only CLOSED bars at or before the current one, so there is no
+    lookahead. Returns False on any data problem, which lets the trade through -
+    the filter is an exclusion, so failing open keeps behaviour closest to unfiltered.
+    """
+    try:
+        n = len(candles)
+        if n < 120:
+            return False
+        highs = [h(c) for c in candles]
+        lows  = [l(c) for c in candles]
+        closes= [cl(c) for c in candles]
+        opens = [float(c["open"]) for c in candles]
+        look = REV4_SMC_LOOKBACK
+        # only the recent window can still be "in effect"
+        start = max(97, n - 1 - look)
+        for i in range(start, n):
+            pool = max(max(highs[i - 96:i]), max(highs[i - 16:i]))
+            if not (highs[i] > pool and closes[i] < pool and max(closes[i], opens[i]) < pool):
+                continue
+            for t in range(i + 1, min(i + 1 + look, n)):
+                if closes[t] < min(lows[t - 3:t]):
+                    return True
+        return False
+    except Exception:
+        return False
 
 
 def rev4_check_signal(symbol, btc_ret, eng):
@@ -3357,7 +3469,9 @@ def rev4_check_signal(symbol, btc_ret, eng):
     "simplify" this by moving the floor into the engine's min_quote_vol.
     """
     win  = eng.get("pos_window", REV4_POS_WINDOW)
-    need = win + REV_ATR_LEN + 5
+    # 120 bars = 30h, enough to always contain today's 05:00 UTC hour plus the rest of
+    # the day, which the Asian-session filter needs.
+    need = max(win + REV_ATR_LEN + 5, 120)
     candles = get_candles(symbol, limit=need + REV_CANDLE_BUFFER, interval="15m")
     # closed bars only - a forming bar would turn "did the bar CLOSE at the 12h high"
     # into "is price at this instant's running high", which fires far too often.
@@ -3383,6 +3497,30 @@ def rev4_check_signal(symbol, btc_ret, eng):
     bar_qv = v(candles[-1]) * px
     if bar_qv < eng.get("min_bar_qv", REV4_MIN_BAR_QV):
         return None
+
+    # ---- ASIAN-SESSION CONFIRMATION (added 2026-09-02) ----
+    # Measured on BOTH exchanges: T4 trades where the 05:00-06:00 UTC range has ALREADY
+    # broken DOWNWARD earn +119.9 bps (Binance) / +166.4 (BingX); the ones where it has
+    # not are worth +3.4 / +0.1 bps with a NEGATIVE test half. Same edge, half the trades,
+    # and the worst week improves from -$1,538 to -$656. The breakout strategy is dead on
+    # its own (0/9 months) - it only works as a confirmation filter, never as a signal.
+    if eng.get("asia_filter", REV4_ASIA_FILTER):
+        if not _rev4_asia_short_confirmed(candles):
+            return None
+
+    # ---- INVERSE SMC LIQUIDITY-SWEEP FILTER (2026-09-03) ----
+    # Measured on BOTH exchanges: when an SMC high-sweep has already fired on this
+    # coin today, T4 LOSES money (Binance -39.6 bps / BingX -36.7, 2-3/9 months,
+    # TEST negative on both). Excluding those trades takes T4 from $161/wk to
+    # $372/wk with the worst week improving from -$1,538 to -$624.
+    # Mechanism: a sweep means the highs have already been taken and the stops above
+    # are gone, so there is less fuel left for a short. T4 wants a coin sitting at
+    # its high that has NOT yet been swept.
+    # NOTE THE SIGN: the sweep pattern is a dead strategy on its own (0-1/9 months);
+    # it only works INVERTED, as an exclusion. Do not "fix" this into a confirmation.
+    if eng.get("smc_filter", REV4_SMC_FILTER):
+        if _rev4_smc_sweep_fired(candles):
+            return None
 
     # ---- ATR% floor (0.6%): keeps cost-in-bps small relative to the move ----
     atr = atr_series(highs, lows, closes, REV_ATR_LEN)
@@ -3432,6 +3570,8 @@ REV_T4 = {
     "extreme": REV4_EXTREME,
     "atrp_min": REV4_ATRP_MIN,
     "min_bar_qv": REV4_MIN_BAR_QV,
+    "asia_filter": REV4_ASIA_FILTER,
+    "smc_filter": REV4_SMC_FILTER,
     "dstop_pct": REV4_DSTOP_PCT,
     "tp_mult": REV4_TP_MULT,
     # The old stop-based T4 ran a BTC regime gate, a CVD filter and a CALM range filter.
@@ -3507,16 +3647,27 @@ REV_T4 = {
 
 REV5_ENGINE_ENABLED   = os.environ.get("REV5_ENGINE_ENABLED", "1") == "1"
 rev5_auto_enabled     = AUTO_RESUME_ON_START   # /t5_start /t5_stop
-REV5_CRASH_RET        = float(os.environ.get("REV5_CRASH_RET", -0.20))   # 24h return gate
+REV5_CRASH_RET        = float(os.environ.get("REV5_CRASH_RET", -0.20))   # legacy absolute gate, no longer the trigger
+# ---- 2026-09-03 RETUNE ----
+# The old rule was an absolute 24h drop of 20%. That conflates a coin breaking down
+# with the whole market falling, and the market half carries no edge: by BTC 14d
+# regime the old spec scored BEAR -0.020, BULL +0.067, FLAT +0.155.
+# The new rule is the EXCESS drop: how much further the coin fell than BTC did over
+# the same 24h. BTC calm + one coin down hard = that coin's own problem (bad news,
+# a holder leaving), and that selling continues. Same drop while BTC is falling is
+# just beta, and it bounces.
+REV5_EXCESS_DROP      = float(os.environ.get("REV5_EXCESS_DROP", -0.08))
+REV5_ATRP_MIN         = float(os.environ.get("REV5_ATRP_MIN", 0.010))
+REV5_ST_ONLY          = os.environ.get("REV5_ST_ONLY", "1") == "1"   # drop the CCI trigger
 REV5_RET_WINDOW       = 96      # 96 x 15m = 24h
 REV5_ST_PERIOD        = 7
 REV5_ST_FACTOR        = 2.0
-REV5_SL_ATR           = 3.0
-REV5_TP_R             = 1.5
+REV5_SL_ATR           = float(os.environ.get("REV5_SL_ATR", 3.0))   # 2026-09-03 confirmed
+REV5_TP_R             = float(os.environ.get("REV5_TP_R", 1.0))    # 2026-09-03 retune
 REV5_HOLD_SECONDS     = int(os.environ.get("REV5_HOLD_SECONDS", 96 * 3600))   # 4 days
 REV5_MIN_QUOTE_VOL    = float(os.environ.get("REV5_MIN_QUOTE_VOL", 2_000_000))
 REV5_MAX_CONCURRENT   = int(os.environ.get("REV5_MAX_CONCURRENT", 30))
-REV5_RISK_USDT        = float(os.environ.get("REV5_RISK_USDT", 1.5))
+REV5_RISK_USDT        = float(os.environ.get("REV5_RISK_USDT", 5.0))
 REV5_MAX_MARGIN_USDT  = float(os.environ.get("REV5_MAX_MARGIN_USDT", 40))
 REV5_SCAN_SECONDS     = int(os.environ.get("REV5_SCAN_SECONDS", 300))
 REV5_COOLDOWN_SECONDS = int(os.environ.get("REV5_COOLDOWN_SECONDS", 24 * 3600))
@@ -3609,13 +3760,33 @@ def rev5_check_signal(symbol, btc_ret, eng):
     past = closes[-(REV5_RET_WINDOW + 1)]
     if past <= 0:
         return None
-    if (px / past - 1.0) > REV5_CRASH_RET:
+    coin_ret = px / past - 1.0
+    # ---- 2026-09-03: EXCESS DROP vs BTC replaces the absolute -20% gate ----
+    # How much further this coin fell than BTC over the same 24h. BTC calm + one coin
+    # down hard = that coin's own problem, and that selling continues. The same drop
+    # while BTC is falling is just beta, and it bounces. By BTC 14d regime the OLD
+    # spec scored BEAR -0.020 / BULL +0.067 / FLAT +0.155 - the market half had no edge.
+    # Validated the right way round: TUNED on BingX, held out on Binance.
+    #   BingX   8.8 tr/wk meanR +0.143 win 58.2% 7/9 months
+    #   Binance 22.1 tr/wk meanR +0.081 win 55.1% 8/12, TRAIN +0.083 / TEST +0.079,
+    #           flip -0.132, random z +3.33
+    # Two earlier Binance-tuned versions BOTH died on BingX with a POSITIVE side-flip.
+    # Order matters: BingX data starts Nov-2025, so Binance-first tuning silently fits
+    # Aug-Oct 2025, which is where the old edge lived.
+    _btc24 = rev_btc_24h()
+    if _btc24 is None:
+        return None                      # skip rather than guess
+    if (coin_ret - _btc24) > REV5_EXCESS_DROP:
         return None
 
     atr = atr_series(highs, lows, closes, REV_ATR_LEN)
     if not atr or atr[-1] is None or atr[-1] <= 0:
         return None
     atr_now = atr[-1]
+    # 2026-09-03: ATR% floor. Cost in R = slippage / stop distance, and the stop is a
+    # multiple of ATR, so a floor here keeps the fixed 20bps a small fraction of R.
+    if (atr_now / px) < REV5_ATRP_MIN:
+        return None
 
     ema200 = _ema_list(closes, 200)
     ema250 = _ema_list(closes, 250)
@@ -3628,7 +3799,9 @@ def rev5_check_signal(symbol, btc_ret, eng):
         trigger = "ST"
 
     # ---- trigger B: EMA/CCI/MACD bearish zero-cross ----
-    if trigger is None:
+    # 2026-09-03: OFF by default. Tuned on BingX and held out on Binance, the
+    # Supertrend-only variant survived both exchanges; adding CCI did not.
+    if trigger is None and not REV5_ST_ONLY:
         e12 = _ema_list(closes, 12); e26 = _ema_list(closes, 26)
         macd = [e12[i] - e26[i] for i in range(len(closes))]
         sig9 = _ema_list(macd, 9)
@@ -3664,7 +3837,9 @@ REV_T5 = {
     "signal_fn": rev5_check_signal,
     "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0, "atrp_max": 0.0,
     "side_only": "SELL",
-    "range_regime": "WIDE",     # continuation engine
+    # 2026-09-03: WIDE gate REMOVED. The excess-drop rule already strips the market
+    # component, so the regime filter only cut trades without adding edge.
+    "range_regime": None,
     "cvd_filter": False,        # crash entries never print a new high
     "min_quote_vol": REV5_MIN_QUOTE_VOL,
     "long_sl_atr": REV5_SL_ATR, "long_tp_r": REV5_TP_R,
@@ -3917,6 +4092,22 @@ def rev_symbol_busy(symbol, eng):
             or symbol in rev4_pending or symbol in rev5_pending
             or symbol in rev6_pending
             or symbol in rev_claimed)
+
+
+def rev_btc_24h():
+    """BTC 24h return. Used by T5's excess-drop rule. None means skip, never guess."""
+    try:
+        candles = get_candles("BTC-USDT", limit=96 + 5, interval="15m")
+        if not candles or len(candles) < 97:
+            return None
+        closes = [cl(c) for c in candles]
+        past = closes[-97]
+        if past <= 0:
+            return None
+        return closes[-1] / past - 1.0
+    except Exception as e:
+        print(f"[REV BTC24] {e}")
+        return None
 
 
 def rev_btc_regime():
@@ -4368,6 +4559,7 @@ def rev_check_signal(symbol, btc_ret, eng):
     vr = vols[-1] / med_vol
     if vr < eng["vol_mult"]:
         return None
+    # per-leg volume floors are checked after `side` is known, further down
     # T2 ceiling: reject FOMO-continuation volume spikes (vr>3x measured NEGATIVE). T1 leaves this off (max=0).
     if eng["vol_mult_max"] > 0 and vr > eng["vol_mult_max"]:
         return None
@@ -4388,11 +4580,37 @@ def rev_check_signal(symbol, btc_ret, eng):
     # high/low) - the close price essentially never equals the running extreme exactly,
     # so this fired almost never. The backtest that produced every number in this file
     # used 0.999/0.001 (near-extreme, not exact) - this is that same threshold, restored.
-    if ret >= eng["ret_thr"] and pos >= 0.999:
+    # 2026-09-03 RETUNE: the two legs no longer share one threshold. Gridded with the
+    # cap applied and a HARD both-coin-group holdout gate; the pos extreme, the volume
+    # multiple and the move measure all differ per leg (see the engine dict).
+    _pos_s = eng.get("pos_extreme_short", 0.999)
+    _pos_l = eng.get("pos_extreme_long", 0.001)
+    _thr_s = eng.get("ret_thr_short", eng["ret_thr"])
+    _thr_l = eng.get("ret_thr_long", eng["ret_thr"])
+    if ret >= _thr_s and pos >= _pos_s:
         side = "SELL"
-    elif ret <= -eng["ret_thr"] and pos <= 0.001:
+    elif ret <= -_thr_l and pos <= _pos_l:
         side = "BUY"
     if side is None:
+        return None
+
+    # ---- 2026-09-03 PER-LEG GATES ----
+    # move measured in ATR UNITS, not percent. A 4% threshold silently selects
+    # low-ATR coins; in ATR units the same number means the same degree of
+    # overextension on every coin. This is the single change that fixed the
+    # coin-holdout failure on the short leg.
+    _mv_atr = abs(px - past) / atr_now if atr_now > 0 else 0.0
+    _need_mv = eng.get("mv_atr_short", 0.0) if side == "SELL" else eng.get("mv_atr_long", 0.0)
+    if _need_mv > 0 and _mv_atr < _need_mv:
+        return None
+    _need_vr = eng.get("vol_mult_short", 0.0) if side == "SELL" else eng.get("vol_mult_long", 0.0)
+    if _need_vr > 0 and vr < _need_vr:
+        return None
+    # ATR% floor. Cost in R = slippage / stop distance, and the stop is a multiple of
+    # ATR, so a higher ATR% floor makes the same 20bps cost a smaller fraction of R.
+    # It also thins out the low-ATR names that crowd the concurrency cap without an edge.
+    _atrp_min = eng.get("atrp_min_short", 0.0) if side == "SELL" else eng.get("atrp_min_long", 0.0)
+    if _atrp_min > 0 and (atr_now / px) < _atrp_min:
         return None
 
     # 2026-08-28: T4 is SHORT-ONLY. Its long leg measured negative in EVERY regime
@@ -4404,7 +4622,10 @@ def rev_check_signal(symbol, btc_ret, eng):
     # 2026-08-30 RANGE-REGIME ROUTER. Reversion engines (T1, T4) only trade CALM
     # ranges, continuation engines trade WIDE. T2 sets nothing and is unfiltered
     # (every range variant measured worse for it). Fails OPEN if unreadable.
-    _want_reg = eng.get("range_regime")
+    # 2026-09-03: per-leg. The CALM filter was the single biggest blocker on the LONG
+    # leg (turning it off took T1 long from 3.3 to 63 tr/wk) while the SHORT leg keeps it.
+    _want_reg = eng.get("range_regime_short" if side == "SELL" else "range_regime_long",
+                        eng.get("range_regime"))
     if _want_reg:
         _ok, _reg = range_allows(symbol, _want_reg, label=" " + eng["tag"].upper())
         if not _ok:
@@ -4412,7 +4633,9 @@ def rev_check_signal(symbol, btc_ret, eng):
 
     # 2026-08-30 CVD DIVERGENCE. Reversion engines only. Requires the tape to
     # DISAGREE with the price extreme we are fading. Fails OPEN if unreadable.
-    if eng.get("cvd_filter"):
+    _want_cvd = eng.get("cvd_filter_short" if side == "SELL" else "cvd_filter_long",
+                        eng.get("cvd_filter"))
+    if _want_cvd:
         _ok, _dv = cvd_allows(symbol, side, label=" " + eng["tag"].upper())
         if not _ok:
             return None

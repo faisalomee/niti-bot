@@ -1648,7 +1648,8 @@ def all_open_symbols():
     and unmanaged on BingX (COMP-USDT 2026-08-19). Every engine's dict belongs here."""
     syms = set()
     for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades,
-              rev2_open_trades, rev4_open_trades, rev5_open_trades, rev6_open_trades):
+              rev2_open_trades, rev3_open_trades, rev4_open_trades, rev5_open_trades,
+              rev6_open_trades):
         for t in d.values():
             s = t.get("symbol")
             if s:
@@ -2150,7 +2151,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev3_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
     # auto-trade ON after a redeploy.
@@ -2190,7 +2191,7 @@ def handle_telegram_commands():
                     else: _off.append("T1")
                     if REV2_ENGINE_ENABLED: rev2_auto_enabled = True; _on.append("T2")
                     else: _off.append("T2")
-                    if T3_ENGINE_ENABLED:   t3_scalp_auto_enabled = True; _on.append("T3")
+                    if REV3_ENGINE_ENABLED: rev3_auto_enabled = True; _on.append("T3")
                     else: _off.append("T3")
                     if REV4_ENGINE_ENABLED: rev4_auto_enabled = True; _on.append("T4")
                     else: _off.append("T4")
@@ -2206,6 +2207,7 @@ def handle_telegram_commands():
                     rev_auto_enabled = False
                     rev2_auto_enabled = False
                     t3_scalp_auto_enabled = False
+                    rev3_auto_enabled = False
                     rev4_auto_enabled = False
                     rev5_auto_enabled = False
                     rev6_auto_enabled = False
@@ -2315,6 +2317,37 @@ def handle_telegram_commands():
                 elif text == "/t5_stop":
                     rev5_auto_enabled = False
                     send_tg("Tight 5 (crash-continuation short) Auto-trade OFF.")
+                # ---- Tight 3 = clean-level sweep SHORT: /t3_start /t3_stop ----
+                elif text == "/t3_start":
+                    if not REV3_ENGINE_ENABLED:
+                        send_tg("Tight 3 (clean-level sweep short) is disabled at build level (REV3_ENGINE_ENABLED=0).")
+                    else:
+                        rev3_auto_enabled = True
+                        send_tg("Tight 3 (clean-level sweep SHORT) Auto-trade ON.")
+                elif text == "/t3_stop":
+                    rev3_auto_enabled = False
+                    send_tg("Tight 3 (clean-level sweep SHORT) Auto-trade OFF.")
+                elif text == "/t3_status":
+                    lines3 = ("Tight 3 (clean-level sweep SHORT): " +
+                              ("ON" if rev3_auto_enabled else "OFF") +
+                              " | Open: " + str(len(rev3_open_trades)) + "/" + str(REV3_MAX_CONCURRENT) +
+                              " | Pending: " + str(len(rev3_pending)) +
+                              "\nTrigger (4H): high sweeps the " + ",".join(str(x) for x in REV3_LEVEL_WINDOWS) +
+                              "-bar high by >=" + str(round(REV3_SWEEP_MIN * 100, 2)) + "% and CLOSES back below" +
+                              "\nGates: upper wick >= " + str(round(REV3_WICK_MIN * 100)) + "% | level touched <= " +
+                              str(REV3_MAX_TOUCHES) + " (CLEAN) | ATR%(4H) <= " + str(round(REV3_ATRP_MAX * 100)) + "%" +
+                              ("\nAsia filter: ON" if REV3_ASIA_FILTER else "\nAsia filter: OFF") +
+                              ("\nSMC exclusion: ON" if REV3_SMC_FILTER else "\nSMC exclusion: OFF") +
+                              ("\nT4-day block: ON" if REV3_BLOCK_T4_DAY else "\nT4-day block: OFF") +
+                              "\nEXIT: market close after " + str(REV3_HOLD_SECONDS // 3600) +
+                              "h. No TP. Disaster stop only, " + str(round(REV3_DSTOP_PCT * 100)) + "% away." +
+                              "\nNotional $" + str(REV3_NOTIONAL_USDT) + " | leverage " + str(REV3_LEVERAGE) + "x")
+                    for _oid, _t in list(rev3_open_trades.items()):
+                        _left = REV3_HOLD_SECONDS - (time.time() - _t.get("open_ts", time.time()))
+                        lines3 += ("\n  " + str(_t.get("symbol")) + " " + str(_t.get("pos_side")) +
+                                   " closes in " + str(max(0, int(_left // 60))) + "m")
+                    send_tg(lines3)
+
                 # ---- Tight 6 = ATR%-gated range-extreme reversion: /t6_start /t6_stop ----
                 elif text == "/t6_start":
                     if not REV6_ENGINE_ENABLED:
@@ -3350,7 +3383,20 @@ REV4_MIN_BAR_QV       = float(os.environ.get("REV4_MIN_BAR_QV", 20_000)) # signa
 REV4_MIN_QUOTE_VOL    = float(os.environ.get("REV4_MIN_QUOTE_VOL", 100_000))  # 24h universe screen only
 
 # ---- the exit, which is the whole point of this engine ----
-REV4_HOLD_SECONDS     = int(os.environ.get("REV4_HOLD_SECONDS", 24 * 3600))   # THE exit
+REV4_HOLD_SECONDS     = int(os.environ.get("REV4_HOLD_SECONDS", 48 * 3600))   # THE exit
+# 2026-09-05: 24h -> 48h. BingX day-level scoring, full pool, 20bps:
+#   24h +99.9 bps/day (t 2.95) | 48h +131.4 (t 3.22) | 96h +158.5 (t 2.59).
+#   48h has the best t; 96h scores higher raw but the t falls and slots stay locked.
+REV4_TRAIL_GIVEBACK   = float(os.environ.get("REV4_TRAIL_GIVEBACK", 0.05))
+# 2026-09-05: THE FIX for "winning trades close at a loss". Faisal's complaint was
+# measured and is real: 75% of T4 signals reach +2% in profit and 22.6% of those end
+# NEGATIVE. A trailing give-back stop is the only lever that raises win rate AND PnL
+# at the same time. Ladder (bps/day, win%): 1% +24.9/73.2 | 2% +41.2/71.0 |
+# 3% +86.3/66.8 | 5% +120.3/63.7 | 8% +126.9/59.8 | none +131.4/58.9.
+# 5% is the pick: +20% PnL/day over the live 24h config with a HIGHER win rate.
+# Rejected: fixed TP (2% -> win 77.9% but PnL cut to a third; monotone, never use a
+# near TP) and breakeven stops (LOWER win rate, 61% -> 35/46/57%, and less PnL).
+# Set to 0 to disable. NOT applied to T5/T6 - measured only on T4.
 REV4_DSTOP_PCT        = float(os.environ.get("REV4_DSTOP_PCT", 0.15))         # 15% disaster stop
 REV4_TP_MULT          = float(os.environ.get("REV4_TP_MULT", 3.0))            # TP = 3x dstop = unreachable
 
@@ -3597,6 +3643,7 @@ REV_T4 = {
     "max_concurrent": REV4_MAX_CONCURRENT, "max_margin": REV4_MAX_MARGIN_USDT,
     "cooldown_s": REV4_COOLDOWN_SECONDS,
     "hold_seconds": REV4_HOLD_SECONDS,
+    "trail_giveback": REV4_TRAIL_GIVEBACK,
     "max_symbols": REV4_MAX_SYMBOLS,
     "open": rev4_open_trades, "pending": rev4_pending, "last_fire": rev4_last_fire,
 }
@@ -4055,6 +4102,301 @@ REV_T6 = {
 }
 
 
+
+# ============================================================================
+# TIGHT 3 (2026-09-05 REBUILD) = CLEAN-LEVEL SWEEP SHORT, no stop, 5-day hold.
+# Replaces the HTF clean-break retest in the same slot (that engine was filed
+# UNFIXABLE 2026-09-02 and the live audit measured it at ~-2.46 R/wk, the bot's
+# single biggest leak). /t3_start /t3_stop /t3_status keep working.
+#
+# ORIGIN: Faisal's AMD (Accumulation-Manipulation-Distribution) doc. The rule that
+# survived is the SHORT half of it, on 4H bars.
+#
+# THE RULE (all on 4H bars resampled from 15m klines)
+#   1. Level = the highest HIGH of the prior REV3_LEVEL_WINDOWS bars (10 and 20).
+#   2. SWEEP: this bar's HIGH takes the level out by >= REV3_SWEEP_MIN (0.5%) and the
+#      bar CLOSES BACK BELOW it. A failed breakout, not a breakout.
+#   3. REJECTION: upper wick >= REV3_WICK_MIN (40%) of the bar's total range.
+#   4. CLEAN LEVEL: the level was touched <= REV3_MAX_TOUCHES (1) times before.
+#      THIS IS THE LOAD-BEARING FILTER - measured four independent ways:
+#      BingX virgin +0.132 vs touched -0.168 (unfiltered pool is -0.039, i.e. the
+#      filter IS the entire edge); Binance clean +147.7 bps with TRAIN +150.8 /
+#      TEST +145.2 vs touched +100.6 with TRAIN +249.6 / TEST -61.3 (sign flip).
+#   5. ATR%(4H,14) <= REV3_ATRP_MAX (5%).
+#   6. Asia filter must AGREE and the SMC sweep must NOT have fired (see below).
+#   7. -> SHORT at the next 15m open. NO stop, NO TP. Exit at 5 days.
+#
+# VALIDATION (BingX 15m, 241 coins, 8 months, 20bps, day-level scoring)
+#   raw n=4,267 | 138 tr/wk | +165.9 bps/trade | win 62.4% | +243.9 bps/day
+#   t = +4.79, p < 0.00001
+#   TRAIN p=0.0010 / TEST p=0.0017      coin holdout A p=0.0000 / B p=0.0009
+#   side-flip t = -4.79 (exact mirror)  ex-top-3 coins p=0.0000
+#   cost 50bps p=0.0002 | 100bps p=0.0052
+#   BEAR p=0.0006 / MID p=0.0389 / BULL p=0.0082 - works in ALL THREE regimes,
+#     which no other engine in this bot does.
+#   Portfolio form, cap 10 at 1/10 of account: 13.4 tr/wk, win 62.8%, +3.56%/week,
+#     maxDD -18.0%, worst single trade -2.8% of account.
+#
+# THE THREE FILTERS (2026-09-05, same "dead strategy as a filter" method as T4)
+#                        tr/wk   bps    win     TRAIN    TEST
+#   T3 alone              138   +145.9  61.2%   +223.1  +215.2
+#   asia AGREES            82   +218.9  64.4%   +224.4  +237.8
+#   asia disagrees         56    +39.1  56.5%    +91.5    -9.8   <- dead half
+#   SMC excluded           33   +282.1  67.0%   +195.1  +256.5
+#   T4-day excluded       116   +171.6  61.4%   +227.3  +237.7
+#   T4 same day            22    +11.6  60.1%   +146.8   -45.0   <- dead half
+#   asia AND SMC-excluded  25   +383.9  71.0%   +223.1  +285.7
+#   Every excluded half is TEST-negative or near zero, so the filters drop the
+#   broken trades, not random ones. T3/T4 overlap is only 15.6% of T3's signals.
+#
+# DO NOT RETRY (all measured 2026-09-05)
+#   - A STOP OF ANY WIDTH. 10/15/20/30% all keep full-sample p<0.05 but DESTROY the
+#     TEST half (p 0.18-0.55) and halve ret/DD. No-stop is structural here.
+#   - TRAILING give-back (the lever that DID work on T4): win rises to 78% but
+#     bps/day falls +223.9 -> +99.0. T4 is a 24h trade, T3 holds 5 days and the
+#     trail just gets cut by noise.
+#   - LONGER HOLD. 10d looks better per-trade (+269.7 vs +145.9) but INVERTS in
+#     portfolio form: 7.0 tr/wk, +1.34%/wk, maxDD -32.4% vs 5d's 13.4 tr/wk,
+#     +5.93%/wk, maxDD -18.0%. Slots stay locked. Score hold changes in portfolio
+#     form, never per-trade.
+#   - The LONG mirror (clean LOW sweep + lower wick): p=0.230, and pooling it with
+#     the short leg DILUTES it (t 4.79 -> 1.33). SHORT ONLY.
+#   - 1h and 12h timeframes (~zero and -0.175). The pattern is specifically 4H.
+#   - 15m MSS entry with a tight swing stop: TRAIN+/TEST- in 10 of 10 cells. The
+#     wide distance to the sweep high is part of the signal, not a cost.
+#
+# RISK: no stop means an open tail, exactly like T4. Position weight is the ONLY
+# control. Worst backtest trade was -64% of notional. At cap 10 and $75 notional
+# that is a bounded dollar loss; do NOT raise notional without cutting slots.
+# ============================================================================
+REV3_ENGINE_ENABLED   = os.environ.get("REV3_ENGINE_ENABLED", "1") == "1"
+rev3_auto_enabled     = AUTO_RESUME_ON_START   # /t3_start /t3_stop
+REV3_LEVEL_WINDOWS    = [int(x) for x in os.environ.get("REV3_LEVEL_WINDOWS", "10,20").split(",")]
+REV3_SWEEP_MIN        = float(os.environ.get("REV3_SWEEP_MIN", 0.005))   # high must exceed the level by 0.5%
+REV3_WICK_MIN         = float(os.environ.get("REV3_WICK_MIN", 0.40))     # upper wick >= 40% of the bar range
+REV3_MAX_TOUCHES      = int(os.environ.get("REV3_MAX_TOUCHES", 1))       # CLEAN level - the load-bearing filter
+REV3_TOUCH_TOL        = float(os.environ.get("REV3_TOUCH_TOL", 0.01))    # within 1% counts as a touch
+REV3_ATRP_MAX         = float(os.environ.get("REV3_ATRP_MAX", 0.05))     # ATR%(4H) <= 5%
+REV3_MIN_BAR_QV       = float(os.environ.get("REV3_MIN_BAR_QV", 20_000)) # signal 4H bar quote volume
+REV3_MIN_QUOTE_VOL    = float(os.environ.get("REV3_MIN_QUOTE_VOL", 2_000_000))  # 24h universe screen
+REV3_HOLD_SECONDS     = int(os.environ.get("REV3_HOLD_SECONDS", 5 * 24 * 3600))  # 5 days - THE exit
+REV3_DSTOP_PCT        = float(os.environ.get("REV3_DSTOP_PCT", 0.15))    # disaster cap only, same as T4
+REV3_TP_MULT          = float(os.environ.get("REV3_TP_MULT", 3.0))       # TP = 3x dstop = deliberately unreachable
+REV3_ASIA_FILTER      = os.environ.get("REV3_ASIA_FILTER", "1") == "1"
+REV3_SMC_FILTER       = os.environ.get("REV3_SMC_FILTER", "1") == "1"
+REV3_BLOCK_T4_DAY     = os.environ.get("REV3_BLOCK_T4_DAY", "1") == "1"  # cross-engine dedup
+REV3_T4_BLOCK_SECONDS = int(os.environ.get("REV3_T4_BLOCK_SECONDS", 24 * 3600))
+REV3_NOTIONAL_USDT    = float(os.environ.get("REV3_NOTIONAL_USDT", 75))
+REV3_RISK_USDT        = REV3_NOTIONAL_USDT * REV3_DSTOP_PCT   # derived - never set directly
+REV3_LEVERAGE         = int(os.environ.get("REV3_LEVERAGE", 5))  # 15% stop must sit inside liquidation
+REV3_MAX_CONCURRENT   = int(os.environ.get("REV3_MAX_CONCURRENT", 10))
+REV3_MAX_MARGIN_USDT  = float(os.environ.get("REV3_MAX_MARGIN_USDT", 200))
+REV3_SCAN_SECONDS     = int(os.environ.get("REV3_SCAN_SECONDS", 300))
+REV3_COOLDOWN_SECONDS = int(os.environ.get("REV3_COOLDOWN_SECONDS", 4 * 3600))  # dedup 1/coin per 4H bar
+REV3_MAX_SYMBOLS      = int(os.environ.get("REV3_MAX_SYMBOLS", 600))
+REV3_FRESH_SECONDS    = int(os.environ.get("REV3_FRESH_SECONDS", 3600))
+# ^ only fire in the first hour after a 4H bar closes. The backtest entered at the
+#   first 15m open AFTER the 4H close; without this the engine would re-fire the same
+#   4H signal for four hours at progressively worse prices.
+
+rev3_open_trades = {}
+rev3_pending     = {}
+rev3_last_fire   = {}
+
+
+def _rev3_build_4h(candles):
+    """Group closed 15m bars into CLOSED 4H bars aligned to the exchange 4H boundary.
+
+    Returns (bars, last_close_ms) where each bar is (open, high, low, close, quote_vol).
+    A 4H bucket is only emitted when all 16 of its 15m bars are present, so a partially
+    formed 4H bar can never be treated as closed.
+    """
+    buckets = {}
+    for c in candles:
+        t = _bar_ms(c)
+        if not t:
+            continue
+        k = (t // 14400000) * 14400000
+        buckets.setdefault(k, []).append((t, c))
+    out = []
+    last_close = 0
+    for k in sorted(buckets):
+        grp = sorted(buckets[k], key=lambda x: x[0])
+        if len(grp) < 16:
+            continue
+        cs = [x[1] for x in grp]
+        o = float(cs[0]["open"])
+        hi = max(h(c) for c in cs)
+        lo = min(l(c) for c in cs)
+        cx = cl(cs[-1])
+        qv = sum(v(c) * cl(c) for c in cs)
+        out.append((o, hi, lo, cx, qv))
+        last_close = k + 14400000
+    return out, last_close
+
+
+def rev3_check_signal(symbol, btc_ret, eng):
+    """T3 clean-level sweep SHORT. Returns (side, entry, sl, tp) or None.
+
+    No ATR stop: sl is a flat disaster percentage and tp is placed out of reach. The
+    real exit is the 5-day hold_seconds timer in _rev_engine_loop.
+    """
+    # 4H needs 20 level bars + 14 ATR bars + margin => ~40 4H bars => 640 15m bars.
+    # The asia/SMC helpers read the same 15m list, so this also covers their 120-bar need.
+    need = 640
+    candles = get_candles(symbol, limit=need + REV_CANDLE_BUFFER, interval="15m")
+    # closed bars only
+    if candles:
+        _t = _bar_ms(candles[-1])
+        if _t and (_t % 900000) != 0:
+            candles = candles[:-1]
+    if not candles or len(candles) < 200:
+        _rev_log_thin(symbol, eng, len(candles) if candles else 0, 200)
+        return None
+
+    # ---- CROSS-ENGINE BLOCK: never double-book a coin T4 is already trading today ----
+    # Measured: T3 signals landing on a T4 day are worth +11.6 bps with TEST -45.0,
+    # versus +171.6 / TEST +237.7 for the rest. Overlap is only 15.6% of T3's signals,
+    # so this costs almost nothing and removes the whole broken slice.
+    if eng.get("block_t4_day", REV3_BLOCK_T4_DAY):
+        if symbol in rev4_open_trades_symbols() or \
+           (time.time() - rev4_last_fire.get(symbol, 0)) < REV3_T4_BLOCK_SECONDS:
+            return None
+
+    bars, last_close_ms = _rev3_build_4h(candles)
+    W = max(eng.get("level_windows", REV3_LEVEL_WINDOWS))
+    if len(bars) < W + 20:
+        return None
+
+    # ---- only act right after a 4H bar closes (mirrors the backtest's entry timing) ----
+    if last_close_ms:
+        age = time.time() - (last_close_ms / 1000.0)
+        if age < 0 or age > eng.get("fresh_seconds", REV3_FRESH_SECONDS):
+            return None
+
+    o4 = [b[0] for b in bars]; h4 = [b[1] for b in bars]
+    l4 = [b[2] for b in bars]; c4 = [b[3] for b in bars]; q4 = [b[4] for b in bars]
+    i = len(bars) - 1                      # the signal bar = last CLOSED 4H bar
+
+    if q4[i] < eng.get("min_bar_qv", REV3_MIN_BAR_QV):
+        return None
+
+    rng = h4[i] - l4[i]
+    if rng <= 0:
+        return None
+
+    # ---- rejection wick ----
+    upper_wick = (h4[i] - max(o4[i], c4[i])) / rng
+    if upper_wick < eng.get("wick_min", REV3_WICK_MIN):
+        return None
+
+    # ---- ATR%(4H) ceiling ----
+    atr4 = atr_series(h4, l4, c4, REV_ATR_LEN)
+    if not atr4 or atr4[-1] is None or atr4[-1] <= 0:
+        return None
+    px4 = c4[i]
+    if px4 <= 0 or (atr4[-1] / px4) > eng.get("atrp_max", REV3_ATRP_MAX):
+        return None
+
+    # ---- clean-level sweep, checked on every configured window ----
+    sweep_min = eng.get("sweep_min", REV3_SWEEP_MIN)
+    tol       = eng.get("touch_tol", REV3_TOUCH_TOL)
+    max_touch = eng.get("max_touches", REV3_MAX_TOUCHES)
+    hit = None
+    for w in eng.get("level_windows", REV3_LEVEL_WINDOWS):
+        if i - w < 0:
+            continue
+        level = max(h4[i - w:i])
+        if level <= 0:
+            continue
+        # swept the level, then closed back UNDER it
+        if not (h4[i] > level * (1.0 + sweep_min) and c4[i] < level):
+            continue
+        touches = sum(1 for x in h4[i - w:i] if x >= level * (1.0 - tol))
+        if touches > max_touch:
+            continue
+        hit = (w, level, touches)
+        break
+    if hit is None:
+        return None
+    w_used, level_used, touches_used = hit
+
+    # ---- asia confirmation + inverse-SMC exclusion (same helpers T4 uses) ----
+    if eng.get("asia_filter", REV3_ASIA_FILTER):
+        if not _rev4_asia_short_confirmed(candles):
+            return None
+    if eng.get("smc_filter", REV3_SMC_FILTER):
+        if _rev4_smc_sweep_fired(candles):
+            return None
+
+    # entry = the current 15m price, i.e. the first 15m bar after the 4H close
+    px = cl(candles[-1])
+    if px <= 0 or px < 0.001:
+        return None
+
+    dstop = eng.get("dstop_pct", REV3_DSTOP_PCT)
+    sl = px * (1.0 + dstop)
+    tp = px * (1.0 - dstop * eng.get("tp_mult", REV3_TP_MULT))
+    if tp <= 0:
+        return None
+
+    print(f"[T3] {symbol} SELL sweep W{w_used} level={round(level_used,8)} "
+          f"touches={touches_used} wick={upper_wick:.2f} atr%={100*atr4[-1]/px4:.2f} "
+          f"barqv=${q4[i]:,.0f} entry={px} sl={round(sl,8)} tp={round(tp,8)} "
+          f"hold={eng.get('hold_seconds', REV3_HOLD_SECONDS)//3600}h")
+    return ("SELL", px, sl, tp)
+
+
+REV_T3 = {
+    "name": "TIGHT 3", "tag": "t3",
+    "signal_fn": rev3_check_signal,
+    "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0, "atrp_max": 0.0,
+    "side_only": "SELL",
+    "pos_window": 0, "range_window": 0, "extreme": 0.0,
+    "atrp_min": 0.0,
+    "min_bar_qv": REV3_MIN_BAR_QV,
+    "level_windows": REV3_LEVEL_WINDOWS,
+    "sweep_min": REV3_SWEEP_MIN,
+    "wick_min": REV3_WICK_MIN,
+    "max_touches": REV3_MAX_TOUCHES,
+    "touch_tol": REV3_TOUCH_TOL,
+    "atrp_max_4h": REV3_ATRP_MAX,
+    "fresh_seconds": REV3_FRESH_SECONDS,
+    "asia_filter": REV3_ASIA_FILTER,
+    "smc_filter": REV3_SMC_FILTER,
+    "block_t4_day": REV3_BLOCK_T4_DAY,
+    "dstop_pct": REV3_DSTOP_PCT,
+    "tp_mult": REV3_TP_MULT,
+    "regime_min_btc": None, "range_regime": None,
+    "cvd_filter": False, "flow_gate": False,
+    "min_quote_vol": REV3_MIN_QUOTE_VOL,
+    "long_sl_atr": 0.0, "long_tp_r": 0.0,
+    "short_sl_atr": 0.0, "short_tp_r": 0.0,
+    # a 15% stop must clear the shared 6% cap, so this engine carries its own
+    "sl_cap_pct": max(REV3_DSTOP_PCT * 1.5, REV_SL_CAP_PCT),
+    # same rule as T4: DSTOP must sit INSIDE liquidation distance ~= (1/leverage)
+    "risk_usdt": REV3_RISK_USDT, "leverage": REV3_LEVERAGE,
+    "max_concurrent": REV3_MAX_CONCURRENT, "max_margin": REV3_MAX_MARGIN_USDT,
+    "cooldown_s": REV3_COOLDOWN_SECONDS,
+    "hold_seconds": REV3_HOLD_SECONDS,
+    # NO trail_giveback - measured worse on T3 (see the DO NOT RETRY note above)
+    "max_symbols": REV3_MAX_SYMBOLS,
+    "open": rev3_open_trades, "pending": rev3_pending, "last_fire": rev3_last_fire,
+}
+
+
+def rev4_open_trades_symbols():
+    """Symbols T4 currently holds or has a resting limit for. Used by T3's cross-engine
+    block so the two short engines never double-book the same coin on the same day."""
+    s = set()
+    for _t in list(rev4_open_trades.values()):
+        _s = _t.get("symbol")
+        if _s:
+            s.add(_s)
+    s |= set(rev4_pending.keys())
+    return s
+
+
 def rev_in_cooldown(symbol, eng):
     cd = eng.get("cooldown_s", REV_COOLDOWN_SECONDS)
     return (time.time() - eng["last_fire"].get(symbol, 0)) < cd
@@ -4073,8 +4415,8 @@ def rev_try_claim(symbol):
     with _rev_claim_lock:
         if (symbol in rev_claimed or symbol in all_open_symbols()
                 or symbol in rev_pending or symbol in rev2_pending
-                or symbol in rev4_pending or symbol in rev5_pending
-                or symbol in rev6_pending):
+                or symbol in rev3_pending or symbol in rev4_pending
+                or symbol in rev5_pending or symbol in rev6_pending):
             return False
         rev_claimed.add(symbol)
         return True
@@ -4089,8 +4431,8 @@ def rev_symbol_busy(symbol, eng):
     # A coin held/pending/claimed by ANY engine is off-limits (prevents T1 and T2 both grabbing it).
     return (symbol in all_open_symbols() or symbol in eng["pending"]
             or symbol in rev_pending or symbol in rev2_pending
-            or symbol in rev4_pending or symbol in rev5_pending
-            or symbol in rev6_pending
+            or symbol in rev3_pending or symbol in rev4_pending
+            or symbol in rev5_pending or symbol in rev6_pending
             or symbol in rev_claimed)
 
 
@@ -4826,6 +5168,56 @@ def rev_track_trades(eng):
     for oid, t in list(trades.items()):
         sym = t["symbol"]
 
+        # ---- TRAILING GIVE-BACK (2026-09-05, T4 only via eng["trail_giveback"]) ----
+        # Close when the trade has given back X% of PRICE from its best point. Peak is
+        # tracked in favourable-move terms so it works for either side. This is checked
+        # BEFORE the time-stop so a give-back exit wins the race on the same pass.
+        _tg = eng.get("trail_giveback", 0.0)
+        if _tg and _tg > 0:
+            try:
+                _ef = t.get("entry_fill", t.get("entry", 0)) or 0
+                _px = get_current_price(sym)
+                if _ef > 0 and _px:
+                    _fav = ((_ef - _px) / _ef) if t["side"] == "SELL" else ((_px - _ef) / _ef)
+                    _peak = max(t.get("peak_fav", 0.0), _fav)
+                    t["peak_fav"] = _peak
+                    if _peak >= _tg and _fav <= (_peak - _tg):
+                        place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
+                        for _k in ("sl_id", "tp_id"):
+                            if t.get(_k) and t[_k] != "N/A":
+                                try:
+                                    cancel_order(sym, t[_k])
+                                except Exception:
+                                    pass
+                        _pnl = None
+                        _rd = abs(_ef - t["sl"])
+                        if _rd > 0:
+                            _pnl = _fav * _ef / _rd * eng["risk_usdt"]
+                        send_tg(
+                            f"\U0001f501 {name} {sym} TRAIL EXIT (gave back {_tg*100:.0f}% "
+                            f"from peak {_peak*100:.2f}%)\n"
+                            f"Entry: {_ef} | Exit: {_px} | "
+                            f"PnL: {('$' + format(_pnl, '.2f')) if _pnl is not None else 'n/a'}"
+                        )
+                        try:
+                            _er = None
+                            if _rd > 0:
+                                _er = round(_fav * _ef / _rd, 2)
+                            journal_closed_trade({
+                                "label": name, "symbol": sym, "side": t["pos_side"],
+                                "entry": _ef,
+                                "result": "trail-exit",
+                                "pnl": round(_pnl, 2) if _pnl is not None else 0,
+                                "exit_r": _er,
+                            })
+                        except Exception:
+                            pass
+                        eng["last_fire"][sym] = time.time()
+                        eng["open"].pop(oid, None)
+                        continue
+            except Exception as _e:
+                print(f"[{eng.get('tag','?').upper()} TRAIL {sym}] {_e}")
+
         if now - t.get("open_ts", now) > eng.get("hold_seconds", REV_HOLD_SECONDS):
             try:
                 place_market_order(sym, t["close_side"], t["total_qty"], t["pos_side"])
@@ -4990,6 +5382,13 @@ def rev4_loop():
     _rev_engine_loop(REV_T4, lambda: rev4_auto_enabled, REV4_SCAN_SECONDS)
 
 
+def rev3_loop():
+    if not REV3_ENGINE_ENABLED:
+        print("Tight 3 disabled at build level (REV3_ENGINE_ENABLED=0)")
+        return
+    _rev_engine_loop(REV_T3, lambda: rev3_auto_enabled, REV3_SCAN_SECONDS)
+
+
 def rev6_loop():
     if not REV6_ENGINE_ENABLED:
         print("Tight 6 disabled at build level (REV6_ENGINE_ENABLED=0)")
@@ -5100,7 +5499,11 @@ if __name__ == "__main__":
     # Thread(target=t3_loop, ...) DISABLED 2026-08-23: old dormant/OI watchlist T3 retired; superseded by S/R Sweep SHORT (t3_scalp_loop).
     Thread(target=handle_telegram_commands, daemon=True).start()
     Thread(target=oi_collector_loop,        daemon=True).start()   # OI logger -> Supabase (2026-08-10)
-    Thread(target=t3_scalp_loop,            daemon=True).start()   # Tight 3 = S/R Sweep SHORT bear engine (2026-08-23)
+    # 2026-09-05: t3_scalp_loop (HTF clean-break retest) RETIRED - filed UNFIXABLE and
+    # measured at ~-2.46 R/wk live, the bot's biggest leak. The T3 slot now runs the
+    # clean-level sweep short via the shared rev engine machinery.
+    # Thread(target=t3_scalp_loop,          daemon=True).start()
+    Thread(target=rev3_loop,                daemon=True).start()   # Tight 3 = clean-level sweep SHORT (2026-09-05)
     Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
     Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
     Thread(target=rev5_loop,                daemon=True).start()   # Tight 5 = crash-continuation SHORT (2026-08-30)

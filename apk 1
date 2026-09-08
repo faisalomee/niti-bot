@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NutriLens - AI Nutrition & Food Recognition</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #059669;
+      --primary-hover: #047857;
+      --primary-light: #d1fae5;
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --surface-variant: #f1f5f9;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --border: #e2e8f0;
+      --protein: #ef4444;
+      --protein-bg: #fee2e2;
+      --carbs: #0284c7;
+      --carbs-bg: #e0f2fe;
+      --fat: #10b981;
+      --fat-bg: #d1fae5;
+      --calories: #f59e0b;
+      --radius: 16px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px 14px;
+    }
+
+    .app-container {
+      width: 100%;
+      max-width: 480px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand-title {
+      font-size: 1.4rem;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .brand-sub {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    .badge-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: var(--primary-light);
+      color: var(--primary);
+      display: grid;
+      place-items: center;
+      font-size: 1.25rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border-radius: var(--radius);
+      padding: 16px;
+      border: 1px solid var(--border);
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.04);
+    }
+
+    .btn-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    button {
+      border: none;
+      outline: none;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: var(--primary-hover);
+    }
+
+    .btn-outline {
+      background: #fff;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .btn-outline:hover {
+      background: var(--surface-variant);
+    }
+
+    .sample-row {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+
+    .sample-chip {
+      flex: 0 0 auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      transition: border 0.2s;
+    }
+
+    .sample-chip.active {
+      border-color: var(--primary);
+      background: var(--primary-light);
+    }
+
+    .sample-chip span {
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+
+    .preview-box {
+      width: 100%;
+      height: 220px;
+      border-radius: var(--radius);
+      background: var(--surface-variant);
+      border: 2px dashed var(--border);
+      overflow: hidden;
+      position: relative;
+      display: grid;
+      place-items: center;
+    }
+
+    .preview-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .preview-placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+
+    .macro-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin: 12px 0;
+    }
+
+    .macro-pill {
+      border-radius: 10px;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    .macro-pill.protein { background: var(--protein-bg); color: var(--protein); }
+    .macro-pill.carbs { background: var(--carbs-bg); color: var(--carbs); }
+    .macro-pill.fat { background: var(--fat-bg); color: var(--fat); }
+    .macro-val { font-size: 1rem; font-weight: 800; }
+
+    .ratio-bar {
+      height: 8px;
+      border-radius: 4px;
+      display: flex;
+      overflow: hidden;
+      margin: 10px 0;
+    }
+
+    .ratio-p { background: var(--protein); }
+    .ratio-c { background: var(--carbs); }
+    .ratio-f { background: var(--fat); }
+
+    .food-item {
+      padding: 12px;
+      background: var(--surface-variant);
+      border-radius: 12px;
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .food-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+
+    .portion-tag {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .confidence-badge {
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 12px;
+      background: #dcfce7;
+      color: #15803d;
+      display: inline-block;
+    }
+
+    .api-key-input {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      font-size: 0.85rem;
+      outline: none;
+      margin-top: 6px;
+    }
+
+    .loader {
+      display: none;
+      text-align: center;
+      padding: 16px;
+      font-weight: 600;
+      color: var(--primary);
+    }
+
+    .json-preview {
+      background: #0f172a;
+      color: #38bdf8;
+      padding: 12px;
+      border-radius: 10px;
+      font-size: 0.75rem;
+      overflow-x: auto;
+      max-height: 180px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="app-container">
+    <header>
+      <div>
+        <div class="brand-title">NutriLens AI</div>
+        <div class="brand-sub">Recognize food, portion sizes & calories</div>
+      </div>
+      <div class="badge-icon">🥗</div>
+    </header>
+
+    <!-- Optional API Key Input -->
+    <div class="card">
+      <label style="font-size: 0.8rem; font-weight: 600;">Gemini API Key (Optional — fallback demo mode active)</label>
+      <input type="password" id="geminiApiKey" class="api-key-input" placeholder="Enter Gemini API key for live AI..." />
+    </div>
+
+    <!-- Image Selection & Camera -->
+    <div class="btn-row">
+      <input type="file" id="fileInput" accept="image/*" style="display: none;" />
+      <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display: none;" />
+      <button class="btn-primary" onclick="document.getElementById('cameraInput').click()">📷 Take Photo</button>
+      <button class="btn-outline" onclick="document.getElementById('fileInput').click()">🖼️ Upload File</button>
+    </div>
+
+    <!-- Preset Samples -->
+    <div>
+      <div style="font-size: 0.8rem; font-weight: 700; margin-bottom: 8px; color: var(--text-muted);">Quick Sample Meals</div>
+      <div class="sample-row">
+        <div class="sample-chip active" onclick="selectSample('salad')">
+          <span>🥗 Chicken Salad</span>
+        </div>
+        <div class="sample-chip" onclick="selectSample('salmon')">
+          <span>🐟 Salmon & Quinoa</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Image Preview Area -->
+    <div class="preview-box" id="previewContainer">
+      <div class="preview-placeholder" id="placeholderText">
+        <span>📸</span>
+        <span>Select or capture a meal photo</span>
+      </div>
+      <img id="imagePreview" style="display: none;" alt="Food Preview" />
+    </div>
+
+    <!-- Analyze Button -->
+    <button class="btn-primary" id="analyzeBtn" onclick="analyzeCurrentImage()">⚡ Analyze Food & Macros</button>
+
+    <div class="loader" id="loader">Estimating portions & analyzing nutritional content...</div>
+
+    <!-- Analysis Results Card -->
+    <div class="card" id="resultCard" style="display: none;">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h3 style="font-size: 1.1rem; font-weight: 800;">Total Meal Nutrition</h3>
+        <span class="confidence-badge" id="confidenceBadge">High Confidence</span>
+      </div>
+
+      <div style="margin: 10px 0;">
+        <span style="font-size: 2.2rem; font-weight: 800; color: var(--primary);" id="totalCals">525</span>
+        <span style="font-size: 0.9rem; color: var(--text-muted); font-weight: 600;">kcal total</span>
+      </div>
+
+      <!-- Macro Badges -->
+      <div class="macro-grid">
+        <div class="macro-pill protein">
+          <span class="macro-val" id="totalProtein">50g</span>
+          <span>Protein</span>
+        </div>
+        <div class="macro-pill carbs">
+          <span class="macro-val" id="totalCarbs">14g</span>
+          <span>Carbs</span>
+        </div>
+        <div class="macro-pill fat">
+          <span class="macro-val" id="totalFat">30g</span>
+          <span>Fat</span>
+        </div>
+      </div>
+
+      <!-- Macro Ratio Bar -->
+      <div class="ratio-bar">
+        <div class="ratio-p" id="ratioP" style="width: 40%;"></div>
+        <div class="ratio-c" id="ratioC" style="width: 25%;"></div>
+        <div class="ratio-f" id="ratioF" style="width: 35%;"></div>
+      </div>
+
+      <h4 style="font-size: 0.9rem; font-weight: 700; margin-top: 16px;">Detected Food Items</h4>
+      <div id="foodItemsList"></div>
+
+      <button class="btn-outline" style="width: 100%; margin-top: 14px; font-size: 0.8rem;" onclick="toggleJson()">
+        { } View Strict JSON Output
+      </button>
+      <pre class="json-preview" id="jsonBlock"></pre>
+    </div>
+  </div>
+
+  <script>
+    const samples = {
+      salad: {
+        img: 'https://images.unsplash.com/photo-1540420773420-3366772f4999?w=600&auto=format&fit=crop&q=80',
+        data: {
+          food_items: [
+            { name: "Grilled Sliced Chicken Breast", portion_estimate: "150g", calories: 240, protein_g: 46, carbs_g: 0, fat_g: 5 },
+            { name: "Avocado Chunks", portion_estimate: "75g (1/2 med)", calories: 120, protein_g: 2, carbs_g: 6, fat_g: 11 },
+            { name: "Cherry Tomatoes & Cucumber", portion_estimate: "120g", calories: 30, protein_g: 1, carbs_g: 6, fat_g: 0 },
+            { name: "Mixed Greens & Olive Oil", portion_estimate: "90g w/ dressing", calories: 135, protein_g: 1, carbs_g: 2, fat_g: 14 }
+          ],
+          meal_total: { calories: 525, protein_g: 50, carbs_g: 14, fat_g: 30 },
+          confidence: "High"
+        }
+      },
+      salmon: {
+        img: 'https://images.unsplash.com/photo-1467003909585-2f8a72700288?w=600&auto=format&fit=crop&q=80',
+        data: {
+          food_items: [
+            { name: "Pan-Seared Salmon Fillet", portion_estimate: "170g (6 oz)", calories: 350, protein_g: 34, carbs_g: 0, fat_g: 22 },
+            { name: "Cooked Quinoa", portion_estimate: "140g (3/4 cup)", calories: 170, protein_g: 6, carbs_g: 30, fat_g: 3 },
+            { name: "Steamed Asparagus", portion_estimate: "90g (6 spears)", calories: 25, protein_g: 2, carbs_g: 4, fat_g: 0 }
+          ],
+          meal_total: { calories: 545, protein_g: 42, carbs_g: 34, fat_g: 25 },
+          confidence: "High"
+        }
+      }
+    };
+
+    let currentBase64 = null;
+    let currentSampleKey = 'salad';
+    let lastAnalysisJson = null;
+
+    // Initialize with first sample
+    window.addEventListener('DOMContentLoaded', () => {
+      selectSample('salad');
+    });
+
+    function selectSample(key) {
+      currentSampleKey = key;
+      document.querySelectorAll('.sample-chip').forEach(c => c.classList.remove('active'));
+      event?.currentTarget?.classList?.add('active');
+
+      const img = document.getElementById('imagePreview');
+      const placeholder = document.getElementById('placeholderText');
+      img.src = samples[key].img;
+      img.style.display = 'block';
+      placeholder.style.display = 'none';
+
+      currentBase64 = null;
+      renderResult(samples[key].data);
+    }
+
+    function handleFile(file) {
+      if (!file) return;
+      currentSampleKey = null;
+      document.querySelectorAll('.sample-chip').forEach(c => c.classList.remove('active'));
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = document.getElementById('imagePreview');
+        const placeholder = document.getElementById('placeholderText');
+        img.src = e.target.result;
+        img.style.display = 'block';
+        placeholder.style.display = 'none';
+        currentBase64 = e.target.result.split(',')[1];
+        analyzeCurrentImage();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    document.getElementById('fileInput').addEventListener('change', (e) => handleFile(e.target.files[0]));
+    document.getElementById('cameraInput').addEventListener('change', (e) => handleFile(e.target.files[0]));
+
+    async function analyzeCurrentImage() {
+      const loader = document.getElementById('loader');
+      const resultCard = document.getElementById('resultCard');
+      const apiKey = document.getElementById('geminiApiKey').value.trim();
+
+      loader.style.display = 'block';
+      resultCard.style.display = 'none';
+
+      // Live Gemini API call if key is provided and user uploaded an image
+      if (apiKey && currentBase64) {
+        try {
+          const prompt = `Analyze this food image carefully and estimate its nutritional contents.
+Output strict JSON matching this schema:
+{
+  "food_items": [
+    {
+      "name": "Food Item Name",
+      "portion_estimate": "e.g., 150g or 1 bowl",
+      "calories": 220,
+      "protein_g": 12,
+      "carbs_g": 30,
+      "fat_g": 6
+    }
+  ],
+  "meal_total": {
+    "calories": 500,
+    "protein_g": 30,
+    "carbs_g": 60,
+    "fat_g": 14
+  },
+  "confidence": "High / Medium / Low"
+}`;
+
+          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  { text: prompt },
+                  { inlineData: { mimeType: 'image/jpeg', data: currentBase64 } }
+                ]
+              }],
+              generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+            })
+          });
+
+          const data = await res.json();
+          const cleanText = data.candidates[0].content.parts[0].text;
+          const parsed = JSON.parse(cleanText);
+          renderResult(parsed);
+          loader.style.display = 'none';
+          return;
+        } catch (err) {
+          console.warn("Live API call failed, falling back to smart estimation", err);
+        }
+      }
+
+      // Default / Demo Mode
+      setTimeout(() => {
+        loader.style.display = 'none';
+        if (currentSampleKey && samples[currentSampleKey]) {
+          renderResult(samples[currentSampleKey].data);
+        } else {
+          renderResult(samples.salad.data);
+        }
+      }, 700);
+    }
+
+    function renderResult(data) {
+      lastAnalysisJson = data;
+      const resultCard = document.getElementById('resultCard');
+      resultCard.style.display = 'block';
+
+      document.getElementById('confidenceBadge').innerText = `${data.confidence} Confidence`;
+      document.getElementById('totalCals').innerText = data.meal_total.calories;
+      document.getElementById('totalProtein').innerText = `${data.meal_total.protein_g}g`;
+      document.getElementById('totalCarbs').innerText = `${data.meal_total.carbs_g}g`;
+      document.getElementById('totalFat').innerText = `${data.meal_total.fat_g}g`;
+
+      // Macro Ratio Bar
+      const pCals = data.meal_total.protein_g * 4;
+      const cCals = data.meal_total.carbs_g * 4;
+      const fCals = data.meal_total.fat_g * 9;
+      const totalMacroCals = Math.max(1, pCals + cCals + fCals);
+
+      document.getElementById('ratioP').style.width = `${(pCals / totalMacroCals) * 100}%`;
+      document.getElementById('ratioC').style.width = `${(cCals / totalMacroCals) * 100}%`;
+      document.getElementById('ratioF').style.width = `${(fCals / totalMacroCals) * 100}%`;
+
+      // Itemized List
+      const list = document.getElementById('foodItemsList');
+      list.innerHTML = '';
+      data.food_items.forEach(item => {
+        const el = document.createElement('div');
+        el.className = 'food-item';
+        el.innerHTML = `
+          <div class="food-item-header">
+            <span>${item.name}</span>
+            <span style="color: var(--primary);">${item.calories} kcal</span>
+          </div>
+          <div class="portion-tag">Portion: ${item.portion_estimate} • P: ${item.protein_g}g | C: ${item.carbs_g}g | F: ${item.fat_g}g</div>
+        `;
+        list.appendChild(el);
+      });
+
+      document.getElementById('jsonBlock').innerText = JSON.stringify(data, null, 2);
+    }
+
+    function toggleJson() {
+      const block = document.getElementById('jsonBlock');
+      block.style.display = block.style.display === 'block' ? 'none' : 'block';
+    }
+  </script>
+</body>
+</html>

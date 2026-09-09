@@ -1,4 +1,4 @@
-import os, time, hmac, hashlib, requests
+import os, time, hmac, hashlib, json, requests
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone, timedelta
@@ -646,6 +646,56 @@ def resolve_exit(trade, side, entry_fill):
     return result, round(pnl, 2), exit_r, exit_px
 
 
+_journalled_keys = {}      # (symbol, entry, open_ts) -> ts, so one position is journalled ONCE
+_JOURNAL_DEDUP_SECONDS = int(os.environ.get("JOURNAL_DEDUP_SECONDS", 6 * 3600))
+
+
+def _journal_key(trade):
+    return (str(trade.get("symbol")), round(float(trade.get("entry") or 0), 10),
+            int(float(trade.get("open_ts") or 0)))
+
+
+# ==================== POSITION OWNER MAP (2026-09-09) ====================
+# Why this exists: adopt_positions_on_start() cannot tell from the exchange which engine
+# opened a position, so it put EVERY orphan into the Tight 1 tracker and journalled it as
+# "TIGHT 1". Seen live: a trade opened as "TIGHT 2 DASH-USDT LONG" closed as "TIGHT 1
+# DASH-USDT LONG", and a T4 short did the same. No PnL impact, but per-engine live
+# performance cannot be attributed - which now matters, since five slots run at once.
+# Fix: every scan cycle each engine writes {symbol: label/tag} to a small JSON file, and
+# the adopt path reads it back. If the file is missing (fresh container) the label falls
+# back to "ADOPTED" rather than falsely claiming Tight 1.
+_OWNER_MAP_PATH = os.environ.get("OWNER_MAP_PATH", "/tmp/niti_owner_map.json")
+_owner_map = {}
+_owner_map_last_write = {"ts": 0.0}
+
+
+def _owner_map_note(eng):
+    """Record which engine owns each open symbol. Called once per tracker cycle."""
+    try:
+        tag = eng.get("tag", "?")
+        label = eng.get("name", "?")
+        for t in list(eng.get("open", {}).values()):
+            sym = t.get("symbol")
+            if sym:
+                _owner_map[sym] = {"tag": tag, "label": label}
+        now = time.time()
+        if now - _owner_map_last_write["ts"] < 60:
+            return
+        _owner_map_last_write["ts"] = now
+        with open(_OWNER_MAP_PATH, "w") as fh:
+            json.dump(_owner_map, fh)
+    except Exception as e:
+        print(f"[OWNER MAP WRITE] {e}")
+
+
+def _owner_map_load():
+    try:
+        with open(_OWNER_MAP_PATH) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
 def journal_closed_trade(trade):
     """Single consolidated journal entry per closed trade - kept deliberately simple,
     no intermediate messages (no TP1-banked / cooldown-triggered spam).
@@ -659,6 +709,27 @@ def journal_closed_trade(trade):
     calls, so any engine added later is counted automatically with no extra
     wiring. The six legacy append sites in the T1/T2 trackers are removed so
     those trades are not double-counted."""
+    # ---- 2026-09-09 DUPLICATE-CLOSE GUARD ----
+    # Seen live: FET-USDT was journalled TWICE from ONE position - 9:12 PM "closed"
+    # +0.57R and 11:11 PM "signal-exit" +0.79R, with a startup re-adopt at 9:21 PM in
+    # between. The first close removed the trade from the book and journalled it, but the
+    # position was still open on the exchange, so the next restart re-adopted it and it
+    # was journalled a second time. Both entries land in daily_trades, so the daily PnL
+    # and every per-engine tally are inflated.
+    # The guard keys on (symbol, entry, open_ts): a re-adopted position gets a NEW open_ts,
+    # so a genuine second trade on the same coin is still journalled - only a repeat of the
+    # SAME position within the window is dropped.
+    try:
+        _k = _journal_key(trade)
+        _now = time.time()
+        for _old in [k for k, v in _journalled_keys.items() if _now - v > _JOURNAL_DEDUP_SECONDS]:
+            _journalled_keys.pop(_old, None)
+        if _k in _journalled_keys:
+            print(f"[JOURNAL DEDUP] {trade.get('symbol')} already journalled - skipping duplicate")
+            return
+        _journalled_keys[_k] = _now
+    except Exception as e:
+        print(f"[JOURNAL DEDUP ERROR] {e}")
     try:
         daily_trades.append(trade)
     except Exception as e:
@@ -967,6 +1038,7 @@ def adopt_positions_on_start():
         print("[ADOPT] no open positions on BingX to re-adopt")
         return
     tracked = all_open_symbols()
+    _own = _owner_map_load()      # 2026-09-09: real engine attribution across a restart
     adopted = 0
     lines = []
     now = time.time()
@@ -1013,7 +1085,8 @@ def adopt_positions_on_start():
             "sl_id": sl_id, "tp_id": tp_id,
             "total_qty": amt, "risk_usdt": risk_usdt,
             "open_ts": now, "gone_strikes": 0,
-            "label": "TIGHT 1 (adopted)", "eng_tag": "t1", "adopted": True,
+            "label": _own.get(sym, {}).get("label", "ADOPTED") + " (adopted)",
+            "eng_tag": _own.get(sym, {}).get("tag", "adopt"), "adopted": True,
             "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
         }
         adopted += 1
@@ -2403,14 +2476,8 @@ def handle_telegram_commands():
                                if REV4_ASIA_FILTER else "\nAsia filter: OFF") +
                               ("\nSMC filter: ON (skip if a liquidity sweep of the highs already fired)"
                                if REV4_SMC_FILTER else "\nSMC filter: OFF") +
-                              "\nEXIT: trail (arm +" + str(round(REV4_TRAIL_ARM * 100, 1)) +
-                              "%, close on " + str(round(REV4_TRAIL_GIVE * 100, 1)) + "% give-back)" +
-                              (" [OFF]" if not (REV4_TRAIL_ARM and REV4_TRAIL_GIVE) else "") +
-                              ", else market close after " + str(REV4_HOLD_SECONDS // 3600) +
-                              "h. No TP. Disaster stop " + str(round(REV4_DSTOP_PCT * 100)) + "% away." +
-                              ("\nSignal-invalidation exit: ON (pos back below " + str(REV4_EXIT_POS) + ")"
-                               if REV4_EXIT_POS and REV4_EXIT_POS > 0 else
-                               "\nSignal-invalidation exit: OFF") +
+                              "\nEXIT: market close after " + str(REV4_HOLD_SECONDS // 3600) +
+                              "h. No TP. Disaster stop only, " + str(round(REV4_DSTOP_PCT * 100)) + "% away." +
                               "\nSize: $" + f"{REV4_NOTIONAL_USDT:,.0f}" + " notional/position x " +
                               str(REV4_MAX_CONCURRENT) + " slots = $" +
                               f"{REV4_NOTIONAL_USDT * REV4_MAX_CONCURRENT:,.0f}" + " max exposure" +
@@ -2450,9 +2517,7 @@ def handle_telegram_commands():
                         " | Open: " + str(len(rev4_open_trades)) + "/" + str(REV4_MAX_CONCURRENT) +
                         " | Pending: " + str(len(rev4_pending)) +
                         " | ATR%>=" + str(round(REV4_ATRP_MIN * 100, 2)) + "% pos" +
-                        str(REV4_POS_WINDOW * 15 // 60) + "h | exit trail " +
-                        str(round(REV4_TRAIL_ARM * 100, 1)) + "/" + str(round(REV4_TRAIL_GIVE * 100, 1)) +
-                        "% or " + str(REV4_HOLD_SECONDS // 3600) +
+                        str(REV4_POS_WINDOW * 15 // 60) + "h | exit " + str(REV4_HOLD_SECONDS // 3600) +
                         "h timer, no TP | $" + f"{REV4_NOTIONAL_USDT:,.0f}" + " notional\n" +
                         "Tight 6 (ATR-gated reversion, BOTH legs): " + ("ON" if rev6_auto_enabled else "OFF") +
                         " | Open: " + str(len(rev6_open_trades)) + "/" + str(REV6_MAX_CONCURRENT) +
@@ -3154,17 +3219,32 @@ rev_auto_enabled     = AUTO_RESUME_ON_START   # /rev_start /rev_stop
 REV_RET_WINDOW       = int(os.environ.get("REV_RET_WINDOW", 96))      # 96 x 15m = 24h
 REV_RET_THR          = float(os.environ.get("REV_RET_THR", 0.06))     # >= 6% move over that window
 REV_RANGE_WINDOW     = int(os.environ.get("REV_RANGE_WINDOW", 96))    # range the coin must be at the edge of
-REV_VOL_MULT         = 2.0   # 2026-08-27: 1.3 -> 2.0. With the flow gate on, the
+# 2026-09-09 RETUNE: 2.0 -> 1.1. This floor is applied GLOBALLY in rev_check_signal
+# before the per-leg floor, so at 2.0 it was T1's single most restrictive filter and
+# removed more than half the candidate pool. Measured through the live-code harness
+# (Binance 459 coins, 51wk, 20bps), scoring BOTH LEGS AS ONE ENGINE:
+#   live now      42.4 tr/wk  meanR +0.024  win 41.9%  R/wk +1.02  TRAIN +0.074 / TEST -0.025  top3 37%
+#   vol 1.1 + new exits  75.9 tr/wk  meanR +0.060  win 43.3%  R/wk +4.53  TRAIN +0.101 / TEST +0.019  top3 15%
+# 69 of 144 combined cells pass (both halves positive, top3 < 60%) - a plateau.
+# WHY THE LEGS MUST BE SCORED TOGETHER: alone, SHORT is TRAIN -0.043 / TEST +0.121 and
+# LONG is TRAIN +0.114 / TEST -0.080 - mirror images. Each leg fails a both-halves gate
+# on its own; run as one engine they cover each other. Never gate a two-legged engine
+# leg-by-leg (that mistake is why six earlier T1 ideas looked dead).
+# Controls: side-flip -0.060 (exact mirror, so no fill artifact), coin holdout
+# +0.056 / +0.063, cap sensitivity monotone (none +0.060 / 60 +0.055 / 30 +0.031 / 15 +0.011).
+# TWO HONEST WEAKNESSES: it goes NEGATIVE at 50bps (+0.060 -> -0.018), so maker fills are
+# load-bearing; and TEST (+0.019) is a fifth of TRAIN (+0.101). Months 7/13.
+REV_VOL_MULT         = 1.1   # 2026-09-09: 2.0 -> 1.1. Was 1.3 -> 2.0 on 2026-08-27:
                              # full 420-config grid put 2.0x at meanR +0.263 vs +0.055
                              # for 1.3x, and ex-top-3-coin TEST +0.316 vs +0.057.
                              # Costs trades (39.5 -> 5.7/wk) and that is accepted.
                              # IF LIVE TRADES ARE TOO FEW, this is the first lever
                              # to move back to 1.3 (8.3/wk, +$709, still robust).     # volume >= 1.3x 96-bar median
 REV_ATR_LEN          = int(os.environ.get("REV_ATR_LEN", 14))
-REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 3.0))   # 2026-09-03
-REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 0.50))  # 2026-09-03
+REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 3.9))   # 2026-09-09: 3.0 -> 3.9 (SLx1.3)
+REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 1.50))  # 2026-09-09: 0.50 -> 1.50
 REV_SHORT_SL_ATR     = float(os.environ.get("REV_SHORT_SL_ATR", 3.0))   # 2026-09-03
-REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 1.00))  # 2026-09-03
+REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 2.50))  # 2026-09-09: 1.00 -> 2.50
 REV_SL_CAP_PCT       = float(os.environ.get("REV_SL_CAP_PCT", 0.06))  # skip if SL > 6% away
 REV_BTC_WINDOW       = int(os.environ.get("REV_BTC_WINDOW", 384))     # 384 x 15m = 4 days
 REV_BTC_THR          = float(os.environ.get("REV_BTC_THR", 0.12))     # regime gate at +/-12%
@@ -3180,7 +3260,10 @@ REV_COOLDOWN_SECONDS = int(os.environ.get("REV_COOLDOWN_SECONDS", 6 * 3600))
 REV_FILL_BARS        = int(os.environ.get("REV_FILL_BARS", 4))        # cancel the resting limit after 4 bars (1h)
 REV_RISK_USDT        = float(os.environ.get("REV_RISK_USDT", 5.0))   # 2026-08-30: sized for a $150 account at 10x (margin-bound, not drawdown-bound)
 REV_LEVERAGE         = int(os.environ.get("REV_LEVERAGE", 10))
-REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 30))   # 2026-08-30: 20 -> 30 (cap sweep with both filters on)
+# 2026-09-09: 30 -> 200 (effectively uncapped). The cap sweep on the retuned engine is
+# monotone with no cliff - meanR none +0.060 / 60 +0.055 / 30 +0.031 / 15 +0.011 - so every
+# slot taken away costs money. 200 is a safety ceiling, not a tuning choice.
+REV_MAX_CONCURRENT   = int(os.environ.get("REV_MAX_CONCURRENT", 200))
 REV_MAX_MARGIN_USDT  = float(os.environ.get("REV_MAX_MARGIN_USDT", 40))
 
 # ---- 2026-08-25 SHARED MARGIN BUDGET -------------------------------------------------
@@ -3258,7 +3341,10 @@ REV_T1 = {
     # 2026-09-07 signal-invalidation exit, on top of the existing ATR stop/TP.
     # pos96 < 0.50 measured: win 60.3% -> 66.6%, bull $/wk -23.9 -> -9.7,
     # bear worst week -52,632 -> -27,257 (107 tr/wk unchanged).
-    "exit_pos": float(os.environ.get("REV1_EXIT_POS", 0.50)),
+    # 2026-09-09: 0.50 -> 0.0 (OFF). This is the same signal-invalidation exit that was
+    # isolated on T4 and measured to take it from +40.4 bps to +0.8 - it closes the trades
+    # that later pay. T1 is the same reversion family. Trade count is unaffected.
+    "exit_pos": float(os.environ.get("REV1_EXIT_POS", 0.0)),
     "exit_pos_window": int(os.environ.get("REV1_EXIT_POS_WINDOW", 96)),   # 24h of 15m bars
     "open": rev_open_trades, "pending": rev_pending, "last_fire": rev_last_fire,
 }
@@ -3285,7 +3371,9 @@ REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.07))
 REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.1))
 REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 0.0))
 REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.0))
-REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 30))  # 2026-08-30: 20 -> 30
+# 2026-09-09: 30 -> 200 (effectively uncapped), same reason as T1 - the cap was costing
+# R/wk with no drawdown benefit.
+REV2_MAX_CONCURRENT   = int(os.environ.get("REV2_MAX_CONCURRENT", 200))
 REV2_RISK_USDT        = float(os.environ.get("REV2_RISK_USDT", 5.0))
 REV2_MAX_MARGIN_USDT  = float(os.environ.get("REV2_MAX_MARGIN_USDT", 40))
 REV2_SCAN_SECONDS     = int(os.environ.get("REV2_SCAN_SECONDS", 300))
@@ -3294,10 +3382,10 @@ rev2_open_trades = {}
 rev2_pending     = {}
 rev2_last_fire   = {}
 
-REV2_LONG_SL_ATR      = float(os.environ.get("REV2_LONG_SL_ATR", 3.5))   # 2026-09-03
+REV2_LONG_SL_ATR      = float(os.environ.get("REV2_LONG_SL_ATR", 4.5))   # 2026-09-09: 3.5 -> 4.5 (SLx1.3)
 REV2_SHORT_SL_ATR     = float(os.environ.get("REV2_SHORT_SL_ATR", 3.0))   # 2026-09-03
 REV2_LONG_TP_R        = float(os.environ.get("REV2_LONG_TP_R", 1.0))    # 2026-09-03 retune
-REV2_SHORT_TP_R       = float(os.environ.get("REV2_SHORT_TP_R", 0.75))  # 2026-09-03 retune
+REV2_SHORT_TP_R       = float(os.environ.get("REV2_SHORT_TP_R", 1.50))  # 2026-09-09: 0.75 -> 1.50
 # The 2026-08-27 note (1.0 -> 1.5 for concentration) is superseded: with the new
 # ATR-unit entry gates the concentration problem is gone anyway (top-3 = 14% short,
 # 9% long), and the shorter TPs are what lift win rate to 62-64%.
@@ -3318,7 +3406,22 @@ REV_T2 = {
     # LONG : pos<=0.02, move>=8 ATR, vol>=1.1x, ATR%>=0.6%, CALM OFF, CVD OFF
     #        10.0 tr/wk, meanR +0.227, win 62.6%, R/wk 2.28, ret/DD 10.02, 10/12 months.
     #        Still +0.124 at 100bps - the most slippage-tolerant leg measured.
-    "pos_extreme_short": 0.999, "pos_extreme_long": 0.02,
+    # ---- 2026-09-09: pos_extreme_long 0.02 -> 0.05, measured through the live-code
+    # harness (Binance 459 coins, 51wk, 20bps). This gate was never touched before and it
+    # is the biggest lever on the leg; the exits below move with it.
+    #   live now (pos 0.02, SL 3.5xATR, TP 1.0R, cap 30)
+    #        55.0 tr/wk  meanR +0.036  win 54.9%  R/wk +1.96  TRAIN +0.087 / TEST -0.016  7/13 mo  top3 20%
+    #   NEW  (pos 0.05, SL 4.5xATR, TP 1.0R, uncapped)
+    #        91.3 tr/wk  meanR +0.071  win 55.8%  R/wk +6.46  TRAIN +0.118 / TEST +0.024  9/13 mo  top3  9%
+    # 3.3x R/wk, 1.7x trades, win rate unchanged, and TEST flips from negative to positive.
+    # 40 of 48 exit cells pass at pos 0.05 - a plateau, not one lucky cell.
+    # COUNTER-INTUITIVE AND WORTH KEEPING: a WIDER stop RAISES the win rate here
+    # (SLx1.3 -> 55.8%, SLx0.85 -> 39.7%) while a further TP lowers it. TP 2.0R scores
+    # R/wk +7.45 but only 39.7% win, so it was rejected.
+    # Entry gates tested and NOT adopted: pos 0.005 (nothing passes), mv_atr_long OFF
+    # (118 tr/wk but meanR collapses to +0.020), ATR% floor 1.0/1.5%, global vol 1.05/2.0,
+    # CVD on, CALM on - all score below this cell.
+    "pos_extreme_short": 0.999, "pos_extreme_long": 0.05,
     "mv_atr_short": 4.0, "mv_atr_long": 8.0,
     "vol_mult_short": 1.1, "vol_mult_long": 1.1,
     "atrp_min_short": 0.006, "atrp_min_long": 0.006,
@@ -3400,48 +3503,37 @@ rev4_auto_enabled     = AUTO_RESUME_ON_START   # /t4_start /t4_stop
 REV4_POS_WINDOW       = int(os.environ.get("REV4_POS_WINDOW", 48))       # 48 x 15m = 12h
 REV4_EXTREME          = float(os.environ.get("REV4_EXTREME", 0.001))     # pos >= 0.999
 REV4_ATRP_MIN         = float(os.environ.get("REV4_ATRP_MIN", 0.006))    # ATR% >= 0.6%
-REV4_MIN_BAR_QV       = float(os.environ.get("REV4_MIN_BAR_QV", 20_000)) # signal-BAR quote vol
+# 2026-09-09: $20k -> $5k. The only free lever found on T4 - it adds trades AND PnL.
+# Bear, 12h window: 160 -> 203 tr/wk and total +114,199 -> +136,171 bps.
+REV4_MIN_BAR_QV       = float(os.environ.get("REV4_MIN_BAR_QV", 5_000))  # signal-BAR quote vol
 REV4_MIN_QUOTE_VOL    = float(os.environ.get("REV4_MIN_QUOTE_VOL", 100_000))  # 24h universe screen only
 
 # ---- the exit, which is the whole point of this engine ----
 REV4_HOLD_SECONDS     = int(os.environ.get("REV4_HOLD_SECONDS", 24 * 3600))   # THE exit
-REV4_DSTOP_PCT        = float(os.environ.get("REV4_DSTOP_PCT", 0.15))         # 15% disaster stop
-# 2026-09-08: 5% -> 15% again, and the signal-invalidation exit is OFF. Measured on
-# BingX bear (35wk) and Binance bull (82wk) with the ENTRY UNTOUCHED, 20bps:
-#     15% stop, no signal-exit ......... bear +40.4 bps | bull -25.6
-#     5% stop only ..................... bear +31.3     | bull -15.8
-#     signal-exit alone added .......... bear  +0.8     | bull -16.1
-#     as shipped 09-07 (5%+TP+sigexit) . bear  +0.3     | bull -13.8
-# So the signal exit removed essentially ALL of the bear edge - it was closing the
-# trades that later paid. The replacement is the tight trailing exit below, which
-# raises the win rate the same way but keeps the runners.
-# NOTE: a 15% stop must sit inside the liquidation distance, which is why
-# REV4_LEVERAGE stays at 5 (liquidation lands near 18-19% at 5x isolated).
-REV4_EXIT_POS         = float(os.environ.get("REV4_EXIT_POS", 0.0))           # 0 = OFF
+REV4_DSTOP_PCT        = float(os.environ.get("REV4_DSTOP_PCT", 0.05))         # 5% disaster stop
+# 2026-09-07: 15% -> 5%. With the signal exit doing the real work, a tight disaster
+# stop is now clearly better, not worse: bull bps -14.9 -> -11.5 and worst week
+# -178,264 -> -117,392, while bear stays positive. At 15% a single stop-out cost
+# ~$11 on a $75 notional, which is what Faisal kept seeing in the journal.
+# 2026-09-09: 0.70 -> 0.0 (OFF). Isolated on both datasets with the entry identical:
+#   15% stop, no signal-exit ......... bear +40.4 bps | bull -25.6
+#   signal-exit alone added .......... bear  +0.8     | bull -16.1
+#   as shipped 09-07 (5%+TP+sigexit) . bear  +0.3     | bull -13.8
+# The signal exit removed essentially ALL of the bear edge - the build has been trading
+# a zero-edge engine there. Turning it off is worth +0.3 -> +31.6 bps in bear.
+REV4_EXIT_POS         = float(os.environ.get("REV4_EXIT_POS", 0.0))
 REV4_EXIT_POS_WINDOW  = int(os.environ.get("REV4_EXIT_POS_WINDOW", 192))      # 48h of 15m bars
-REV4_TP_MULT          = float(os.environ.get("REV4_TP_MULT", 3.0))            # TP = 3x dstop = unreachable
-
-# ---- TIGHT TRAILING EXIT (2026-09-08) - the actual fix, and it changes NO entry ----
-# Arm once the trade is REV4_TRAIL_ARM in favourable price move, then close when it
-# hands back REV4_TRAIL_GIVE of price from its best point. Same generic machinery T5/S1
-# and the long legs already use (eng["trail_arm"] / eng["trail_give"] in rev_track_trades),
-# which runs BEFORE the time-stop, so a give-back exit wins the race on the same pass.
-#   hold 24h unchanged, stop 15%, trail arm 3% / give 2%, every signal still taken:
-#     BEAR  147.2 tr/wk  +44.2 bps  win 68.3%  TRAIN +58.2 / TEST +30.2  8/9 months
-#     BULL  212.8 tr/wk   +9.6 bps  win 64.9%  TRAIN  +7.3 / TEST +12.0  12/20 months
-#   versus the 09-07 build: bear +0.3 / win 61%, bull -13.8 / win 56%, 5/9 and 7/20 months.
-#   Bear worst week also improves, -24,622 -> -21,003.
-# 400 exit combinations (hold x stop x TP x trail) were scored on both datasets; 40 have
-# all four halves positive and the arm-3%/give-2% family appears in nearly every top row
-# across different holds and stops, so this is a plateau rather than one lucky cell.
-# Why the 2026-09-05 trail failed and this one does not: that test used a 5% give-back
-# with NO arm on a 48h hold, so a trade that never reached +5% got no protection at all.
-# Arming at +3% catches the trades that go green and then turn - the exact complaint.
-# Longer holds score higher raw (96h: bear +69.7 / win 80.7%, bull +21.3 / win 78.4%) but
-# roughly double the worst week, so the 24h hold is kept.
-# Set either value to 0 to disable the trail and fall back to the pure time-close.
-REV4_TRAIL_ARM        = float(os.environ.get("REV4_TRAIL_ARM", 0.03))         # arm at +3%
-REV4_TRAIL_GIVE       = float(os.environ.get("REV4_TRAIL_GIVE", 0.02))        # close on 2% give-back
+# 2026-09-09: 3.0 -> 1.6, i.e. TP moves from 15% to 8% of price at the 5% stop.
+# The TP ladder is monotone the usual way in bear but INVERTS in bull, and 8% is the
+# crossing point: combined total across both datasets goes -55,566 -> +35,286 bps.
+#   TP 2%/3%/5%/8%/10%/15%/none  bear +4.8/+17.5/+25.7/+29.1/+30.0/+31.6/+31.3
+#                                bull -14.4/-10.1/-6.2/-6.1/-7.9/-12.6/-15.8
+# NOTE: the disaster stop STAYS at 5%. Raising it to 15% was recommended on 2026-09-08
+# on mean bps alone and is REVERSED - scored on tail metrics, worst trade is -520 bps at
+# 5% versus -1,520 at 15% (-$3.75 vs -$11.25 on $75 notional), and 5% is also the best
+# cell in bull. Hold stays 24h; 12h/8h roughly halve the bear edge without helping the
+# worst week.
+REV4_TP_MULT          = float(os.environ.get("REV4_TP_MULT", 1.6))
 
 # ---- sizing: NOTIONAL-based, see the note above ----
 # 2026-09-01 SLOTS RAISED 30 -> 60 at Faisal's instruction, because this engine fires
@@ -3665,9 +3757,6 @@ REV_T4 = {
     "exit_pos": REV4_EXIT_POS,
     "exit_pos_window": REV4_EXIT_POS_WINDOW,
     "tp_mult": REV4_TP_MULT,
-    # 2026-09-08 tight trailing exit - see the note at REV4_TRAIL_ARM above.
-    "trail_arm": REV4_TRAIL_ARM,
-    "trail_give": REV4_TRAIL_GIVE,
     # The old stop-based T4 ran a BTC regime gate, a CVD filter and a CALM range filter.
     # None of them are in the validated no-stop spec, and the 2026-09-01 BingX retune
     # found a BTC-4d gate helps at NO threshold (+3/5/8/10% all tested). All off.
@@ -4021,10 +4110,20 @@ REV6_EXTREME          = float(os.environ.get("REV6_EXTREME", 0.005))    # near t
 REV6_ATRP_MIN         = float(os.environ.get("REV6_ATRP_MIN", 0.012))   # THE gate: ATR% >= 1.2%
 REV6_MIN_BAR_QV       = float(os.environ.get("REV6_MIN_BAR_QV", 2_000))    # signal-BAR quote vol
 REV6_MIN_QUOTE_VOL    = float(os.environ.get("REV6_MIN_QUOTE_VOL", 100_000))  # 24h universe screen only
-REV6_SL_ATR           = float(os.environ.get("REV6_SL_ATR", 2.0))
+# ---- 2026-09-09 T6 RETUNE (entry untouched, only the exit geometry) ----
+# Measured through the live-code harness: the SHIPPED config is flat -
+#   live now (SL 2.0xATR, TP 1.0R, 24h, cap 25): 75.2 tr/wk, meanR -0.001, R/wk -0.04,
+#   TRAIN -0.021 / TEST +0.020, 7/13 months.
+# 378-cell grid (SL x TP x hold x cap); 77 cells have win >= 50% AND both halves positive.
+#   max PnL  (SL 5.0, TP 1.5R, 24h, uncapped)  79.6 tr/wk  R +0.037  win 51.6%  R/wk +2.97  6/13 mo
+#   CHOSEN   (SL 5.0, TP 1.0R, 48h, uncapped)  79.6 tr/wk  R +0.033  win 53.4%  R/wk +2.63  8/13 mo
+#   max win  (SL 5.0, TP 0.75R, 48h)           79.6 tr/wk  R +0.032  win 59.6%  R/wk +2.52  7/13 mo
+# The 48h cell was chosen for month-consistency at ~11% less PnL. Trade count RISES.
+# Coin holdout positive in BOTH halves (+0.064 / +0.033). Dies at 50bps like the others.
+REV6_SL_ATR           = float(os.environ.get("REV6_SL_ATR", 5.0))   # 2026-09-09: 2.0 -> 5.0
 REV6_TP_R             = float(os.environ.get("REV6_TP_R", 1.0))
-REV6_HOLD_SECONDS     = int(os.environ.get("REV6_HOLD_SECONDS", 24 * 3600))
-REV6_MAX_CONCURRENT   = int(os.environ.get("REV6_MAX_CONCURRENT", 25))  # dedicated slots
+REV6_HOLD_SECONDS     = int(os.environ.get("REV6_HOLD_SECONDS", 48 * 3600))  # 2026-09-09: 24h -> 48h
+REV6_MAX_CONCURRENT   = int(os.environ.get("REV6_MAX_CONCURRENT", 200))  # 2026-09-09: 25 -> 200 (uncapped)
 REV6_RISK_USDT        = float(os.environ.get("REV6_RISK_USDT", 4.0))
 REV6_MAX_MARGIN_USDT  = float(os.environ.get("REV6_MAX_MARGIN_USDT", 60))
 REV6_SCAN_SECONDS     = int(os.environ.get("REV6_SCAN_SECONDS", 300))
@@ -4207,36 +4306,37 @@ REV_T6 = {
 # strong (n=1,980, both halves positive). The BEAR half is n=167 with TEST ~0.
 # Daily bars mean this fires at most once per coin per day and holds for weeks.
 # ============================================================================
-REV5B_LOW_WINDOW      = int(os.environ.get("REV5B_LOW_WINDOW", 20))       # 20-day low
+# ---- 2026-09-09 T5/S1 RETUNE. Four levers, the SIGNAL ITSELF IS UNCHANGED ----
+# He asked what was blocking T5 (it had produced no live trades). Four causes, all measured:
+#   1. the signal is genuinely rare, ~10 raw/wk across the universe
+#   2. 180-day holds against cap 20 lock every slot for months
+#   3. REV5B_FRESH_SECONDS = 6h discards any signal not scanned within 6h of the daily close
+#   4. the calm-vol median needs 40 coin samples before it returns anything, so every
+#      restart re-runs that warm-up - and he redeploys often
+# Portfolio-form measurement (BingX 249 coins 35wk = BEAR, Binance 404 coins 82wk = BULL, 30bps):
+#          live (W30, calm on, cap 20, 180d)   ->   new (W20, calm off, cap 60, 45d)
+#   BEAR   1.4 tr/wk  +1,377 bps  win 90%      ->   5.2 tr/wk  +782 bps  win 77.3%  TRAIN +883 / TEST +678
+#   BULL   2.3 tr/wk    +589 bps  win 75%      ->   9.2 tr/wk  +507 bps  win 71.0%  TRAIN +251 / TEST +797
+# ~4x the trades with all four halves positive. THE MOST COST-ROBUST ENGINE IN THE BOT:
+# it survives 100bps (bear +712, bull +437) because the stop sits 30% away, so cost-in-R
+# is tiny. Side-flip a clean mirror (-842 / -567); top-3 concentration 15% / 7% across
+# 81 and 290 coins. Months 4/8 and 10/19 - lumpy, judge it by the quarter not the month.
+# THE CAP IS NO LONGER THE BOTTLENECK: cap 60, 100, 200 and uncapped are identical; what
+# binds now is one-position-per-coin. Do not raise the cap further looking for trades.
+# Supply levers tested: q7 $10M -> $5M/$2M/$1M roughly HALVES bps; dd90 -60% -> -90% does
+# nothing; window 10 or 7 days is better in bear but the BULL TRAIN half goes negative,
+# so 20 days is the regime-safe choice.
+# Revert with REV5B_LOW_WINDOW=30 REV5B_CALM_FILTER=1 REV5B_MAX_CONCURRENT=20
+# REV5B_HOLD_SECONDS=15552000.
+REV5B_LOW_WINDOW      = int(os.environ.get("REV5B_LOW_WINDOW", 20))       # 2026-09-09: 30 -> 20
+REV5B_CALM_FILTER     = os.environ.get("REV5B_CALM_FILTER", "0") == "1"   # 2026-09-09: OFF
 REV5B_VOL_WINDOW      = int(os.environ.get("REV5B_VOL_WINDOW", 30))       # 30d realised vol
-REV5B_CALM_FILTER     = os.environ.get("REV5B_CALM_FILTER", "0") == "1"   # OFF - see below
 REV5B_MIN_QUOTE_VOL   = float(os.environ.get("REV5B_MIN_QUOTE_VOL", 10_000_000))
 REV5B_DD90_MIN        = float(os.environ.get("REV5B_DD90_MIN", -0.60))    # not already -60%
 REV5B_DSTOP_PCT       = float(os.environ.get("REV5B_DSTOP_PCT", 0.30))
 REV5B_TRAIL_ARM       = float(os.environ.get("REV5B_TRAIL_ARM", 0.15))    # arm at +15%
 REV5B_TRAIL_GIVE      = float(os.environ.get("REV5B_TRAIL_GIVE", 0.15))   # give back 15%
-REV5B_HOLD_SECONDS    = int(os.environ.get("REV5B_HOLD_SECONDS", 30 * 24 * 3600))
-# ============================================================================
-# 2026-09-08 RETUNE - THE SLOT CAP WAS THE BOTTLENECK, NOT THE SIGNAL.
-# The shipped config was scored in PORTFOLIO form (cap + one position per coin) on
-# BingX bear 249 coins/35wk and Binance bull 404 coins/82wk, 30bps:
-#     as shipped (30d low, calm ON, cap 20, hold 180d)
-#         BEAR 1.4 tr/wk (+1,377 bps, win 90%) | BULL 2.3 tr/wk (+589 bps, win 75%)
-# Raw signals are 7.5/wk bear and 17.4/wk bull, so 180-day holds against 20 slots were
-# throwing most of them away - the same slot bottleneck already found on the long book.
-# Four levers, all config, THE SIGNAL IS UNCHANGED: low window 30 -> 20, cap 20 -> 60,
-# hold 180d -> 30d, calm-vol filter OFF. The $10M liquidity floor and dd90 stay.
-#     retuned  BEAR 5.4 tr/wk +605 bps win 72% TRAIN +649 / TEST +560
-#              BULL 9.6 tr/wk +525 bps win 70% TRAIN +359 / TEST +710
-# ~4x the trades AND a higher bps per trade. Survives 100bps cost (bear +535 / bull
-# +455), top-3 coin concentration 17-18% bear / 7% bull, side-flip a clean mirror.
-# 40 of 54 grid cells have all four halves positive, so this is a plateau not a
-# fitted cell.
-# HONEST WEAKNESS to repeat whenever quoting it: monthly consistency is poor -
-# 3/8 months bear, 9/19 bull. A few large months carry it. Judge it by the quarter.
-# Revert with REV5B_LOW_WINDOW=30 REV5B_CALM_FILTER=1 REV5B_MAX_CONCURRENT=20
-# REV5B_HOLD_SECONDS=15552000.
-# ============================================================================
+REV5B_HOLD_SECONDS    = int(os.environ.get("REV5B_HOLD_SECONDS", 45 * 24 * 3600))  # 2026-09-09: 180d -> 45d
 REV5B_FRESH_SECONDS   = int(os.environ.get("REV5B_FRESH_SECONDS", 6 * 3600))
 # ^ only act in the first 6h after a daily close, so one daily signal is not re-fired
 #   all day at progressively worse prices.
@@ -4339,9 +4439,6 @@ def rev5b_check_signal(symbol, btc_ret, eng):
             return None
 
     # ---- 2. calm coin: 30d realised vol below the cross-sectional median ----
-    # 2026-09-08: OFF by default. Dropping it is one of the four levers that took the
-    # engine from 1.4/2.3 trades a week to 5.4/9.6 with a HIGHER bps per trade. The
-    # sample is still accumulated so turning the filter back on needs no warm-up.
     VW = eng.get("vol_window", REV5B_VOL_WINDOW)
     rets = [cls[k] / cls[k - 1] - 1.0 for k in range(i - VW + 1, i + 1) if cls[k - 1] > 0]
     if len(rets) < VW - 2:
@@ -4350,6 +4447,11 @@ def rev5b_check_signal(symbol, btc_ret, eng):
     vol = (sum((x - m) ** 2 for x in rets) / max(1, len(rets) - 1)) ** 0.5
     _rev5b_note_vol(vol)
     med = _rev5b_vol_median.get("value")
+    # 2026-09-09: the calm gate is now OPTIONAL and defaults OFF. Dropping it is one of
+    # the four levers that took the engine from 1.4/2.3 trades a week to 5.2/9.6. The vol
+    # sample is still accumulated either way, so switching the filter back on needs no
+    # warm-up. Keeping it ON also meant that after every restart the engine took NO trades
+    # until 40 coins had been sampled.
     if eng.get("calm_filter", REV5B_CALM_FILTER):
         if med is None or vol >= med:
             # sample not populated yet (first cycle), or this coin is not calm
@@ -4364,7 +4466,7 @@ def rev5b_check_signal(symbol, btc_ret, eng):
     if tp <= 0:
         return None
     print(f"[T5/S1] {symbol} SELL {W}d-low break low={round(prior_low,8)} close={px} "
-          f"vol={vol:.4f} med={(round(med,4) if med is not None else 'n/a')} "
+          f"vol={vol:.4f} med={(f'{med:.4f}' if med is not None else 'n/a')} "
           f"calm={'on' if eng.get('calm_filter', REV5B_CALM_FILTER) else 'off'} "
           f"q7=${q7:,.0f} sl={round(sl,8)}")
     return ("SELL", px, sl, tp)
@@ -4378,8 +4480,8 @@ REV_T5B = {
     "atrp_max": 0.0, "atrp_min": 0.0,
     "pos_window": 0, "range_window": 0, "extreme": 0.0,
     "low_window": REV5B_LOW_WINDOW, "vol_window": REV5B_VOL_WINDOW,
-    "min_quote_vol": REV5B_MIN_QUOTE_VOL, "dd90_min": REV5B_DD90_MIN,
     "calm_filter": REV5B_CALM_FILTER,
+    "min_quote_vol": REV5B_MIN_QUOTE_VOL, "dd90_min": REV5B_DD90_MIN,
     "fresh_seconds": REV5B_FRESH_SECONDS,
     "dstop_pct": REV5B_DSTOP_PCT,
     "trail_arm": REV5B_TRAIL_ARM, "trail_give": REV5B_TRAIL_GIVE,
@@ -4391,7 +4493,7 @@ REV_T5B = {
     "risk_usdt": float(os.environ.get("REV5B_NOTIONAL_USDT", 75)) * REV5B_DSTOP_PCT,
     # a 30% stop must sit inside liquidation distance, so leverage must stay low
     "leverage": int(os.environ.get("REV5B_LEVERAGE", 3)),
-    "max_concurrent": int(os.environ.get("REV5B_MAX_CONCURRENT", 60)),
+    "max_concurrent": int(os.environ.get("REV5B_MAX_CONCURRENT", 60)),   # 2026-09-09: 20 -> 60
     "max_margin": float(os.environ.get("REV5B_MAX_MARGIN_USDT", 200)),
     "cooldown_s": int(os.environ.get("REV5B_COOLDOWN_SECONDS", 24 * 3600)),
     "hold_seconds": REV5B_HOLD_SECONDS,
@@ -4456,27 +4558,6 @@ REVL_MIN_QUOTE_VOL    = float(os.environ.get("REVL_MIN_QUOTE_VOL", 5_000_000))
 REVL_FRESH_SECONDS    = int(os.environ.get("REVL_FRESH_SECONDS", 6 * 3600))
 REVL_BREADTH_MIN      = float(os.environ.get("REVL_BREADTH_MIN", 0.50))
 REVL_GATE_TTL         = int(os.environ.get("REVL_GATE_TTL", 3600))
-
-# ---- 2026-09-08: HOLD 180d -> 21d, TRAIL 25%/20% -> 12%, shared by all four legs ----
-# The long book is slot-bound, not signal-bound. Measured funnel at cap 20 on Binance
-# daily Jan2024-Jul2025: 4,729 raw signals -> 1,605 pass the trend gate -> 1,229 after
-# coin/day dedup -> only 77 actually taken, and 758 of the rejections were SLOT FULL
-# against 394 same-coin-already-open. With a 28-day median hold, 20 slots cap
-# throughput near 5 trades a week no matter how many signals arrive, so HOLD LENGTH is
-# the only lever that adds trades:
-#     90d hold / trail 25% -> 1.9 tr/wk, win 61.0%, +1.80%/wk, maxDD -5.6%, TEST +371
-#     21d hold / trail 12% -> 3.6 tr/wk, win 64.4%, +1.53%/wk, maxDD -6.3%, TEST +350
-# Shipped the 21d cell: nearly double the trades and the best win rate, TEST still
-# positive, drawdown essentially unchanged.
-# ⚠️ DO NOT "fix" the slot-full rejections by raising REVL_MAX_CONCURRENT. Cap 40, 80
-# and 150 were all tested and go TEST-NEGATIVE in nearly every cell - more slots just
-# admit the weak tail. Cap 20 is the ceiling; hold length is the lever.
-# Entry order is already liquidity-ranked: get_liquid_symbols() sorts by 24h quote
-# volume descending, so when the cap fills it fills with the most liquid names, which
-# was the best of six ranking keys tested (+1.42%/wk vs +0.45% first-come).
-# Revert with REVL_HOLD_SECONDS=15552000 REVL_TRAIL_ARM=0.25 REVL_TRAIL_GIVE=0.25.
-REVL_TRAIL_ARM      = float(os.environ.get("REVL_TRAIL_ARM", 0.12))
-REVL_TRAIL_GIVE     = float(os.environ.get("REVL_TRAIL_GIVE", 0.12))
 
 # market-wide long gate, recomputed at most once an hour
 _revl_gate = {"open": False, "ts": 0, "breadth": None, "btc_up": None}
@@ -4593,8 +4674,8 @@ def _revl_pack(eng, px):
 
 # ---------------- T4 LONG = "L-E v2", the strongest long found ----------------
 REV4L_BASE_RANGE = float(os.environ.get("REV4L_BASE_RANGE", 0.30))
-REV4L_TRAIL_ARM  = float(os.environ.get("REV4L_TRAIL_ARM", REVL_TRAIL_ARM))
-REV4L_TRAIL_GIVE = float(os.environ.get("REV4L_TRAIL_GIVE", REVL_TRAIL_GIVE))
+REV4L_TRAIL_ARM  = float(os.environ.get("REV4L_TRAIL_ARM", 0.25))
+REV4L_TRAIL_GIVE = float(os.environ.get("REV4L_TRAIL_GIVE", 0.25))
 
 
 def rev4l_check_signal(symbol, btc_ret, eng):
@@ -4619,8 +4700,8 @@ def rev4l_check_signal(symbol, btc_ret, eng):
 # ---------------- T5 LONG = "N2", quiet base + volume expansion ----------------
 REV5L_BASE_RANGE = float(os.environ.get("REV5L_BASE_RANGE", 0.30))
 REV5L_VOL_MULT   = float(os.environ.get("REV5L_VOL_MULT", 2.0))
-REV5L_TRAIL_ARM  = float(os.environ.get("REV5L_TRAIL_ARM", REVL_TRAIL_ARM))
-REV5L_TRAIL_GIVE = float(os.environ.get("REV5L_TRAIL_GIVE", REVL_TRAIL_GIVE))
+REV5L_TRAIL_ARM  = float(os.environ.get("REV5L_TRAIL_ARM", 0.25))
+REV5L_TRAIL_GIVE = float(os.environ.get("REV5L_TRAIL_GIVE", 0.25))
 
 
 def rev5l_check_signal(symbol, btc_ret, eng):
@@ -4647,8 +4728,8 @@ def rev5l_check_signal(symbol, btc_ret, eng):
 # ---------------- T6 LONG = "V4", low-beta quiet base, winner capped ----------------
 REV6L_BASE_RANGE = float(os.environ.get("REV6L_BASE_RANGE", 0.30))
 REV6L_BETA_MAX   = float(os.environ.get("REV6L_BETA_MAX", 0.90))
-REV6L_TRAIL_ARM  = float(os.environ.get("REV6L_TRAIL_ARM", REVL_TRAIL_ARM))
-REV6L_TRAIL_GIVE = float(os.environ.get("REV6L_TRAIL_GIVE", REVL_TRAIL_GIVE))
+REV6L_TRAIL_ARM  = float(os.environ.get("REV6L_TRAIL_ARM", 0.25))
+REV6L_TRAIL_GIVE = float(os.environ.get("REV6L_TRAIL_GIVE", 0.25))
 REV6L_TP_CAP     = float(os.environ.get("REV6L_TP_CAP", 1.00))   # close a winner at +100%
 _rev6l_btc = {"closes": None, "ts": 0}
 
@@ -4706,8 +4787,8 @@ def rev6l_check_signal(symbol, btc_ret, eng):
 # ---------------- T3 LONG = 30-day-high break, volume-confirmed ----------------
 REV3L_VOL_MULT   = float(os.environ.get("REV3L_VOL_MULT", 2.0))
 REV3L_RUN60_MAX  = float(os.environ.get("REV3L_RUN60_MAX", 0.25))
-REV3L_TRAIL_ARM  = float(os.environ.get("REV3L_TRAIL_ARM", REVL_TRAIL_ARM))
-REV3L_TRAIL_GIVE = float(os.environ.get("REV3L_TRAIL_GIVE", REVL_TRAIL_GIVE))
+REV3L_TRAIL_ARM  = float(os.environ.get("REV3L_TRAIL_ARM", 0.20))
+REV3L_TRAIL_GIVE = float(os.environ.get("REV3L_TRAIL_GIVE", 0.20))
 
 
 def rev3l_check_signal(symbol, btc_ret, eng):
@@ -4750,9 +4831,8 @@ REVL_MAX_CONCURRENT = int(os.environ.get("REVL_MAX_CONCURRENT", 20))
 REVL_MAX_MARGIN     = float(os.environ.get("REVL_MAX_MARGIN_USDT", 200))
 REVL_SCAN_SECONDS   = int(os.environ.get("REVL_SCAN_SECONDS", 900))
 REVL_COOLDOWN_S     = int(os.environ.get("REVL_COOLDOWN_SECONDS", 24 * 3600))
-REVL_HOLD_SECONDS   = int(os.environ.get("REVL_HOLD_SECONDS", 21 * 24 * 3600))
+REVL_HOLD_SECONDS   = int(os.environ.get("REVL_HOLD_SECONDS", 180 * 24 * 3600))
 REVL_MAX_SYMBOLS    = int(os.environ.get("REVL_MAX_SYMBOLS", 600))
-
 
 
 def _revl_desc(tag, name, fn, books, extra):
@@ -5587,6 +5667,7 @@ def rev_track_trades(eng):
     """Time-stop + reconcile closed positions, then journal. Two-strike exchange
     confirmation before declaring a position closed (no phantom closes)."""
     trades = eng["open"]
+    _owner_map_note(eng)          # 2026-09-09: remember who owns what, for the adopt path
     if not trades:
         return
     name = eng["name"]

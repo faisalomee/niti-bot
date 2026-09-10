@@ -1234,6 +1234,13 @@ t3_auto_trade_enabled = AUTO_RESUME_ON_START
 t3_watchlist   = {}   # symbol -> dormancy info (dormant range + median vol), rebuilt every 4h
 t3_watch       = {}   # symbol -> AWAKENED state machine (pullback tracking -> entry)
 t3_open_trades = {}   # order_id -> trade dict (managed by track_t3_trades in the 30s loop)
+# 2026-09-09: the T3 SLOT is refilled. The old HTF clean-break retest engine that used to
+# live here is still disabled at build level (T3_ENGINE_ENABLED=0); the slot now runs a
+# 10-day-low breakdown short, bear-gated. Its own books, kept separate from t3_open_trades
+# so the retired engine can still be switched back on without a collision.
+rev3_open_trades = {}
+rev3_pending = {}
+rev3_last_fire = {}
 t3_cooldown    = {}   # symbol -> unix ts until which no new T3 signal may fire
 
 
@@ -1723,6 +1730,7 @@ def all_open_symbols():
     syms = set()
     for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades,
               rev2_open_trades, rev4_open_trades, rev5_open_trades, rev6_open_trades,
+              rev3_open_trades,
               rev3l_open_trades, rev4l_open_trades, rev5l_open_trades, rev6l_open_trades):
         for t in d.values():
             s = t.get("symbol")
@@ -2225,7 +2233,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev3_auto_enabled
     global rev3l_auto_enabled, rev4l_auto_enabled, rev5l_auto_enabled, rev6l_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
@@ -2266,8 +2274,9 @@ def handle_telegram_commands():
                     else: _off.append("T1")
                     if REV2_ENGINE_ENABLED: rev2_auto_enabled = True; _on.append("T2")
                     else: _off.append("T2")
-                    if T3_ENGINE_ENABLED:   t3_scalp_auto_enabled = True; _on.append("T3")
+                    if REV3_ENGINE_ENABLED: rev3_auto_enabled = True; _on.append("T3")
                     else: _off.append("T3")
+                    if T3_ENGINE_ENABLED:   t3_scalp_auto_enabled = True; _on.append("T3-old")
                     if REV4_ENGINE_ENABLED: rev4_auto_enabled = True; _on.append("T4")
                     else: _off.append("T4")
                     if REV5_ENGINE_ENABLED: rev5_auto_enabled = True; _on.append("T5")
@@ -2291,6 +2300,7 @@ def handle_telegram_commands():
                     rev4_auto_enabled = False
                     rev5_auto_enabled = False
                     rev6_auto_enabled = False
+                    rev3_auto_enabled = False
                     rev3l_auto_enabled = rev4l_auto_enabled = False
                     rev5l_auto_enabled = rev6l_auto_enabled = False
                     send_tg("ALL ENGINES OFF: T1, T2, T3, T4, T5, T6 + LONG legs.\n"
@@ -2318,15 +2328,37 @@ def handle_telegram_commands():
                     send_tg("Tight 1 (24h-reversion) Auto-trade OFF.")
                 # ---- Tight 3 = S/R Sweep SHORT (bear engine): /t3_start /t3_stop ----
                 elif text == "/t3_start":
-                    if not T3_ENGINE_ENABLED:
-                        send_tg("Tight 3 (HTF clean-break retest) is disabled at build level (T3_ENGINE_ENABLED=0).")
+                    # 2026-09-09: /t3_* now drives the NEW slot engine (10d-low breakdown
+                    # short, bear-gated). The retired HTF retest engine keeps /t3old_*.
+                    if not REV3_ENGINE_ENABLED:
+                        send_tg("Tight 3 is disabled at build level (REV3_ENGINE_ENABLED=0).")
                     else:
-                        t3_scalp_auto_enabled = True
-                        send_tg("Tight 3 (HTF clean-break retest) Auto-trade ON.")
+                        rev3_auto_enabled = True
+                        send_tg("Tight 3 (10d-low breakdown SHORT, bear-gated) Auto-trade ON.")
                 elif text == "/t3_stop":
-                    t3_scalp_auto_enabled = False
-                    send_tg("Tight 3 (HTF clean-break retest) Auto-trade OFF.")
+                    rev3_auto_enabled = False
+                    send_tg("Tight 3 Auto-trade OFF.")
                 elif text == "/t3_status":
+                    try:
+                        _g = revl_gate_open()
+                    except Exception:
+                        _g = None
+                    send_tg("Tight 3 (10d-low breakdown SHORT): " + ("ON" if rev3_auto_enabled else "OFF") +
+                            " | Open: " + str(len(rev3_open_trades)) + "/" + str(REV_T3["max_concurrent"]) +
+                            " | Pending: " + str(len(rev3_pending)) +
+                            "\nRule: daily close below the " + str(REV3_LOW_WINDOW) + "-day low, "
+                            "7d avg quote vol >= $" + f"{REV5B_MIN_QUOTE_VOL:,.0f}" + ", not already "
+                            + str(round(REV5B_DD90_MIN * 100)) + "% off the 90d high" +
+                            "\nEXIT: stop +" + str(round(REV5B_DSTOP_PCT * 100)) + "%, arm at +" +
+                            str(round(REV5B_TRAIL_ARM * 100)) + "% then close on a " +
+                            str(round(REV5B_TRAIL_GIVE * 100)) + "% give-back, else " +
+                            str(REV_T3["hold_seconds"] // 86400) + "d time-stop" +
+                            "\nBEAR GATE: " + ("ON" if REV3_BEAR_GATE else "OFF") +
+                            " | long gate is currently " +
+                            ("OPEN -> T3 is standing down" if _g else
+                             ("SHUT -> T3 is armed" if _g is False else "UNREADABLE -> T3 stands down")) +
+                            "\nA quiet T3 in a strong uptrend is the gate working, not a fault.")
+                elif text == "/t3old_status":
                     lines_s = ("Tight 3 (HTF clean-break retest, both sides): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
                                " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
                                " | Pending: " + str(len(t3s_pending)) +
@@ -3830,6 +3862,7 @@ REV_T4 = {
 
 REV5_ENGINE_ENABLED   = os.environ.get("REV5_ENGINE_ENABLED", "1") == "1"
 rev5_auto_enabled     = AUTO_RESUME_ON_START   # /t5_start /t5_stop
+rev3_auto_enabled     = AUTO_RESUME_ON_START   # /t3_start /t3_stop (2026-09-09 slot refill)
 REV5_CRASH_RET        = float(os.environ.get("REV5_CRASH_RET", -0.20))   # legacy absolute gate, no longer the trigger
 # ---- 2026-09-03 RETUNE ----
 # The old rule was an absolute 24h drop of 20%. That conflates a coin breaking down
@@ -4472,6 +4505,84 @@ def rev5b_check_signal(symbol, btc_ret, eng):
     return ("SELL", px, sl, tp)
 
 
+# ============================================================================
+# T3 SLOT (2026-09-09) - 10-DAY-LOW BREAKDOWN SHORT, BEAR-GATED
+#
+# The slot had been empty since the old HTF clean-break retest engine was disabled
+# (it measured -2.46 R/wk, the biggest single leak in the bot). Four fresh families were
+# tested for it and all failed: failed-breakout of the 20d high (0.1 tr/wk, no signal),
+# loss of EMA50 (TRAIN negative), squeeze -> 10d-low break (bear good, BULL TEST -703),
+# and the clean-level 4H sweep even after a full stop/TP grid, a session filter and a
+# bear gate (best bear cell 67 tr/wk +85 bps win 60% but TRAIN +150 / TEST +18, and ZERO
+# cells pass on bull data). Do not retry those.
+#
+# WHAT WORKS is not a new family at all: it is the T5/S1 machinery at a SHORTER low
+# window, restricted to bear regimes. W=10 was already known to beat W=20 in bear and to
+# fail only because its UNGATED bull TRAIN half is negative - so gating it removes exactly
+# the half that was broken, and a 10-day low is a different signal from T5's 20-day low,
+# so the two do not duplicate each other.
+#   BEAR (BingX 249 coins, 35wk, 30bps):
+#       7.1 tr/wk  +788 bps  win 72.6%  TRAIN +790 / TEST +786  top3 12%  90 coins
+#       survives 100bps (+718 bps) - the stop sits 30% away so cost-in-R is tiny
+#       side-flip -848 bps, a clean mirror
+#   BULL data, bear-gated days only (Binance 404 coins, 82wk):
+#       11.3 tr/wk +163 bps  win 64.4%  TRAIN +47 / TEST +314  10/17 months
+#
+# THE GATE IS THE EXISTING LONG GATE, INVERTED. revl_gate_open() is True when BTC is above
+# EMA50 > EMA200 AND breadth > 50%; T3 trades only when it is False. That is his
+# "bull a long, bear a short" architecture in one line: the same switch turns the long book
+# on and this engine off. Kill the gate with REV3_BEAR_GATE=0.
+# ⚠️ The gate was open ~28% of days in the bull sample and NEVER in the bear sample, so
+# expect T3 to be BUSY in a downtrend and silent in a strong uptrend - that is by design.
+# Revert the whole slot with REV3_ENGINE_ENABLED=0.
+# ============================================================================
+REV3_ENGINE_ENABLED   = os.environ.get("REV3_ENGINE_ENABLED", "1") == "1"
+REV3_LOW_WINDOW       = int(os.environ.get("REV3_LOW_WINDOW", 10))      # 10-day low, vs T5's 20
+REV3_BEAR_GATE        = os.environ.get("REV3_BEAR_GATE", "1") == "1"
+REV3_SCAN_SECONDS     = int(os.environ.get("REV3_SCAN_SECONDS", 900))
+
+
+def rev3_check_signal(symbol, btc_ret, eng):
+    """T3 = the T5/S1 rule at a 10-day window, and only while the long gate is SHUT."""
+    if REV3_BEAR_GATE:
+        try:
+            if revl_gate_open():
+                return None
+        except Exception as e:
+            # gate unreadable -> do NOT trade. Same fail-closed policy the long side uses.
+            print(f"[T3 GATE] unreadable, skipping: {e}")
+            return None
+    return rev5b_check_signal(symbol, btc_ret, eng)
+
+
+REV_T3 = {
+    "name": "TIGHT 3", "tag": "t3",
+    "signal_fn": rev3_check_signal,
+    "side_only": "SELL",
+    "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0,
+    "atrp_max": 0.0, "atrp_min": 0.0,
+    "pos_window": 0, "range_window": 0, "extreme": 0.0,
+    "low_window": REV3_LOW_WINDOW, "vol_window": REV5B_VOL_WINDOW,
+    "calm_filter": False,
+    "min_quote_vol": REV5B_MIN_QUOTE_VOL, "dd90_min": REV5B_DD90_MIN,
+    "fresh_seconds": REV5B_FRESH_SECONDS,
+    "dstop_pct": REV5B_DSTOP_PCT,
+    "trail_arm": REV5B_TRAIL_ARM, "trail_give": REV5B_TRAIL_GIVE,
+    "regime_min_btc": None, "range_regime": None,
+    "cvd_filter": False, "flow_gate": False,
+    "long_sl_atr": 0.0, "long_tp_r": 0.0, "short_sl_atr": 0.0, "short_tp_r": 0.0,
+    "sl_cap_pct": max(REV5B_DSTOP_PCT * 1.5, REV_SL_CAP_PCT),
+    "risk_usdt": float(os.environ.get("REV3_NOTIONAL_USDT", 75)) * REV5B_DSTOP_PCT,
+    "leverage": int(os.environ.get("REV3_LEVERAGE", 3)),
+    "max_concurrent": int(os.environ.get("REV3_MAX_CONCURRENT", 60)),
+    "max_margin": float(os.environ.get("REV3_MAX_MARGIN_USDT", 200)),
+    "cooldown_s": int(os.environ.get("REV3_COOLDOWN_SECONDS", 24 * 3600)),
+    "hold_seconds": int(os.environ.get("REV3_HOLD_SECONDS", 45 * 24 * 3600)),
+    "max_symbols": int(os.environ.get("REV3_MAX_SYMBOLS", 600)),
+    "open": rev3_open_trades, "pending": rev3_pending, "last_fire": rev3_last_fire,
+}
+
+
 REV_T5B = {
     "name": "TIGHT 5", "tag": "t5",
     "signal_fn": rev5b_check_signal,
@@ -4558,6 +4669,18 @@ REVL_MIN_QUOTE_VOL    = float(os.environ.get("REVL_MIN_QUOTE_VOL", 5_000_000))
 REVL_FRESH_SECONDS    = int(os.environ.get("REVL_FRESH_SECONDS", 6 * 3600))
 REVL_BREADTH_MIN      = float(os.environ.get("REVL_BREADTH_MIN", 0.50))
 REVL_GATE_TTL         = int(os.environ.get("REVL_GATE_TTL", 3600))
+
+# ---- 2026-09-09 shared long trail. CORRECTS the 21d/12% shipped on 2026-09-08, which was
+# picked WITHOUT a concurrency cap in the sim and is TRAIN-NEGATIVE once the cap is applied.
+# Portfolio form, Binance daily 2024-01..2025-07 (404 coins), 30bps, trend-gated,
+# liquidity-ranked, all four legs sharing one slot pool:
+#   shipped 09-08  cap 20 / hold 21d / arm+trail 12% -> 2.9 tr/wk +103 bps win 53.4% TRAIN -184 / TEST +395
+#   NEW            cap 100 / hold 90d / arm 15% / trail 20% -> 6.5 tr/wk +385 bps win 61.1% TRAIN +166 / TEST +616
+# THE LEVER NOBODY HAD TOUCHED: arm and give-back were always the SAME number. Arming at
+# 15% while still giving back 20% lifts the win rate - the trail protects sooner without
+# cutting the runners any tighter.
+REVL_TRAIL_ARM      = float(os.environ.get("REVL_TRAIL_ARM", 0.15))
+REVL_TRAIL_GIVE     = float(os.environ.get("REVL_TRAIL_GIVE", 0.20))
 
 # market-wide long gate, recomputed at most once an hour
 _revl_gate = {"open": False, "ts": 0, "breadth": None, "btc_up": None}
@@ -4674,8 +4797,8 @@ def _revl_pack(eng, px):
 
 # ---------------- T4 LONG = "L-E v2", the strongest long found ----------------
 REV4L_BASE_RANGE = float(os.environ.get("REV4L_BASE_RANGE", 0.30))
-REV4L_TRAIL_ARM  = float(os.environ.get("REV4L_TRAIL_ARM", 0.25))
-REV4L_TRAIL_GIVE = float(os.environ.get("REV4L_TRAIL_GIVE", 0.25))
+REV4L_TRAIL_ARM  = float(os.environ.get("REV4L_TRAIL_ARM", REVL_TRAIL_ARM))
+REV4L_TRAIL_GIVE = float(os.environ.get("REV4L_TRAIL_GIVE", REVL_TRAIL_GIVE))
 
 
 def rev4l_check_signal(symbol, btc_ret, eng):
@@ -4700,8 +4823,8 @@ def rev4l_check_signal(symbol, btc_ret, eng):
 # ---------------- T5 LONG = "N2", quiet base + volume expansion ----------------
 REV5L_BASE_RANGE = float(os.environ.get("REV5L_BASE_RANGE", 0.30))
 REV5L_VOL_MULT   = float(os.environ.get("REV5L_VOL_MULT", 2.0))
-REV5L_TRAIL_ARM  = float(os.environ.get("REV5L_TRAIL_ARM", 0.25))
-REV5L_TRAIL_GIVE = float(os.environ.get("REV5L_TRAIL_GIVE", 0.25))
+REV5L_TRAIL_ARM  = float(os.environ.get("REV5L_TRAIL_ARM", REVL_TRAIL_ARM))
+REV5L_TRAIL_GIVE = float(os.environ.get("REV5L_TRAIL_GIVE", REVL_TRAIL_GIVE))
 
 
 def rev5l_check_signal(symbol, btc_ret, eng):
@@ -4728,8 +4851,8 @@ def rev5l_check_signal(symbol, btc_ret, eng):
 # ---------------- T6 LONG = "V4", low-beta quiet base, winner capped ----------------
 REV6L_BASE_RANGE = float(os.environ.get("REV6L_BASE_RANGE", 0.30))
 REV6L_BETA_MAX   = float(os.environ.get("REV6L_BETA_MAX", 0.90))
-REV6L_TRAIL_ARM  = float(os.environ.get("REV6L_TRAIL_ARM", 0.25))
-REV6L_TRAIL_GIVE = float(os.environ.get("REV6L_TRAIL_GIVE", 0.25))
+REV6L_TRAIL_ARM  = float(os.environ.get("REV6L_TRAIL_ARM", REVL_TRAIL_ARM))
+REV6L_TRAIL_GIVE = float(os.environ.get("REV6L_TRAIL_GIVE", REVL_TRAIL_GIVE))
 REV6L_TP_CAP     = float(os.environ.get("REV6L_TP_CAP", 1.00))   # close a winner at +100%
 _rev6l_btc = {"closes": None, "ts": 0}
 
@@ -4787,8 +4910,8 @@ def rev6l_check_signal(symbol, btc_ret, eng):
 # ---------------- T3 LONG = 30-day-high break, volume-confirmed ----------------
 REV3L_VOL_MULT   = float(os.environ.get("REV3L_VOL_MULT", 2.0))
 REV3L_RUN60_MAX  = float(os.environ.get("REV3L_RUN60_MAX", 0.25))
-REV3L_TRAIL_ARM  = float(os.environ.get("REV3L_TRAIL_ARM", 0.20))
-REV3L_TRAIL_GIVE = float(os.environ.get("REV3L_TRAIL_GIVE", 0.20))
+REV3L_TRAIL_ARM  = float(os.environ.get("REV3L_TRAIL_ARM", REVL_TRAIL_ARM))
+REV3L_TRAIL_GIVE = float(os.environ.get("REV3L_TRAIL_GIVE", REVL_TRAIL_GIVE))
 
 
 def rev3l_check_signal(symbol, btc_ret, eng):
@@ -4827,11 +4950,17 @@ rev6l_auto_enabled = AUTO_RESUME_ON_START
 REVL_ENGINE_ENABLED = os.environ.get("REVL_ENGINE_ENABLED", "1") == "1"
 REVL_NOTIONAL_USDT  = float(os.environ.get("REVL_NOTIONAL_USDT", 75))
 REVL_LEVERAGE       = int(os.environ.get("REVL_LEVERAGE", 3))    # a 30% stop must sit inside liquidation
-REVL_MAX_CONCURRENT = int(os.environ.get("REVL_MAX_CONCURRENT", 20))
+# 2026-09-09: 20 -> 100. Nearby cells, all TRAIN>0 and TEST>0: cap40/90d 3.0 tr/wk +536 bps
+# win 62.9% | cap60/90d 4.3 tr/wk +519 win 61.7%. cap 200 is where it BREAKS - 11 tr/wk but
+# win 43-48% and TEST negative, because the extra slots admit the weak tail. 100 is the ceiling.
+# The gate opens on only ~28% of days in the bull sample and NEVER opened in the bear sample,
+# so a silent long book is the gate working, not a fault.
+# Revert: REVL_MAX_CONCURRENT=20 REVL_HOLD_SECONDS=1814400 REVL_TRAIL_ARM=0.12 REVL_TRAIL_GIVE=0.12
+REVL_MAX_CONCURRENT = int(os.environ.get("REVL_MAX_CONCURRENT", 100))
 REVL_MAX_MARGIN     = float(os.environ.get("REVL_MAX_MARGIN_USDT", 200))
 REVL_SCAN_SECONDS   = int(os.environ.get("REVL_SCAN_SECONDS", 900))
 REVL_COOLDOWN_S     = int(os.environ.get("REVL_COOLDOWN_SECONDS", 24 * 3600))
-REVL_HOLD_SECONDS   = int(os.environ.get("REVL_HOLD_SECONDS", 180 * 24 * 3600))
+REVL_HOLD_SECONDS   = int(os.environ.get("REVL_HOLD_SECONDS", 90 * 24 * 3600))   # 2026-09-09: 180d -> 90d
 REVL_MAX_SYMBOLS    = int(os.environ.get("REVL_MAX_SYMBOLS", 600))
 
 
@@ -4918,7 +5047,7 @@ def rev_try_claim(symbol):
         if (symbol in rev_claimed or symbol in all_open_symbols()
                 or symbol in rev_pending or symbol in rev2_pending
                 or symbol in rev4_pending or symbol in rev5_pending
-                or symbol in rev6_pending
+                or symbol in rev6_pending or symbol in rev3_pending
                 or symbol in rev3l_pending or symbol in rev4l_pending
                 or symbol in rev5l_pending or symbol in rev6l_pending):
             return False
@@ -4936,7 +5065,7 @@ def rev_symbol_busy(symbol, eng):
     return (symbol in all_open_symbols() or symbol in eng["pending"]
             or symbol in rev_pending or symbol in rev2_pending
             or symbol in rev4_pending or symbol in rev5_pending
-            or symbol in rev6_pending
+            or symbol in rev6_pending or symbol in rev3_pending
             or symbol in rev3l_pending or symbol in rev4l_pending
             or symbol in rev5l_pending or symbol in rev6l_pending
             or symbol in rev_claimed)
@@ -6006,6 +6135,14 @@ def rev5_loop():
     # crash-continuation descriptor REV_T5 is left in the file, unused, for reference.
     _rev_engine_loop(REV_T5B, lambda: rev5_auto_enabled, REV5_SCAN_SECONDS)
 
+
+def rev3_loop():
+    """T3 slot = 10-day-low breakdown short, bear-gated. See the REV_T3 block above."""
+    if not REV3_ENGINE_ENABLED:
+        print("[REV] Tight 3 disabled by env REV3_ENGINE_ENABLED=0 - loop idle")
+        return
+    _rev_engine_loop(REV_T3, lambda: rev3_auto_enabled, REV3_SCAN_SECONDS)
+
 # ==================== END TIGHT 1 (24h-reversion) ====================
 
 
@@ -6107,6 +6244,7 @@ if __name__ == "__main__":
     Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
     Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
     Thread(target=rev5_loop,                daemon=True).start()   # Tight 5 = crash-continuation SHORT (2026-08-30)
+    Thread(target=rev3_loop,                daemon=True).start()   # Tight 3 = 10d-low breakdown SHORT, bear-gated (2026-09-09)
     Thread(target=rev3l_loop,               daemon=True).start()   # long legs (2026-09-07)
     Thread(target=rev4l_loop,               daemon=True).start()
     Thread(target=rev5l_loop,               daemon=True).start()

@@ -5048,7 +5048,8 @@ REVL_MIN_QUOTE_VOL    = float(os.environ.get("REVL_MIN_QUOTE_VOL", 5_000_000))
 REVL_FRESH_SECONDS    = int(os.environ.get("REVL_FRESH_SECONDS", 6 * 3600))
 REVL_BREADTH_MIN      = float(os.environ.get("REVL_BREADTH_MIN", 0.50))
 REVL_GATE_TTL         = int(os.environ.get("REVL_GATE_TTL", 3600))
-REVL_BREADTH_WARM_N   = int(os.environ.get("REVL_BREADTH_WARM_N", 80))   # coins sampled to warm the breadth deque
+REVL_BREADTH_WARM_N   = int(os.environ.get("REVL_BREADTH_WARM_N", 45))   # coins sampled to warm the breadth deque
+REVL_BREADTH_BARS     = int(os.environ.get("REVL_BREADTH_BARS", 400))    # 4h bars per coin (~66 days); BingX caps a request at 1440
 
 # ---- 2026-09-09 shared long trail. CORRECTS the 21d/12% shipped on 2026-09-08, which was
 # picked WITHOUT a concurrency cap in the sim and is TRAIN-NEGATIVE once the cap is applied.
@@ -5080,40 +5081,66 @@ def _revl_ema(vals, span):
     return e
 
 
+def _revl_daily_from_4h(candles):
+    """Collapse 4h bars to one close per UTC day. 15m cannot serve this job: BingX
+    caps a klines request at 1,440 bars, which is only ~15 days of 15m but ~240 days
+    of 4h - and the EMA50 breadth test needs 60 daily closes."""
+    daily = {}
+    for x in candles or []:
+        t = _bar_ms(x); p = cl(x)
+        if t and p > 0:
+            daily[t // 86400000] = p
+    return [daily[k] for k in sorted(daily)]
+
+
 def _revl_warm_breadth():
     """Fill the breadth sample from the gate itself.
 
     2026-09-15 - THE DEADLOCK THIS EXISTS TO BREAK. The sample used to be fed only
     from _revl_common(), which returns early when the gate is not open. So: gate shut
-    -> long engines never scan -> sample never fills -> `br is None` -> gate shut.
-    Once closed for ANY reason (and it starts closed after every restart, since the
-    deque is in-memory) it could never reopen, whatever the market did. That is why
-    the long book and the RS pair sat idle while T4 traded through a rally.
-    Samples a bounded slice of the universe, at most once per gate refresh.
+    -> long engines never scan -> sample never fills -> gate shut. Once closed for ANY
+    reason (and it starts closed after every restart, since the deque is in memory) it
+    could never reopen, whatever the market did.
+
+    2026-09-15 SECOND PASS - the first version of this asked for 5,952 15m bars per
+    coin. BingX caps a klines request at 1,440, so every single call errored, nothing
+    was sampled ("breadth sample 0/40 after warm-up" on his /status) and 80 consecutive
+    errors tripped the exchange's 109429 rate-limit backoff. Now: 4h bars, a request
+    size that is actually legal, a small coin count, and a hard stop if the API is
+    already backed off.
     """
+    if api_backoff_active():
+        print("[LONG GATE] breadth warm-up skipped - API backoff active")
+        return 0
     try:
         syms = get_futures_symbols() or []
     except Exception as e:
         print(f"[LONG GATE] breadth warm-up could not list symbols: {e}")
         return 0
-    n = 0
+    n = errs = 0
     for sym in syms[:REVL_BREADTH_WARM_N]:
         if len(_revl_above_ema50) >= 60:
             break
+        if errs >= 5 or api_backoff_active():
+            print(f"[LONG GATE] breadth warm-up stopped early after {errs} errors")
+            break
         try:
-            candles = get_candles(sym, limit=96 * 62, interval="15m")
-            if not candles or len(candles) < 96 * 55:
+            candles = get_candles(sym, limit=REVL_BREADTH_BARS, interval="4h")
+            if not candles:
+                errs += 1
                 continue
-            bars, _ = _rev5b_daily(candles)
-            cls = [b[2] for b in bars]
-            if len(cls) < 55:
+            cls = _revl_daily_from_4h(candles)
+            if len(cls) < 60:
+                errs += 1
                 continue
             _revl_note_breadth(cls[-1] > _revl_ema(cls[-60:], 50))
             n += 1
         except Exception:
+            errs += 1
             continue
-        time.sleep(0.05)
-    print(f"[LONG GATE] breadth warm-up sampled {n} coins, deque now {len(_revl_above_ema50)}")
+        time.sleep(0.15)
+    print(f"[LONG GATE] breadth warm-up sampled {n} coins ({errs} errors), "
+          f"deque now {len(_revl_above_ema50)}")
     return n
 
 
@@ -5134,15 +5161,8 @@ def _revl_btc_daily_closes():
     except Exception as e:
         print(f"[LONG GATE] daily BTC fetch failed ({e}), falling back to 4h")
     try:
-        c = get_candles("BTC-USDT", limit=1400, interval="4h") or []
-        rows = [(_bar_ms(x), cl(x)) for x in c]
-        rows = [(t, p) for t, p in rows if t and p > 0]
-        if not rows:
-            return []
-        daily = {}
-        for t, p in rows:
-            daily[t // 86400000] = p          # last 4h close of each UTC day
-        return [daily[k] for k in sorted(daily)]
+        c = get_candles("BTC-USDT", limit=1440, interval="4h") or []
+        return _revl_daily_from_4h(c)
     except Exception as e:
         print(f"[LONG GATE] 4h BTC fallback failed: {e}")
         return []

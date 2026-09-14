@@ -1730,7 +1730,7 @@ def all_open_symbols():
     syms = set()
     for d in (t3_open_trades, t2_open_trades, t3s_open_trades, rev_open_trades,
               rev2_open_trades, rev4_open_trades, rev5_open_trades, rev6_open_trades,
-              rev3_open_trades,
+              rev3_open_trades, rev7l_open_trades, rev7s_open_trades,
               rev3l_open_trades, rev4l_open_trades, rev5l_open_trades, rev6l_open_trades):
         for t in d.values():
             s = t.get("symbol")
@@ -2233,7 +2233,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev3_auto_enabled
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev3_auto_enabled, rev7l_auto_enabled, rev7s_auto_enabled, ema_alert_auto
     global rev3l_auto_enabled, rev4l_auto_enabled, rev5l_auto_enabled, rev6l_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
@@ -2276,6 +2276,9 @@ def handle_telegram_commands():
                     else: _off.append("T2")
                     if REV3_ENGINE_ENABLED: rev3_auto_enabled = True; _on.append("T3")
                     else: _off.append("T3")
+                    if REV7_ENGINE_ENABLED:
+                        rev7l_auto_enabled = rev7s_auto_enabled = True; _on.append("T7")
+                    else: _off.append("T7")
                     if T3_ENGINE_ENABLED:   t3_scalp_auto_enabled = True; _on.append("T3-old")
                     if REV4_ENGINE_ENABLED: rev4_auto_enabled = True; _on.append("T4")
                     else: _off.append("T4")
@@ -2301,6 +2304,7 @@ def handle_telegram_commands():
                     rev5_auto_enabled = False
                     rev6_auto_enabled = False
                     rev3_auto_enabled = False
+                    rev7l_auto_enabled = rev7s_auto_enabled = False
                     rev3l_auto_enabled = rev4l_auto_enabled = False
                     rev5l_auto_enabled = rev6l_auto_enabled = False
                     send_tg("ALL ENGINES OFF: T1, T2, T3, T4, T5, T6 + LONG legs.\n"
@@ -2327,6 +2331,65 @@ def handle_telegram_commands():
                     rev_auto_enabled = False
                     send_tg("Tight 1 (24h-reversion) Auto-trade OFF.")
                 # ---- Tight 3 = S/R Sweep SHORT (bear engine): /t3_start /t3_stop ----
+                elif text == "/ema_alert":
+                    send_tg("Scanning daily EMA" + str(EMA_ALERT_SPAN) + " crosses, one moment...")
+                    try:
+                        _u, _d = _ema_alert_scan()
+                        send_tg(_ema_alert_message(_u, _d))
+                    except Exception as _e:
+                        send_tg("EMA alert scan failed: " + str(_e))
+                elif text == "/ema_alert_on":
+                    ema_alert_auto = True
+                    send_tg("Daily EMA" + str(EMA_ALERT_SPAN) + " alert ON - fires at " +
+                            f"{EMA_ALERT_HOUR_UTC:02d}:{EMA_ALERT_MINUTE:02d}" +
+                            " UTC (noon NZ, 1pm after daylight saving).")
+                elif text == "/ema_alert_off":
+                    ema_alert_auto = False
+                    send_tg("Daily EMA" + str(EMA_ALERT_SPAN) + " alert OFF. /ema_alert still works on demand.")
+                elif text == "/t7_start":
+                    if not REV7_ENGINE_ENABLED:
+                        send_tg("Tight 7 is disabled at build level (REV7_ENGINE_ENABLED=0).")
+                    else:
+                        rev7l_auto_enabled = rev7s_auto_enabled = True
+                        send_tg("Tight 7 (relative-strength leaders LONG + laggards SHORT) ON.")
+                elif text == "/t7_stop":
+                    rev7l_auto_enabled = rev7s_auto_enabled = False
+                    send_tg("Tight 7 Auto-trade OFF.")
+                elif text == "/t7_status":
+                    try:
+                        _g7 = revl_gate_open()
+                    except Exception:
+                        _g7 = None
+                    _lc = _rev7_rank.get("long_cut"); _sc = _rev7_rank.get("short_cut")
+                    send_tg("Tight 7 (relative strength vs BTC, " +
+                            str(REV7_RS_BARS * 15 // 60) + "h window)\n" +
+                            "LONG: " + ("ON" if rev7l_auto_enabled else "OFF") +
+                            " | Open " + str(len(rev7l_open_trades)) + "/" + str(REV7L_MAX_CONCURRENT) +
+                            " | Pending " + str(len(rev7l_pending)) + "\n" +
+                            "SHORT: " + ("ON" if rev7s_auto_enabled else "OFF") +
+                            " | Open " + str(len(rev7s_open_trades)) + "/" + str(REV7S_MAX_CONCURRENT) +
+                            " | Pending " + str(len(rev7s_pending)) + "\n" +
+                            "Rule: rank every liquid coin by (its " + str(REV7_RS_BARS * 15 // 60) +
+                            "h return - BTC's). Buy the top " + str(round(REV7_LONG_PCT * 100)) +
+                            "% but ONLY while BTC itself is DOWN; sell the bottom " +
+                            str(round(REV7_SHORT_PCT * 100)) + "% with ATR% >= " +
+                            str(round(REV7_SHORT_ATRP_MIN * 100, 1)) + "%\n" +
+                            "LONG exit: stop -" + str(round(REV7L_DSTOP_PCT * 100)) + "%, arm +" +
+                            str(round(REV7L_TRAIL_ARM * 100)) + "% then close on a " +
+                            str(round(REV7L_TRAIL_GIVE * 100, 1)) + "% give-back, else " +
+                            str(REV7L_HOLD_SECONDS // 3600) + "h\n" +
+                            "SHORT exit: stop +" + str(round(REV7S_DSTOP_PCT * 100)) + "%, arm +" +
+                            str(round(REV7S_TRAIL_ARM * 100)) + "% then close on a " +
+                            str(round(REV7S_TRAIL_GIVE * 100, 1)) + "% give-back, else " +
+                            str(REV7S_HOLD_SECONDS // 3600) + "h\n" +
+                            "Ranking: " + (("n=" + str(_rev7_rank.get("n", 0)) +
+                             " long_cut " + (f"{_lc:+.4f}" if _lc is not None else "n/a") +
+                             " short_cut " + (f"{_sc:+.4f}" if _sc is not None else "n/a") +
+                             " btc_down " + str(_rev7_rank.get("btc_down"))) if _lc is not None
+                             else "not built yet") + "\n" +
+                            "RALLY GATE: " + ("OPEN -> T7 armed, T4 stood down" if _g7 else
+                             ("SHUT -> T7 idle, T4 running" if _g7 is False else "UNREADABLE -> T7 idle")) +
+                            "\nA quiet T7 in a downtrend is the gate working, not a fault.")
                 elif text == "/t3_start":
                     # 2026-09-09: /t3_* now drives the NEW slot engine (10d-low breakdown
                     # short, bear-gated). The retired HTF retest engine keeps /t3old_*.
@@ -3589,6 +3652,8 @@ REV4_RISK_USDT        = REV4_NOTIONAL_USDT * REV4_DSTOP_PCT   # derived, do NOT 
 REV4_MAX_CONCURRENT   = int(os.environ.get("REV4_MAX_CONCURRENT", 60))
 REV4_MAX_MARGIN_USDT  = float(os.environ.get("REV4_MAX_MARGIN_USDT", 500))
 REV4_SCAN_SECONDS     = int(os.environ.get("REV4_SCAN_SECONDS", 300))
+# 2026-09-13: stand T4 down while the rally gate is open (see rev4_check_signal).
+REV4_RALLY_STANDDOWN  = os.environ.get("REV4_RALLY_STANDDOWN", "1") == "1"
 REV4_COOLDOWN_SECONDS = int(os.environ.get("REV4_COOLDOWN_SECONDS", 3600))    # dedup 1/coin/hour
 REV4_MAX_SYMBOLS      = int(os.environ.get("REV4_MAX_SYMBOLS", 600))
 
@@ -3681,6 +3746,25 @@ def rev4_check_signal(symbol, btc_ret, eng):
     volume * close, exactly as the backtest built it from the BingX CSV. Do NOT
     "simplify" this by moving the floor into the engine's min_quote_vol.
     """
+    # ---- 2026-09-13: T4 STANDS DOWN WHILE THE RALLY GATE IS OPEN ----
+    # Measured on both datasets: in the rally regime (revl_gate_open() True) T4's
+    # range-extreme short is a LOSER - 65.3 tr/wk, win 45.0%, -12.4 bps, about
+    # -$6.1/wk at $75 notional. That is exactly the run of 15+ consecutive stop-outs
+    # he sent (REZ, ILV, SAGA, GOAT, ARPA): T4 shorts the first leg of an individual
+    # coin pump and the coin runs another 10-25%.
+    # In the bear regime T4 is unchanged and is where its money comes from
+    # (147 tr/wk, +28.9 bps, ~+$31.9/wk).
+    # T7 takes over in the rally regime instead - and critically, T7's SHORT leg IS
+    # the same laggard signal that would otherwise have been "T4 rally mode", so
+    # halting T4 here is what stops the same coin being shorted twice.
+    # Fails OPEN on purpose: if the gate is unreadable revl_gate_open() already
+    # returns False, so T4 keeps trading rather than going silent.
+    if REV4_RALLY_STANDDOWN:
+        try:
+            if revl_gate_open():
+                return None
+        except Exception as ex:
+            print(f"[T4 STANDDOWN] gate unreadable, trading on: {ex}")
     win  = eng.get("pos_window", REV4_POS_WINDOW)
     # 120 bars = 30h, enough to always contain today's 05:00 UTC hour plus the rest of
     # the day, which the Asian-session filter needs.
@@ -4583,6 +4667,270 @@ REV_T3 = {
 }
 
 
+# ============================================================================
+# T7 - RELATIVE-STRENGTH PAIR (leader LONG + laggard SHORT), RALLY-GATED
+#
+# Every other engine in this bot scores a coin against ITSELF - its own range
+# position, its own ATR, its own return. T7 is the first that scores it against BTC:
+#     RS = coin's 4h return  -  BTC's 4h return
+# and then ranks every liquid coin cross-sectionally on that number each scan.
+#
+# WHY IT EXISTS: he sent 15+ consecutive T4 losses (REZ, ILV, SAGA, GOAT, ARPA), all
+# individual coin pumps in an alt-rally that T4 shorted and that then ran another
+# 10-25%. The bot had no engine that BUYS strength. This is that engine.
+#
+# ⭐ THE HORIZON IS THE WHOLE DISCOVERY - 4 HOURS, NOT 24. Same config, only the
+# lookback changes:  4h +24 bps/$42wk | 24h +10/$17 | 3d +2/$3 | 7d -2/-$3.
+# Leadership rotates within hours; a 24h or 7d lookback is already stale.
+#
+# MEASURED (Binance bull 2024-01..2025-07, 404 coins, 82wk, 20bps, $75 notional):
+#   LONG  RS4h top 5% + BTC 4h DOWN   27.9 tr/wk  win 60.5%  +163 bps  TRAIN +177 / TEST +144  DD -$230
+#   SHORT RS4h bottom 2% + ATR%>=1.2% 20.2 tr/wk  win 72.2%   +86 bps  TRAIN  +94 / TEST  +77  DD -$160
+# Controls both legs: side-flip a clean mirror (-120 long / -23 short), coin holdout
+# near-identical in both halves (+86/+90 and +85/+87), top-3 concentration 9% and 5%
+# across ~399 coins, both still positive at 50bps.
+#
+# ⚠️ THE BTC-DOWN FILTER ON THE LONG LEG IS COUNTER-INTUITIVE AND LOAD-BEARING.
+# A coin rising while BTC falls is genuinely, idiosyncratically strong. When BTC is
+# rising everything rises and "who is leading" carries no information - measured:
+# BTC-4h-UP gives win 49.2%, +16 bps, TEST -4, i.e. it breaks. Adding this filter
+# halves the trade count but buys +6 points of win, ~2x bps and half the drawdown.
+# Do NOT "improve" it by removing the filter to get more trades.
+# Also tested on the long leg and REJECTED: stacking 1h RS on 4h RS (marginal, DD
+# unchanged); volume-expansion confirmation (volx>=1.5/2/3 drops win to 52/50/48%
+# and kills TEST); requiring the coin above its own daily EMA40 (83% already are).
+#
+# ⚠️ THE GATE IS MANDATORY. Both legs run ONLY while revl_gate_open() is True.
+# On bear data the laggard short gives +4.8 bps, win 50.9%, TEST -17, 2/8 months,
+# negative at 50bps, top-3 = 52% of PnL - it falls apart completely. Mechanism: in a
+# rally money rotates OUT of laggards INTO leaders; in a bear everything falls
+# together so relative weakness carries no information.
+# The same gate stands T4 down (see rev4_check_signal), which is what stops T7-SHORT
+# and a "T4 rally mode" opening the same coin twice - they are the same signal.
+#
+# ⚠️ LIMITS to repeat whenever quoting this: bull dataset ONLY (the bear sample never
+# opens the gate, so no second-regime confirmation exists or can exist from this
+# data); both legs are effectively zero at 100bps; negative weeks are 32-52% even in
+# these tightened versions - judge by the month, not the week.
+#
+# SIZING: at $75 notional the pair is ~+$51/wk with ~-$390 combined drawdown, which
+# needs about a $2,000 account under his -30% rule. At a $200 account the notional
+# must come down to roughly $10 (long) and $53 (short) - see REV7L/REV7S_NOTIONAL.
+# ============================================================================
+REV7_ENGINE_ENABLED   = os.environ.get("REV7_ENGINE_ENABLED", "1") == "1"
+REV7_RS_BARS          = int(os.environ.get("REV7_RS_BARS", 16))        # 16 x 15m = 4h
+REV7_LONG_PCT         = float(os.environ.get("REV7_LONG_PCT", 0.05))   # top 5% by RS
+REV7_SHORT_PCT        = float(os.environ.get("REV7_SHORT_PCT", 0.02))  # bottom 2% by RS
+REV7_SHORT_ATRP_MIN   = float(os.environ.get("REV7_SHORT_ATRP_MIN", 0.012))
+REV7_BTC_DOWN_FOR_LONG = os.environ.get("REV7_BTC_DOWN_FOR_LONG", "1") == "1"
+REV7_MIN_QUOTE_VOL    = float(os.environ.get("REV7_MIN_QUOTE_VOL", 2_000_000))
+REV7_SCAN_SECONDS     = int(os.environ.get("REV7_SCAN_SECONDS", 900))
+REV7_RANK_TTL         = int(os.environ.get("REV7_RANK_TTL", 900))
+
+REV7L_DSTOP_PCT       = float(os.environ.get("REV7L_DSTOP_PCT", 0.20))
+REV7L_TRAIL_ARM       = float(os.environ.get("REV7L_TRAIL_ARM", 0.08))
+REV7L_TRAIL_GIVE      = float(os.environ.get("REV7L_TRAIL_GIVE", 0.01))
+REV7L_HOLD_SECONDS    = int(os.environ.get("REV7L_HOLD_SECONDS", 24 * 3600))
+REV7L_NOTIONAL_USDT   = float(os.environ.get("REV7L_NOTIONAL_USDT", 10))
+REV7L_LEVERAGE        = int(os.environ.get("REV7L_LEVERAGE", 3))       # 20% stop needs <=4x
+REV7L_MAX_CONCURRENT  = int(os.environ.get("REV7L_MAX_CONCURRENT", 30))
+
+REV7S_DSTOP_PCT       = float(os.environ.get("REV7S_DSTOP_PCT", 0.08))
+REV7S_TRAIL_ARM       = float(os.environ.get("REV7S_TRAIL_ARM", 0.03))
+REV7S_TRAIL_GIVE      = float(os.environ.get("REV7S_TRAIL_GIVE", 0.005))
+REV7S_HOLD_SECONDS    = int(os.environ.get("REV7S_HOLD_SECONDS", 6 * 3600))
+REV7S_NOTIONAL_USDT   = float(os.environ.get("REV7S_NOTIONAL_USDT", 50))
+REV7S_LEVERAGE        = int(os.environ.get("REV7S_LEVERAGE", 5))       # 8% stop
+REV7S_MAX_CONCURRENT  = int(os.environ.get("REV7S_MAX_CONCURRENT", 20))
+
+rev7l_open_trades = {}; rev7l_pending = {}; rev7l_last_fire = {}
+rev7s_open_trades = {}; rev7s_pending = {}; rev7s_last_fire = {}
+rev7l_auto_enabled = AUTO_RESUME_ON_START
+rev7s_auto_enabled = AUTO_RESUME_ON_START
+
+# The cross-sectional ranking is rebuilt once per REV7_RANK_TTL and shared by both
+# legs. Storing the CUTOFF values (not the symbol list) keeps it O(1) per symbol and
+# means a symbol that was not in the ranking sample simply does not trade this cycle.
+_rev7_rank = {"ts": 0, "long_cut": None, "short_cut": None, "btc_down": None, "n": 0}
+
+
+def _rev7_rs(symbol, bars=None):
+    """coin 4h return minus BTC 4h return, from CLOSED 15m bars. None if unavailable."""
+    bars = bars or REV7_RS_BARS
+    try:
+        c = get_candles(symbol, limit=bars + 2 + REV_CANDLE_BUFFER, interval="15m")
+        if not c:
+            return None
+        t = _bar_ms(c[-1])
+        if t and (t % 900000) != 0:
+            c = c[:-1]
+        closes = [cl(x) for x in c if cl(x) > 0]
+        if len(closes) < bars + 1:
+            return None
+        coin = closes[-1] / closes[-1 - bars] - 1.0
+        b = _rev7_btc_ret(bars)
+        if b is None:
+            return None
+        return coin - b
+    except Exception:
+        return None
+
+
+_rev7_btc = {"ts": 0, "ret": None, "bars": 0}
+
+
+def _rev7_btc_ret(bars):
+    """BTC's own 4h return, cached briefly so 400 symbols don't refetch it."""
+    now = time.time()
+    if now - _rev7_btc["ts"] < 120 and _rev7_btc["bars"] == bars:
+        return _rev7_btc["ret"]
+    try:
+        c = get_candles("BTC-USDT", limit=bars + 2 + REV_CANDLE_BUFFER, interval="15m")
+        if not c:
+            return None
+        t = _bar_ms(c[-1])
+        if t and (t % 900000) != 0:
+            c = c[:-1]
+        closes = [cl(x) for x in c if cl(x) > 0]
+        if len(closes) < bars + 1:
+            return None
+        r = closes[-1] / closes[-1 - bars] - 1.0
+        _rev7_btc.update({"ts": now, "ret": r, "bars": bars})
+        return r
+    except Exception as e:
+        print(f"[T7 BTC] {e}")
+        return None
+
+
+def rev7_refresh_ranking():
+    """Rebuild the cross-sectional RS cutoffs. Cheap: one pass over the liquid set."""
+    now = time.time()
+    if now - _rev7_rank["ts"] < REV7_RANK_TTL:
+        return
+    _rev7_rank["ts"] = now
+    try:
+        syms = get_liquid_symbols(get_futures_symbols(), min_quote_vol=REV7_MIN_QUOTE_VOL,
+                                 max_n=REV_MAX_SYMBOLS,
+                                 exclude_top_n=REV_EXCLUDE_TOP_N)
+        vals = []
+        for sym in syms:
+            v = _rev7_rs(sym)
+            if v is not None:
+                vals.append(v)
+        if len(vals) < 40:
+            # too thin to rank - blank the cutoffs so neither leg fires this cycle
+            _rev7_rank.update({"long_cut": None, "short_cut": None, "n": len(vals)})
+            print(f"[T7 RANK] only {len(vals)} symbols priced - standing down")
+            return
+        vals.sort()
+        n = len(vals)
+        _rev7_rank["short_cut"] = vals[max(0, int(n * REV7_SHORT_PCT) - 1)]
+        _rev7_rank["long_cut"] = vals[min(n - 1, int(n * (1.0 - REV7_LONG_PCT)))]
+        _rev7_rank["n"] = n
+        b = _rev7_btc_ret(REV7_RS_BARS)
+        _rev7_rank["btc_down"] = (b is not None and b <= 0)
+        print(f"[T7 RANK] n={n} long_cut={_rev7_rank['long_cut']:+.4f} "
+              f"short_cut={_rev7_rank['short_cut']:+.4f} btc_down={_rev7_rank['btc_down']}")
+    except Exception as e:
+        _rev7_rank.update({"long_cut": None, "short_cut": None})
+        print(f"[T7 RANK] failed, standing down: {e}")
+
+
+def _rev7_common(symbol, eng):
+    """Shared gate for both legs. Returns the coin's RS, or None to skip."""
+    if not revl_gate_open():
+        return None
+    rev7_refresh_ranking()
+    if _rev7_rank["long_cut"] is None or _rev7_rank["short_cut"] is None:
+        return None
+    return _rev7_rs(symbol)
+
+
+def rev7l_check_signal(symbol, btc_ret, eng):
+    """T7 LONG - buy the relative-strength leaders while BTC itself is falling."""
+    rs = _rev7_common(symbol, eng)
+    if rs is None or rs < _rev7_rank["long_cut"]:
+        return None
+    if REV7_BTC_DOWN_FOR_LONG and not _rev7_rank.get("btc_down"):
+        return None
+    candles = get_candles(symbol, limit=8 + REV_CANDLE_BUFFER, interval="15m")
+    if not candles:
+        return None
+    t = _bar_ms(candles[-1])
+    if t and (t % 900000) != 0:
+        candles = candles[:-1]
+    px = cl(candles[-1])
+    if px <= 0:
+        return None
+    sl = px * (1.0 - REV7L_DSTOP_PCT)
+    tp = px * (1.0 + REV7L_DSTOP_PCT * 3.0)    # far; the trail/timer is the real exit
+    print(f"[T7 LONG] {symbol} BUY rs4h={rs:+.4f} cut={_rev7_rank['long_cut']:+.4f} "
+          f"close={px} sl={round(sl,8)}")
+    return ("BUY", px, sl, tp)
+
+
+def rev7s_check_signal(symbol, btc_ret, eng):
+    """T7 SHORT - sell the relative-strength laggards in a rally."""
+    rs = _rev7_common(symbol, eng)
+    if rs is None or rs > _rev7_rank["short_cut"]:
+        return None
+    need = 40 + REV_CANDLE_BUFFER
+    candles = get_candles(symbol, limit=need, interval="15m")
+    if not candles:
+        return None
+    t = _bar_ms(candles[-1])
+    if t and (t % 900000) != 0:
+        candles = candles[:-1]
+    if len(candles) < 20:
+        return None
+    px = cl(candles[-1])
+    if px <= 0:
+        return None
+    atrs = atr_series(candles, REV_ATR_LEN)
+    if not atrs or atrs[-1] is None or atrs[-1] <= 0:
+        return None
+    if (atrs[-1] / px) < REV7_SHORT_ATRP_MIN:
+        return None
+    sl = px * (1.0 + REV7S_DSTOP_PCT)
+    tp = px * (1.0 - REV7S_DSTOP_PCT * 3.0)
+    print(f"[T7 SHORT] {symbol} SELL rs4h={rs:+.4f} cut={_rev7_rank['short_cut']:+.4f} "
+          f"atrp={atrs[-1]/px:.4f} close={px} sl={round(sl,8)}")
+    return ("SELL", px, sl, tp)
+
+
+def _rev7_desc(tag, name, fn, side, dstop, arm, give, hold, notional, lev, cap,
+               open_b, pend_b, fire_b):
+    return {
+        "name": name, "tag": tag, "signal_fn": fn, "side_only": side,
+        "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0,
+        "atrp_max": 0.0, "atrp_min": 0.0,
+        "pos_window": 0, "range_window": 0, "extreme": 0.0,
+        "regime_min_btc": None, "range_regime": None,
+        "cvd_filter": False, "flow_gate": False,
+        "long_sl_atr": 0.0, "long_tp_r": 0.0, "short_sl_atr": 0.0, "short_tp_r": 0.0,
+        "dstop_pct": dstop, "trail_arm": arm, "trail_give": give,
+        "sl_cap_pct": max(dstop * 1.5, REV_SL_CAP_PCT),
+        "risk_usdt": notional * dstop, "leverage": lev,
+        "max_concurrent": cap,
+        "max_margin": float(os.environ.get("REV7_MAX_MARGIN_USDT", 200)),
+        "cooldown_s": int(os.environ.get("REV7_COOLDOWN_SECONDS", 6 * 3600)),
+        "hold_seconds": hold,
+        "min_quote_vol": REV7_MIN_QUOTE_VOL,
+        "max_symbols": int(os.environ.get("REV7_MAX_SYMBOLS", 600)),
+        "open": open_b, "pending": pend_b, "last_fire": fire_b,
+    }
+
+
+REV_T7L = _rev7_desc("t7l", "TIGHT 7 LONG", rev7l_check_signal, "BUY",
+                     REV7L_DSTOP_PCT, REV7L_TRAIL_ARM, REV7L_TRAIL_GIVE,
+                     REV7L_HOLD_SECONDS, REV7L_NOTIONAL_USDT, REV7L_LEVERAGE,
+                     REV7L_MAX_CONCURRENT, rev7l_open_trades, rev7l_pending, rev7l_last_fire)
+REV_T7S = _rev7_desc("t7s", "TIGHT 7 SHORT", rev7s_check_signal, "SELL",
+                     REV7S_DSTOP_PCT, REV7S_TRAIL_ARM, REV7S_TRAIL_GIVE,
+                     REV7S_HOLD_SECONDS, REV7S_NOTIONAL_USDT, REV7S_LEVERAGE,
+                     REV7S_MAX_CONCURRENT, rev7s_open_trades, rev7s_pending, rev7s_last_fire)
+
+
 REV_T5B = {
     "name": "TIGHT 5", "tag": "t5",
     "signal_fn": rev5b_check_signal,
@@ -5048,6 +5396,7 @@ def rev_try_claim(symbol):
                 or symbol in rev_pending or symbol in rev2_pending
                 or symbol in rev4_pending or symbol in rev5_pending
                 or symbol in rev6_pending or symbol in rev3_pending
+                or symbol in rev7l_pending or symbol in rev7s_pending
                 or symbol in rev3l_pending or symbol in rev4l_pending
                 or symbol in rev5l_pending or symbol in rev6l_pending):
             return False
@@ -5066,6 +5415,7 @@ def rev_symbol_busy(symbol, eng):
             or symbol in rev_pending or symbol in rev2_pending
             or symbol in rev4_pending or symbol in rev5_pending
             or symbol in rev6_pending or symbol in rev3_pending
+            or symbol in rev7l_pending or symbol in rev7s_pending
             or symbol in rev3l_pending or symbol in rev4l_pending
             or symbol in rev5l_pending or symbol in rev6l_pending
             or symbol in rev_claimed)
@@ -6136,6 +6486,128 @@ def rev5_loop():
     _rev_engine_loop(REV_T5B, lambda: rev5_auto_enabled, REV5_SCAN_SECONDS)
 
 
+# ============================================================================
+# /ema_alert - DAILY EMA40 CROSS NOTIFIER (2026-09-13). NOTIFICATION ONLY, NO TRADING.
+#
+# His own chart observation: on the 1d timeframe, when a candle closes above the EMA40
+# it often keeps going, and below it often keeps falling. He asked for the crossing
+# coins to be pushed to him so he can look at them himself.
+#
+# ⚠️ THIS DELIBERATELY PLACES NO TRADES, and that is the honest reason why. Backtested
+# as a mechanical rule across 459 coins it does NOT carry an edge on its own - raw
+# forward returns after a bullish cross are positive only 39-47% of the time at
+# +5/+10/+30 days, and splitting by how decisively price broke the line or how strong
+# the candle was does not change that. With a trailing exit it DOES work on the
+# 2024-25 bull data (82 tr/wk, +33 bps, win 50.9%, TRAIN +22 / TEST +44, side-flip
+# -71, coin holdout +40/+26) but it COLLAPSES on the 2025-26 bear data (-29 bps,
+# win 41%, TRAIN -87), and four separate regime filters failed to separate the two
+# (market breadth gate, BTC-uptrend-only, the coin's own EMA100, and an alt-season
+# proxy - the last one came out backwards). The real switch is probably BTC dominance,
+# which cannot be built from these futures files. Until that exists this stays a
+# notifier and he applies his own judgement - which is what he is actually doing live.
+#
+# COST: one scan a day, ~43 daily closes per coin held only inside the function.
+# Daily candles close 00:00 UTC = noon NZ (1pm once NZ daylight saving starts).
+# ============================================================================
+EMA_ALERT_ENABLED   = os.environ.get("EMA_ALERT_ENABLED", "1") == "1"
+EMA_ALERT_SPAN      = int(os.environ.get("EMA_ALERT_SPAN", 40))
+EMA_ALERT_MIN_QV    = float(os.environ.get("EMA_ALERT_MIN_QV", 5_000_000))
+EMA_ALERT_HOUR_UTC  = int(os.environ.get("EMA_ALERT_HOUR_UTC", 0))      # run just after the daily close
+EMA_ALERT_MINUTE    = int(os.environ.get("EMA_ALERT_MINUTE", 8))
+EMA_ALERT_MAX_LIST  = int(os.environ.get("EMA_ALERT_MAX_LIST", 40))
+ema_alert_auto = True
+_ema_alert_last_run = {"day": None}
+
+
+def _ema_alert_scan():
+    """Return (ups, downs) - coins whose last CLOSED daily candle crossed the EMA."""
+    ups, downs = [], []
+    span = EMA_ALERT_SPAN
+    need_days = span + 5
+    try:
+        syms = get_liquid_symbols(get_futures_symbols(),
+                                  min_quote_vol=EMA_ALERT_MIN_QV,
+                                  max_n=REV_MAX_SYMBOLS, exclude_top_n=0)
+    except Exception as e:
+        print(f"[EMA ALERT] symbol list failed: {e}")
+        return ups, downs
+    for sym in syms:
+        try:
+            series = _revl_daily_series(sym, {}, need_days)
+            if not series:
+                continue
+            closes = series[2]
+            if len(closes) < span + 2:
+                continue
+            e = _revl_ema(closes[-(span + 2):], span)
+            e_prev = _revl_ema(closes[-(span + 3):-1], span)
+            if e is None or e_prev is None:
+                continue
+            c_now, c_prev = closes[-1], closes[-2]
+            if c_now > e and c_prev <= e_prev:
+                ups.append((sym, c_now, e))
+            elif c_now < e and c_prev >= e_prev:
+                downs.append((sym, c_now, e))
+        except Exception:
+            continue
+        time.sleep(0.05)
+    return ups, downs
+
+
+def _ema_alert_message(ups, downs):
+    def fmt(rows):
+        out = []
+        for sym, c, e in rows[:EMA_ALERT_MAX_LIST]:
+            pct = (c / e - 1.0) * 100.0 if e else 0.0
+            out.append(f"{sym}  {c:g}  ({pct:+.1f}% vs EMA{EMA_ALERT_SPAN})")
+        if len(rows) > EMA_ALERT_MAX_LIST:
+            out.append(f"...and {len(rows) - EMA_ALERT_MAX_LIST} more")
+        return "\n".join(out) if out else "none"
+    return ("DAILY EMA" + str(EMA_ALERT_SPAN) + " CROSSES\n"
+            "-------------------------------\n"
+            "CLOSED ABOVE (bullish) - " + str(len(ups)) + "\n" + fmt(ups) + "\n\n"
+            "CLOSED BELOW (bearish) - " + str(len(downs)) + "\n" + fmt(downs) + "\n"
+            "-------------------------------\n"
+            "Notification only - no trades are placed from this.")
+
+
+def ema_alert_loop():
+    """Fire once per UTC day shortly after the daily candle closes."""
+    if not EMA_ALERT_ENABLED:
+        print("[EMA ALERT] disabled by env EMA_ALERT_ENABLED=0")
+        return
+    print(f"EMA{EMA_ALERT_SPAN} daily-cross notifier started - fires at "
+          f"{EMA_ALERT_HOUR_UTC:02d}:{EMA_ALERT_MINUTE:02d} UTC")
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            key = now.strftime("%Y-%m-%d")
+            due = (now.hour == EMA_ALERT_HOUR_UTC and now.minute >= EMA_ALERT_MINUTE)
+            if ema_alert_auto and due and _ema_alert_last_run["day"] != key:
+                _ema_alert_last_run["day"] = key
+                ups, downs = _ema_alert_scan()
+                send_tg(_ema_alert_message(ups, downs))
+                print(f"[EMA ALERT] sent - {len(ups)} up, {len(downs)} down")
+        except Exception as e:
+            print(f"[EMA ALERT LOOP] {e}")
+        time.sleep(60)
+
+
+def rev7l_loop():
+    """T7 LONG - relative-strength leaders, rally-gated. See the REV_T7L block."""
+    if not REV7_ENGINE_ENABLED:
+        print("[REV] Tight 7 disabled by env REV7_ENGINE_ENABLED=0 - loop idle")
+        return
+    _rev_engine_loop(REV_T7L, lambda: rev7l_auto_enabled, REV7_SCAN_SECONDS)
+
+
+def rev7s_loop():
+    """T7 SHORT - relative-strength laggards, rally-gated."""
+    if not REV7_ENGINE_ENABLED:
+        return
+    _rev_engine_loop(REV_T7S, lambda: rev7s_auto_enabled, REV7_SCAN_SECONDS)
+
+
 def rev3_loop():
     """T3 slot = 10-day-low breakdown short, bear-gated. See the REV_T3 block above."""
     if not REV3_ENGINE_ENABLED:
@@ -6245,6 +6717,9 @@ if __name__ == "__main__":
     Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
     Thread(target=rev5_loop,                daemon=True).start()   # Tight 5 = crash-continuation SHORT (2026-08-30)
     Thread(target=rev3_loop,                daemon=True).start()   # Tight 3 = 10d-low breakdown SHORT, bear-gated (2026-09-09)
+    Thread(target=ema_alert_loop,           daemon=True).start()   # daily EMA40 cross notifier (2026-09-13)
+    Thread(target=rev7l_loop,               daemon=True).start()   # Tight 7 LONG  = RS leaders, rally-gated (2026-09-13)
+    Thread(target=rev7s_loop,               daemon=True).start()   # Tight 7 SHORT = RS laggards, rally-gated (2026-09-13)
     Thread(target=rev3l_loop,               daemon=True).start()   # long legs (2026-09-07)
     Thread(target=rev4l_loop,               daemon=True).start()
     Thread(target=rev5l_loop,               daemon=True).start()

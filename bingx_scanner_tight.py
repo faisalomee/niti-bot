@@ -2218,10 +2218,15 @@ def trailing_loop():
 def _t7_gate_text():
     """One-line gate state for /status. Never raises - /status must always render."""
     try:
-        return ("OPEN -> T7 armed, T4 stood down" if revl_gate_open()
-                else "SHUT -> T7 idle, T4 running")
+        st = revl_gate_state()
+        why = _revl_gate.get("reason", "")
+        if st == "OPEN":
+            return f"OPEN -> T7 armed, T4 stood down ({why})"
+        if st == "SHUT":
+            return f"SHUT -> T7 idle, T4 running ({why})"
+        return f"UNKNOWN -> T7 idle AND T4 stood down ({why})"
     except Exception as e:
-        return f"unreadable ({e}) -> T7 idle, T4 running"
+        return f"unreadable ({e}) -> T7 idle AND T4 stood down"
 
 
 def _regime_line():
@@ -2366,7 +2371,7 @@ def handle_telegram_commands():
                     send_tg("Tight 7 Auto-trade OFF.")
                 elif text == "/t7_status":
                     try:
-                        _g7 = revl_gate_open()
+                        _g7 = revl_gate_state()
                     except Exception:
                         _g7 = None
                     _lc = _rev7_rank.get("long_cut"); _sc = _rev7_rank.get("short_cut")
@@ -2396,8 +2401,7 @@ def handle_telegram_commands():
                              " short_cut " + (f"{_sc:+.4f}" if _sc is not None else "n/a") +
                              " btc_down " + str(_rev7_rank.get("btc_down"))) if _lc is not None
                              else "not built yet") + "\n" +
-                            "RALLY GATE: " + ("OPEN -> T7 armed, T4 stood down" if _g7 else
-                             ("SHUT -> T7 idle, T4 running" if _g7 is False else "UNREADABLE -> T7 idle")) +
+                            "RALLY GATE: " + (str(_g7) + " (" + str(_revl_gate.get("reason", "")) + ")") +
                             "\nA quiet T7 in a downtrend is the gate working, not a fault.")
                 elif text == "/t3_start":
                     # 2026-09-09: /t3_* now drives the NEW slot engine (10d-low breakdown
@@ -3783,11 +3787,15 @@ def rev4_check_signal(symbol, btc_ret, eng):
     # Fails OPEN on purpose: if the gate is unreadable revl_gate_open() already
     # returns False, so T4 keeps trading rather than going silent.
     if REV4_RALLY_STANDDOWN:
+        # 2026-09-15: was "stand down only when the gate reads OPEN", so an unreadable
+        # gate let T4 short all day through a rally - the live symptom behind this fix.
+        # T4 now needs a CONFIRMED non-rally before it takes anything.
         try:
-            if revl_gate_open():
+            if not revl_gate_shut():
                 return None
         except Exception as ex:
-            print(f"[T4 STANDDOWN] gate unreadable, trading on: {ex}")
+            print(f"[T4 STANDDOWN] gate unreadable, standing down: {ex}")
+            return None
     win  = eng.get("pos_window", REV4_POS_WINDOW)
     # 120 bars = 30h, enough to always contain today's 05:00 UTC hour plus the rest of
     # the day, which the Asian-session filter needs.
@@ -4652,11 +4660,11 @@ REV3_SCAN_SECONDS     = int(os.environ.get("REV3_SCAN_SECONDS", 900))
 def rev3_check_signal(symbol, btc_ret, eng):
     """T3 = the T5/S1 rule at a 10-day window, and only while the long gate is SHUT."""
     if REV3_BEAR_GATE:
+        # 2026-09-15: needs a CONFIRMED non-rally, not merely "not OPEN".
         try:
-            if revl_gate_open():
+            if not revl_gate_shut():
                 return None
         except Exception as e:
-            # gate unreadable -> do NOT trade. Same fail-closed policy the long side uses.
             print(f"[T3 GATE] unreadable, skipping: {e}")
             return None
     return rev5b_check_signal(symbol, btc_ret, eng)
@@ -5040,6 +5048,7 @@ REVL_MIN_QUOTE_VOL    = float(os.environ.get("REVL_MIN_QUOTE_VOL", 5_000_000))
 REVL_FRESH_SECONDS    = int(os.environ.get("REVL_FRESH_SECONDS", 6 * 3600))
 REVL_BREADTH_MIN      = float(os.environ.get("REVL_BREADTH_MIN", 0.50))
 REVL_GATE_TTL         = int(os.environ.get("REVL_GATE_TTL", 3600))
+REVL_BREADTH_WARM_N   = int(os.environ.get("REVL_BREADTH_WARM_N", 80))   # coins sampled to warm the breadth deque
 
 # ---- 2026-09-09 shared long trail. CORRECTS the 21d/12% shipped on 2026-09-08, which was
 # picked WITHOUT a concurrency cap in the sim and is TRAIN-NEGATIVE once the cap is applied.
@@ -5054,7 +5063,8 @@ REVL_TRAIL_ARM      = float(os.environ.get("REVL_TRAIL_ARM", 0.15))
 REVL_TRAIL_GIVE     = float(os.environ.get("REVL_TRAIL_GIVE", 0.20))
 
 # market-wide long gate, recomputed at most once an hour
-_revl_gate = {"open": False, "ts": 0, "breadth": None, "btc_up": None}
+_revl_gate = {"open": False, "state": "UNKNOWN", "reason": "not evaluated yet",
+               "ts": 0, "breadth": None, "btc_up": None}
 # rolling cross-sectional samples, filled by the coins these engines already scan
 _revl_above_ema50 = deque(maxlen=400)
 
@@ -5070,36 +5080,138 @@ def _revl_ema(vals, span):
     return e
 
 
-def revl_gate_open():
-    """True when the market-wide long gate is open.
+def _revl_warm_breadth():
+    """Fill the breadth sample from the gate itself.
 
-    BTC above its EMA50 with EMA50 above EMA200 (daily), AND more than
-    REVL_BREADTH_MIN of recently scanned coins above their own EMA50.
-    Cached for REVL_GATE_TTL so every engine does not refetch BTC.
+    2026-09-15 - THE DEADLOCK THIS EXISTS TO BREAK. The sample used to be fed only
+    from _revl_common(), which returns early when the gate is not open. So: gate shut
+    -> long engines never scan -> sample never fills -> `br is None` -> gate shut.
+    Once closed for ANY reason (and it starts closed after every restart, since the
+    deque is in-memory) it could never reopen, whatever the market did. That is why
+    the long book and the RS pair sat idle while T4 traded through a rally.
+    Samples a bounded slice of the universe, at most once per gate refresh.
+    """
+    try:
+        syms = get_futures_symbols() or []
+    except Exception as e:
+        print(f"[LONG GATE] breadth warm-up could not list symbols: {e}")
+        return 0
+    n = 0
+    for sym in syms[:REVL_BREADTH_WARM_N]:
+        if len(_revl_above_ema50) >= 60:
+            break
+        try:
+            candles = get_candles(sym, limit=96 * 62, interval="15m")
+            if not candles or len(candles) < 96 * 55:
+                continue
+            bars, _ = _rev5b_daily(candles)
+            cls = [b[2] for b in bars]
+            if len(cls) < 55:
+                continue
+            _revl_note_breadth(cls[-1] > _revl_ema(cls[-60:], 50))
+            n += 1
+        except Exception:
+            continue
+        time.sleep(0.05)
+    print(f"[LONG GATE] breadth warm-up sampled {n} coins, deque now {len(_revl_above_ema50)}")
+    return n
+
+
+def _revl_btc_daily_closes():
+    """Daily BTC closes for the EMA50/EMA200 test, with a fallback.
+
+    interval="1d" is asked for first. If it comes back thin - which is what the two
+    silent gate failures looked like - the series is rebuilt from 4h bars, the same
+    trick _revl_daily_series already uses with 15m. Returns [] if neither works, and
+    the caller then reports UNKNOWN rather than pretending the answer is "no rally".
+    """
+    try:
+        c = get_candles("BTC-USDT", limit=480, interval="1d") or []
+        closes = [cl(x) for x in c if cl(x) > 0]
+        if len(closes) >= 210:
+            return closes
+        print(f"[LONG GATE] daily BTC klines thin ({len(closes)}), falling back to 4h")
+    except Exception as e:
+        print(f"[LONG GATE] daily BTC fetch failed ({e}), falling back to 4h")
+    try:
+        c = get_candles("BTC-USDT", limit=1400, interval="4h") or []
+        rows = [(_bar_ms(x), cl(x)) for x in c]
+        rows = [(t, p) for t, p in rows if t and p > 0]
+        if not rows:
+            return []
+        daily = {}
+        for t, p in rows:
+            daily[t // 86400000] = p          # last 4h close of each UTC day
+        return [daily[k] for k in sorted(daily)]
+    except Exception as e:
+        print(f"[LONG GATE] 4h BTC fallback failed: {e}")
+        return []
+
+
+def revl_gate_state():
+    """Three-state market gate: "OPEN" / "SHUT" / "UNKNOWN".
+
+    2026-09-15 FIX. This used to return a bare bool, and False meant BOTH "no rally"
+    and "could not read the market". That single value was consumed in opposite
+    directions:
+        * long book and the RS pair trade only when True  -> they went idle
+        * T4 stands down only when True                   -> it traded flat out
+    So an unreadable gate gave the worst possible pairing - every long engine asleep
+    while the range-extreme short ran unchecked through a rally. Splitting UNKNOWN
+    out of SHUT is the fix; UNKNOWN now means nobody trades.
+
+    OPEN    = BTC above daily EMA50, EMA50 above EMA200, AND breadth > REVL_BREADTH_MIN
+    SHUT    = that test was evaluated and came out false (a real non-rally reading)
+    UNKNOWN = it could not be evaluated (BTC series unavailable, breadth not warm)
+    Every UNKNOWN path logs its reason; two of the three used to be silent.
     """
     now = time.time()
     if now - _revl_gate["ts"] < REVL_GATE_TTL:
-        return _revl_gate["open"]
+        return _revl_gate["state"]
     _revl_gate["ts"] = now
+
+    def _set(state, reason=""):
+        _revl_gate["state"] = state
+        _revl_gate["open"] = (state == "OPEN")
+        _revl_gate["reason"] = reason
+        if state == "UNKNOWN":
+            print(f"[LONG GATE] UNKNOWN - {reason} (T4 and T7 both stand down)")
+        else:
+            print(f"[LONG GATE] {state} - {reason}")
+        return state
+
+    closes = _revl_btc_daily_closes()
+    if len(closes) < 210:
+        return _set("UNKNOWN", f"BTC daily series thin: {len(closes)}/210")
     try:
-        c = get_candles("BTC-USDT", limit=96 * 230 // 96 + 250, interval="1d") or []
-        closes = [cl(x) for x in c if cl(x) > 0]
-        if len(closes) < 210:
-            # daily interval unsupported or thin - fail CLOSED, never guess the gate open
-            _revl_gate["open"] = False
-            return False
         e50 = _revl_ema(closes[-210:], 50); e200 = _revl_ema(closes[-210:], 200)
         btc_up = closes[-1] > e50 and e50 > e200
     except Exception as e:
-        print(f"[LONG GATE] btc fetch failed, gate stays closed: {e}")
-        _revl_gate["open"] = False
-        return False
-    br = None
-    if len(_revl_above_ema50) >= 40:
-        br = sum(_revl_above_ema50) / len(_revl_above_ema50)
-    _revl_gate["breadth"] = br; _revl_gate["btc_up"] = btc_up
-    _revl_gate["open"] = bool(btc_up and br is not None and br > REVL_BREADTH_MIN)
-    return _revl_gate["open"]
+        return _set("UNKNOWN", f"BTC ema failed: {e}")
+
+    if len(_revl_above_ema50) < 40:
+        _revl_warm_breadth()
+    if len(_revl_above_ema50) < 40:
+        _revl_gate["btc_up"] = btc_up
+        return _set("UNKNOWN", f"breadth sample {len(_revl_above_ema50)}/40 after warm-up")
+
+    br = sum(_revl_above_ema50) / len(_revl_above_ema50)
+    _revl_gate["breadth"] = br
+    _revl_gate["btc_up"] = btc_up
+    if btc_up and br > REVL_BREADTH_MIN:
+        return _set("OPEN", f"btc_up=1 breadth={br:.2f}")
+    return _set("SHUT", f"btc_up={int(btc_up)} breadth={br:.2f}")
+
+
+def revl_gate_open():
+    """True ONLY on a confirmed rally. UNKNOWN is not a rally."""
+    return revl_gate_state() == "OPEN"
+
+
+def revl_gate_shut():
+    """True ONLY on a confirmed non-rally. UNKNOWN is NOT shut, so anything that
+    keys off this stands down instead of guessing the market is falling."""
+    return revl_gate_state() == "SHUT"
 
 
 def _revl_daily_series(symbol, eng, need_days):

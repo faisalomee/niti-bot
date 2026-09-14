@@ -2215,6 +2215,15 @@ def trailing_loop():
 
 
 # ==================== TELEGRAM COMMANDS ====================
+def _t7_gate_text():
+    """One-line gate state for /status. Never raises - /status must always render."""
+    try:
+        return ("OPEN -> T7 armed, T4 stood down" if revl_gate_open()
+                else "SHUT -> T7 idle, T4 running")
+    except Exception as e:
+        return f"unreadable ({e}) -> T7 idle, T4 running"
+
+
 def _regime_line():
     """One-line summary of which of the T3/T4 pair the current BTC regime has armed.
     2026-08-28: they deliberately cover opposite regimes, so exactly one should be
@@ -2620,6 +2629,20 @@ def handle_telegram_commands():
                         " | ATR%>=" + str(round(REV6_ATRP_MIN * 100, 2)) + "% pos" +
                         str(REV6_POS_WINDOW * 15 // 60) + "h TP " + str(REV6_TP_R) +
                         "R | risk $" + str(REV6_RISK_USDT) + "\n" +
+                        # 2026-09-13: T7 row. Both legs share one line because they are
+                        # one engine (leaders long / laggards short) behind one gate.
+                        "Tight 7 (rel-strength vs BTC, " + str(REV7_RS_BARS * 15 // 60) +
+                        "h): LONG " + ("ON" if rev7l_auto_enabled else "OFF") +
+                        " " + str(len(rev7l_open_trades)) + "/" + str(REV7L_MAX_CONCURRENT) +
+                        " | SHORT " + ("ON" if rev7s_auto_enabled else "OFF") +
+                        " " + str(len(rev7s_open_trades)) + "/" + str(REV7S_MAX_CONCURRENT) +
+                        " | top " + str(round(REV7_LONG_PCT * 100)) + "% / bottom " +
+                        str(round(REV7_SHORT_PCT * 100)) + "% | $" +
+                        f"{REV7L_NOTIONAL_USDT:,.0f}" + "/$" + f"{REV7S_NOTIONAL_USDT:,.0f}" +
+                        " notional\n" +
+                        "Rally gate: " + _t7_gate_text() + "\n" +
+                        "EMA" + str(EMA_ALERT_SPAN) + " daily alert: " +
+                        ("ON" if ema_alert_auto else "OFF") + " (notify only, no trades)\n" +
                         _regime_line() + backoff
                     )
         except Exception as e:

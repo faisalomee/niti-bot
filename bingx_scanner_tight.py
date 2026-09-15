@@ -610,7 +610,7 @@ def resolve_exit(trade, side, entry_fill):
     result, exit_px = "closed", 0.0
     if tp_px > 0 and sl_px > 0:
         # both report a fill: trust whichever is closer to the recorded target
-        d_tp = abs(tp_px - float(trade.get("tp", tp_px)))
+        d_tp = abs(tp_px - float(trade.get("tp") or tp_px))   # "tp" is None for no-TP engines
         d_sl = abs(sl_px - float(trade.get("sl", sl_px)))
         result, exit_px = ("TP", tp_px) if d_tp <= d_sl else ("SL", sl_px)
     elif tp_px > 0:
@@ -6243,7 +6243,23 @@ def rev_track_pending(eng):
             # entry and every position closed at breakeven within minutes.
             _tpm = eng.get("tp_mult")
             _ds  = eng.get("dstop_pct")
-            if _tpm and _ds:
+            _tpr = eng["long_tp_r"] if p["side"] == "BUY" else eng["short_tp_r"]
+            # ---- 2026-09-15 BUGFIX, THE SAME DEFECT AS 2026-09-01 BUT IN EIGHT MORE ENGINES.
+            # An engine whose design has NO fixed take-profit (exit is trailing give-back +
+            # time-stop) carries tp_r = 0.0. The elif branch below then computes
+            # tp = fill + risk * 0.0 = fill, i.e. a TAKE_PROFIT_MARKET order sitting exactly
+            # ON the entry, so the position closed at breakeven within minutes and the journal
+            # printed "Result: TP | PnL 0.0". Proven against a live fill: MINA-USDT entry
+            # 0.08245 -> formula predicted TP 0.082450 -> journal exit 0.08247.
+            # Affected: T7-LONG, T7-SHORT, T3-SHORT, T3-LONG, T4-LONG, T5-LONG, T6-LONG, T5B.
+            # T4 was patched in isolation on 2026-09-01 via tp_mult; the class was never swept.
+            # tp_r is KEPT in every descriptor (eng["long_tp_r"] is hard-indexed elsewhere) -
+            # what changes is that no TP ORDER is placed when there is no real target.
+            _no_tp = (not _tpm) and (not _tpr)
+            if _no_tp:
+                risk = abs(fill - p["sl"])
+                tp   = None
+            elif _tpm and _ds:
                 risk = abs(p["sl"] - fill)
                 tp   = fill * (1.0 + _ds * _tpm) if p["side"] == "BUY" else fill * (1.0 - _ds * _tpm)
             elif p["side"] == "BUY":
@@ -6265,11 +6281,16 @@ def rev_track_pending(eng):
                 eng["last_fire"][sym] = now
                 pend.pop(sym, None)
                 continue
-            tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label=name)
+            if tp is None:
+                tp_id = "N/A"          # no fixed target by design: trail + time-stop only
+                print(f"[{name}] {sym} no exchange TP by design (trail/time exit)")
+            else:
+                tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label=name)
             eng["open"][p["order_id"]] = {
                 "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
                 "close_side": p["close_side"], "entry": p["entry"], "entry_fill": fill,
-                "sl": p["sl"], "tp": tp, "total_qty": p["qty"], "qty": p["qty"],
+                "sl": p["sl"], "tp": tp, "no_tp": tp is None,
+                "total_qty": p["qty"], "qty": p["qty"],
                 "risk_usdt": eng["risk_usdt"], "margin_used": p.get("margin_used", 0),
                 "sl_id": sl_id, "tp_id": tp_id, "open_ts": now, "gone_strikes": 0,
                 "label": name, "eng_tag": eng["tag"],

@@ -4992,6 +4992,374 @@ REV_T5B = {
 }
 
 
+# ============================================================================
+# 2026-09-17  THE REBUILT SHORT BOOK  (T3 / T5 / T7 short, plus four spares)
+#
+# WHY THIS EXISTS: on 2026-09-16 the account went $254 -> $54. The cause was not a bad
+# signal - it was that BOTH short engines sat behind the rally gate. The gate reads daily
+# EMA50/EMA200, which stayed bullish through a multi-day BTC fall, so it printed OPEN, and
+# OPEN means "stand the shorts down". Shorts were silent for the whole drop while the
+# ungated long engines kept buying. **Every engine in this section is UNGATED for exactly
+# that reason. Do not put a market-regime gate back on T3/T5 short.**
+#
+# THE THREE LEVERS, measured across Binance bull (578d, BTC +162%) and Binance bear (365d),
+# $100 notional, 20bps round-trip, cap 30:
+#   1. WIDE ATR STOPS (5-10 x ATR). A fixed-percent stop ignores how volatile the coin is:
+#      too tight on a 3% mover, pointlessly wide on a 0.5% one. This single change is what
+#      revived every dead leg on both sides of the book.
+#   2. DOWN-CONFIRMATION. Enter on the bar AFTER the signal, and only if that bar closes
+#      BELOW the previous bar's low. Stops the engine selling into a bar already reversing.
+#   3. FUNDING FILTER, NEGATIVE for shorts. Negative funding = shorts already crowded; a coin
+#      still pinned at its range top in that state is being squeezed, not genuinely strong,
+#      so it breaks. (The long side wants the opposite sign. Same data, mirrored.)
+#
+# VALIDATION (all three chosen engines): TRAIN/TEST walk-forward positive in all four halves
+# with win >= 50%; side-flip (same signal taken LONG) strongly negative everywhere, which is
+# the control that caught the 2026-09-08 trailing-exit fill artifact; 374-437 coins traded
+# with top-3 concentration 2.6-4.4% of signals; exit mix healthy (T7 bear: SL 27.9%, TP 24.1%,
+# time 48.0%, and only 6.8% of time-exits are sub-1% "wins", so the win rate is real).
+#
+#   T3 short  10-day-low break,  10 x ATR stop, TP 1R, hold 48h
+#             bull 44.9 tr/wk 53.5% +$35.48 | bear 70.6 tr/wk 52.9% +$34.11
+#   T5 short  30-day-low break,   8 x ATR stop, TP 1R, hold 4d
+#             bull 21.4 tr/wk 59.4% +$33.55 | bear 33.9 tr/wk 54.8% +$27.34
+#   T7 short  bottom 10% RS + funding<0 + ATR%>=1.2%, 8 x ATR, TP 1R, hold 4d
+#             bull 19.1 tr/wk 53.8% +$2.21  | bear 48.4 tr/wk 60.0% +$81.95
+#
+# T7 IS BEAR-ONLY AND IS GATED TO BTC < DAILY EMA200. Its bull half is fragile: only 173
+# coins trade and the top-3 coins produce 187% of bull PnL, i.e. everything else is negative.
+# Eight parameter combinations were tried to fix the bull side and none gave healthy
+# concentration. This is the one gate in the section and it is a SLOW gate (200-day EMA),
+# not the fast rally gate that caused the blow-up.
+#
+# SIZING: risk_usdt is dollars-at-risk per trade, and the framework derives qty as
+# risk_usdt / |entry - sl|. Because the stop is ATR-based the dollar risk stays constant
+# while position size adapts to volatility. At $200 account and 3% risk that is $6/trade,
+# with cap 7 per engine (~$189 peak margin for all three). He chose 3% over 5% because all
+# three legs are SHORT and therefore correlated - a sharp rally pressures all 21 positions
+# at once. At 3%, five losses in a row costs 15% of the account; at 5% it would be 25%.
+#
+# THE FOUR SPARES (T1S/T2S/T4S/T6S) are all walk-forward clean but DISABLED by default.
+# They are pump-shorts, which makes them bear specialists: in bull a coin that reaches its
+# range top tends to stay there, so they fire 0.9-5.3 times a week and earn $0.26-2.80.
+# They are off only because they earn $2-14/wk for the same margin that T3/T5/T7 turn into
+# $27-82. Turn them on with the env vars when the account grows - no push needed.
+#   ~$400 -> REV_T2S_ENABLED=1   (bear +$12.44/wk, win 61.4%, and a genuinely different
+#                                 signal from T3/T5's breakdowns, so it adds diversification)
+#   ~$600 -> REV_T4S_ENABLED=1   (bear +$14.31/wk, win 64.6%)
+#   ~$800 -> REV_T1S_ENABLED=1, REV_T6S_ENABLED=1
+# Raise risk only AFTER live results have been checked against these backtest numbers.
+# ============================================================================
+SHORT_RISK_USDT       = float(os.environ.get("SHORT_RISK_USDT", 6.0))    # 3% of a $200 account
+SHORT_MAX_CONCURRENT  = int(os.environ.get("SHORT_MAX_CONCURRENT", 7))
+SHORT_LEVERAGE        = int(os.environ.get("SHORT_LEVERAGE", 5))         # stops sit 10-16% away
+SHORT_MIN_QUOTE_VOL   = float(os.environ.get("SHORT_MIN_QUOTE_VOL", 2_000_000))
+SHORT_ATRP_MIN        = float(os.environ.get("SHORT_ATRP_MIN", 0.006))
+SHORT_MAX_MARGIN      = float(os.environ.get("SHORT_MAX_MARGIN_USDT", 70))
+
+_funding_cache = {}          # symbol -> (ts, rate)
+FUNDING_TTL = 1800.0
+
+
+def get_funding_rate(symbol):
+    """Latest funding rate for a symbol, cached 30 min. None when unavailable.
+
+    Callers must treat None as 'filter cannot be evaluated' and SKIP the trade rather than
+    assume a sign - an unread funding rate is not evidence of negative funding."""
+    now = time.time()
+    hit = _funding_cache.get(symbol)
+    if hit and (now - hit[0]) < FUNDING_TTL:
+        return hit[1]
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/premiumIndex"
+        r = requests.get(url, params={"symbol": symbol}, timeout=8).json()
+        d = r.get("data")
+        if isinstance(d, list):
+            d = d[0] if d else None
+        rate = float(d.get("lastFundingRate")) if d and d.get("lastFundingRate") is not None else None
+    except Exception:
+        rate = None
+    _funding_cache[symbol] = (now, rate)
+    return rate
+
+
+def _short_entry_setup(symbol, katr, atrp_min=None, need_confirm=True):
+    """Shared 15m entry mechanics for every engine in this section.
+
+    Returns (px, atr) or None. Applies the ATR% floor and, when asked, the
+    down-confirmation rule: this bar's close must be BELOW the previous bar's low.
+    The last candle is dropped unless it is a completed 15m bar."""
+    candles = get_candles(symbol, limit=60 + REV_CANDLE_BUFFER, interval="15m")
+    if not candles:
+        return None
+    t = _bar_ms(candles[-1])
+    if t and (t % 900000) != 0:
+        candles = candles[:-1]
+    if len(candles) < 30:
+        return None
+    px = cl(candles[-1])
+    if px <= 0:
+        return None
+    if need_confirm:
+        prev_low = l(candles[-2])
+        if not (prev_low > 0 and px < prev_low):
+            return None
+    atrs = atr_series([h(c) for c in candles], [l(c) for c in candles],
+                      [cl(c) for c in candles], REV_ATR_LEN)
+    if not atrs or atrs[-1] is None or atrs[-1] <= 0:
+        return None
+    a = atrs[-1]
+    floor_ = SHORT_ATRP_MIN if atrp_min is None else atrp_min
+    if (a / px) < floor_:
+        return None
+    width = katr * a / px
+    # the backtest discarded any setup whose stop was wider than 30% or tighter than 1%
+    if width > 0.30 or width < 0.01:
+        return None
+    return (px, a)
+
+
+def _prior_low_over_days(symbol, days):
+    """Lowest low of the previous `days` days, EXCLUDING the current 4h bar.
+
+    4h bars are used rather than 15m because BingX caps a klines request at 1,440 bars:
+    1,440 x 15m is only ~15 days, but 1,440 x 4h is ~240. The minimum is identical either
+    way - a 4h low IS the minimum of its sixteen 15m lows."""
+    need = days * 6 + 2
+    candles = get_candles(symbol, limit=min(need + REV_CANDLE_BUFFER, 1400), interval="4h")
+    if not candles or len(candles) < need:
+        return None
+    lows = [l(c) for c in candles[-(days * 6 + 1):-1]]
+    lows = [x for x in lows if x and x > 0]
+    if len(lows) < days * 4:
+        return None
+    return min(lows)
+
+
+def _lowbreak_short(symbol, eng, days, katr):
+    """T3/T5 shared body: 15m close breaking below the N-day low, ATR stop, TP 1R."""
+    setup = _short_entry_setup(symbol, katr, need_confirm=False)
+    if setup is None:
+        return None
+    px, a = setup
+    prior = _prior_low_over_days(symbol, days)
+    if prior is None or px >= prior:
+        return None
+    R = katr * a
+    sl = px + R
+    tp = px - R                                  # TP 1R; the fill path re-derives it exactly
+    print(f"[{eng['name']}] {symbol} SELL {days}d-low break close={px} prior_low={round(prior, 8)} "
+          f"atr={round(a, 8)} sl={round(sl, 8)} tp={round(tp, 8)}")
+    return ("SELL", px, sl, tp)
+
+
+def rev3s_check_signal(symbol, btc_ret, eng):
+    """T3 SHORT - 10-day-low breakdown. No regime gate, by design."""
+    return _lowbreak_short(symbol, eng, T3S_LOW_DAYS, T3S_KATR)
+
+
+def rev5s_check_signal(symbol, btc_ret, eng):
+    """T5 SHORT - 30-day-low breakdown. No regime gate, by design."""
+    return _lowbreak_short(symbol, eng, T5S_LOW_DAYS, T5S_KATR)
+
+
+def _btc_below_ema200_daily():
+    """Slow bear gate for T7 short. True when BTC's last daily close is under its 200-day EMA.
+    Unreadable -> False, i.e. T7 stays OFF rather than trading blind."""
+    try:
+        closes = _revl_btc_daily_closes()
+        if not closes or len(closes) < 60:
+            return False
+        return closes[-1] < _revl_ema(closes[-200:], 200)
+    except Exception as e:
+        print(f"[T7S GATE] BTC daily series unreadable, staying off: {e}")
+        return False
+
+
+def rev7s_new_check_signal(symbol, btc_ret, eng):
+    """T7 SHORT - short the relative-strength laggards, bear regimes only.
+
+    Bull half was measured fragile (top-3 coins = 187% of bull PnL), so the slow EMA200 gate
+    is deliberate here even though the rest of this section is ungated."""
+    if T7S_BEAR_ONLY and not _btc_below_ema200_daily():
+        return None
+    rev7_refresh_ranking()
+    if _rev7_rank.get("short_cut") is None:
+        return None
+    rs = _rev7_rs(symbol)
+    if rs is None or rs > _rev7_rank["short_cut"]:
+        return None
+    f = get_funding_rate(symbol)
+    if f is None or f >= 0:
+        return None
+    setup = _short_entry_setup(symbol, T7S_KATR, atrp_min=T7S_ATRP_MIN)
+    if setup is None:
+        return None
+    px, a = setup
+    R = T7S_KATR * a
+    print(f"[TIGHT 7 SHORT] {symbol} SELL rs={rs:+.4f} cut={_rev7_rank['short_cut']:+.4f} "
+          f"funding={f:+.5f} close={px} sl={round(px + R, 8)}")
+    return ("SELL", px, round(px + R, 10), round(px - R, 10))
+
+
+def _pump_short(symbol, eng):
+    """Shared body for the four SPARE engines: coin pinned at the top of its own range,
+    negative funding, then a confirmed down-close. Disabled by default - see the header."""
+    win = eng["_pos_win"]
+    candles = get_candles(symbol, limit=win + 40 + REV_CANDLE_BUFFER, interval="15m")
+    if not candles:
+        return None
+    t = _bar_ms(candles[-1])
+    if t and (t % 900000) != 0:
+        candles = candles[:-1]
+    if len(candles) < win + 5:
+        return None
+    seg = candles[-(win + 1):-1]                 # the window BEFORE the confirmation bar
+    hi_ = max(h(c) for c in seg)
+    lo_ = min(l(c) for c in seg)
+    ref = cl(candles[-2])
+    if hi_ <= lo_ or ref <= 0:
+        return None
+    pos = (ref - lo_) / (hi_ - lo_)
+    if pos < eng["_pos_thr"]:
+        return None
+    if eng["_need_funding"]:
+        f = get_funding_rate(symbol)
+        if f is None or f >= eng["_funding_max"]:
+            return None
+    setup = _short_entry_setup(symbol, eng["_katr"], atrp_min=eng["_atrp_min"])
+    if setup is None:
+        return None
+    px, a = setup
+    R = eng["_katr"] * a
+    print(f"[{eng['name']}] {symbol} SELL pos{win}={pos:.4f} close={px} sl={round(px + R, 8)}")
+    return ("SELL", px, round(px + R, 10), round(px - R, 10))
+
+
+def _short_desc(tag, name, fn, katr, hold_s, enabled, extra=None):
+    """One descriptor shape for every engine in this section.
+
+    short_tp_r = 1.0 makes the fill path place the exchange TP exactly 1R from the REAL
+    ATR stop (it computes risk = sl - fill), which is what keeps a variable-width stop and
+    a 1R target consistent. dstop_pct is only a representative width for the margin and
+    sl-cap maths - the true stop always comes from the signal."""
+    d = {
+        "name": name, "tag": tag, "signal_fn": fn, "side_only": "SELL",
+        "ret_thr": 0.0, "vol_mult": 0.0, "vol_mult_max": 0.0,
+        "atrp_max": 0.0, "atrp_min": 0.0,
+        "pos_window": 0, "range_window": 0, "extreme": 0.0,
+        "regime_min_btc": None, "range_regime": None,
+        "cvd_filter": False, "flow_gate": False,
+        "long_sl_atr": 0.0, "long_tp_r": 0.0, "short_sl_atr": 0.0, "short_tp_r": 1.0,
+        "dstop_pct": 0.15, "trail_arm": 0.0, "trail_give": 0.0,
+        "sl_cap_pct": 0.35,
+        "risk_usdt": SHORT_RISK_USDT,
+        "leverage": SHORT_LEVERAGE,
+        "max_concurrent": SHORT_MAX_CONCURRENT if enabled else 0,
+        "max_margin": SHORT_MAX_MARGIN,
+        "cooldown_s": int(os.environ.get("SHORT_COOLDOWN_SECONDS", 24 * 3600)),
+        "hold_seconds": hold_s,
+        "min_quote_vol": SHORT_MIN_QUOTE_VOL,
+        "max_symbols": int(os.environ.get("SHORT_MAX_SYMBOLS", 600)),
+        "_enabled": enabled, "_katr": katr,
+    }
+    if extra:
+        d.update(extra)
+    return d
+
+
+T3S_LOW_DAYS = int(os.environ.get("T3S_LOW_DAYS", 10))
+T3S_KATR     = float(os.environ.get("T3S_KATR", 10.0))
+T3S_HOLD     = int(os.environ.get("T3S_HOLD_SECONDS", 48 * 3600))
+T5S_LOW_DAYS = int(os.environ.get("T5S_LOW_DAYS", 30))
+T5S_KATR     = float(os.environ.get("T5S_KATR", 8.0))
+T5S_HOLD     = int(os.environ.get("T5S_HOLD_SECONDS", 4 * 24 * 3600))
+T7S_KATR     = float(os.environ.get("T7S_KATR", 8.0))
+T7S_HOLD     = int(os.environ.get("T7S_HOLD_SECONDS", 4 * 24 * 3600))
+T7S_ATRP_MIN = float(os.environ.get("T7S_ATRP_MIN", 0.012))
+T7S_BEAR_ONLY = os.environ.get("T7S_BEAR_ONLY", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
+# WIRE-UP. The three chosen engines REPLACE what used to sit in the T3 / T5 / T7-short
+# slots, keeping the same tags, books and /t3_ /t5_ /t7_ commands so nothing downstream
+# changes. What changed is the logic: 15m bars instead of daily, ATR stops instead of a
+# fixed 30%, and NO regime gate on T3/T5.
+# ---------------------------------------------------------------------------
+REV_T3 = _short_desc("t3", "TIGHT 3", rev3s_check_signal, T3S_KATR, T3S_HOLD, True,
+                     extra={"open": rev3_open_trades, "pending": rev3_pending,
+                            "last_fire": rev3_last_fire})
+REV_T5B = _short_desc("t5", "TIGHT 5", rev5s_check_signal, T5S_KATR, T5S_HOLD, True,
+                      extra={"open": rev5_open_trades, "pending": rev5_pending,
+                             "last_fire": rev5_last_fire})
+REV_T7S = _short_desc("t7s", "TIGHT 7 SHORT", rev7s_new_check_signal, T7S_KATR, T7S_HOLD, True,
+                      extra={"open": rev7s_open_trades, "pending": rev7s_pending,
+                             "last_fire": rev7s_last_fire,
+                             "atrp_min_note": T7S_ATRP_MIN})
+
+# ---------------------------------------------------------------------------
+# THE FOUR SPARES. Coded now, OFF now. Each needs its own books so that turning one on
+# later is a pure env change with no code push. max_concurrent is forced to 0 while
+# disabled, which is belt-and-braces on top of the loop guard.
+# ---------------------------------------------------------------------------
+t1s_open_trades, t1s_pending, t1s_last_fire = {}, {}, {}
+t2s_open_trades, t2s_pending, t2s_last_fire = {}, {}, {}
+t4s_open_trades, t4s_pending, t4s_last_fire = {}, {}, {}
+t6s_open_trades, t6s_pending, t6s_last_fire = {}, {}, {}
+
+REV_T1S_ENABLED = os.environ.get("REV_T1S_ENABLED", "0") == "1"
+REV_T2S_ENABLED = os.environ.get("REV_T2S_ENABLED", "0") == "1"
+REV_T4S_ENABLED = os.environ.get("REV_T4S_ENABLED", "0") == "1"
+REV_T6S_ENABLED = os.environ.get("REV_T6S_ENABLED", "0") == "1"
+
+
+def rev_t1s_signal(symbol, btc_ret, eng): return _pump_short(symbol, eng)
+def rev_t2s_signal(symbol, btc_ret, eng): return _pump_short(symbol, eng)
+def rev_t4s_signal(symbol, btc_ret, eng): return _pump_short(symbol, eng)
+def rev_t6s_signal(symbol, btc_ret, eng): return _pump_short(symbol, eng)
+
+
+# T1S  pos96>=0.99 + ATR%>=1.2%, no funding filter, 5xATR, 48h
+#      bear 13.6 tr/wk 55.2% +$7.12 | bull 5.3 tr/wk 53.5% +$0.51
+REV_T1S = _short_desc("t1s", "SHORT SPARE 1", rev_t1s_signal, 5.0, 48 * 3600, REV_T1S_ENABLED,
+                      extra={"open": t1s_open_trades, "pending": t1s_pending,
+                             "last_fire": t1s_last_fire,
+                             "_pos_win": 96, "_pos_thr": 0.99, "_need_funding": False,
+                             "_funding_max": 0.0, "_atrp_min": 0.012})
+# T2S  pos96>=0.98 + funding<0, 8xATR, 4d
+#      bear 9.8 tr/wk 61.4% +$12.44 | bull 2.7 tr/wk 53.1% +$1.91   <- turn on first
+REV_T2S = _short_desc("t2s", "SHORT SPARE 2", rev_t2s_signal, 8.0, 4 * 24 * 3600, REV_T2S_ENABLED,
+                      extra={"open": t2s_open_trades, "pending": t2s_pending,
+                             "last_fire": t2s_last_fire,
+                             "_pos_win": 96, "_pos_thr": 0.98, "_need_funding": True,
+                             "_funding_max": 0.0, "_atrp_min": 0.006})
+# T4S  pos48>=0.97 + ATR%>=1.2% + funding<-0.01%, 8xATR, 4d
+#      bear 6.7 tr/wk 64.6% +$14.31 | bull 0.9 tr/wk 50.0% +$0.26
+REV_T4S = _short_desc("t4s", "SHORT SPARE 4", rev_t4s_signal, 8.0, 4 * 24 * 3600, REV_T4S_ENABLED,
+                      extra={"open": t4s_open_trades, "pending": t4s_pending,
+                             "last_fire": t4s_last_fire,
+                             "_pos_win": 48, "_pos_thr": 0.97, "_need_funding": True,
+                             "_funding_max": -0.0001, "_atrp_min": 0.012})
+# T6S  pos48>=0.98 + ATR%>=1.2% + funding<0, 8xATR, 4d
+#      bear 3.5 tr/wk 64.3% +$7.80 | bull 0.9 tr/wk 65.3% +$2.80
+REV_T6S = _short_desc("t6s", "SHORT SPARE 6", rev_t6s_signal, 8.0, 4 * 24 * 3600, REV_T6S_ENABLED,
+                      extra={"open": t6s_open_trades, "pending": t6s_pending,
+                             "last_fire": t6s_last_fire,
+                             "_pos_win": 48, "_pos_thr": 0.98, "_need_funding": True,
+                             "_funding_max": 0.0, "_atrp_min": 0.012})
+
+SHORT_SPARES = [REV_T1S, REV_T2S, REV_T4S, REV_T6S]
+SHORT_SCAN_SECONDS = int(os.environ.get("SHORT_SCAN_SECONDS", 300))
+
+
+def short_spare_loop(eng):
+    """One loop per spare. Exits immediately unless its env flag is set."""
+    if not eng.get("_enabled"):
+        print(f"[REV] {eng['name']} disabled - loop idle (set its *_ENABLED=1 to run)")
+        return
+    _rev_engine_loop(eng, lambda: True, SHORT_SCAN_SECONDS)
+
+
 
 # ============================================================================
 # LONG LEGS for T3 / T4 / T5 / T6 (2026-09-07). All four run on DAILY bars built
@@ -6659,7 +7027,7 @@ def rev5_loop():
         return
     # 2026-09-07: T5 slot now runs S1 (30d-low breakdown short). The old
     # crash-continuation descriptor REV_T5 is left in the file, unused, for reference.
-    _rev_engine_loop(REV_T5B, lambda: rev5_auto_enabled, REV5_SCAN_SECONDS)
+    _rev_engine_loop(REV_T5B, lambda: rev5_auto_enabled, SHORT_SCAN_SECONDS)
 
 
 # ============================================================================
@@ -6778,18 +7146,21 @@ def rev7l_loop():
 
 
 def rev7s_loop():
-    """T7 SHORT - relative-strength laggards, rally-gated."""
+    """T7 SHORT - relative-strength laggards. 2026-09-17: gated to BTC below its DAILY
+    EMA200 (a slow bear gate inside the signal), not to the fast rally gate."""
     if not REV7_ENGINE_ENABLED:
         return
-    _rev_engine_loop(REV_T7S, lambda: rev7s_auto_enabled, REV7_SCAN_SECONDS)
+    _rev_engine_loop(REV_T7S, lambda: rev7s_auto_enabled, SHORT_SCAN_SECONDS)
 
 
 def rev3_loop():
-    """T3 slot = 10-day-low breakdown short, bear-gated. See the REV_T3 block above."""
+    """T3 slot = 10-day-low breakdown SHORT on 15m bars, ATR stop, NO regime gate.
+    2026-09-17: the bear gate was REMOVED here deliberately - gating this engine is what
+    silenced the shorts through the fall that cost him the account."""
     if not REV3_ENGINE_ENABLED:
         print("[REV] Tight 3 disabled by env REV3_ENGINE_ENABLED=0 - loop idle")
         return
-    _rev_engine_loop(REV_T3, lambda: rev3_auto_enabled, REV3_SCAN_SECONDS)
+    _rev_engine_loop(REV_T3, lambda: rev3_auto_enabled, SHORT_SCAN_SECONDS)
 
 # ==================== END TIGHT 1 (24h-reversion) ====================
 
@@ -6901,4 +7272,8 @@ if __name__ == "__main__":
     Thread(target=rev5l_loop,               daemon=True).start()
     Thread(target=rev6l_loop,               daemon=True).start()
     Thread(target=rev6_loop,                daemon=True).start()   # Tight 6 = ATR%-gated range-extreme reversion (2026-08-31)
+    # 2026-09-17: the four spare shorts. Each loop returns immediately unless its
+    # REV_T*S_ENABLED env var is set, so this costs one dead thread each while off.
+    for _sp in SHORT_SPARES:
+        Thread(target=short_spare_loop, args=(_sp,), daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

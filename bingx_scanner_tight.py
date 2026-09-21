@@ -2247,7 +2247,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev3_auto_enabled, rev7l_auto_enabled, rev7s_auto_enabled, ema_alert_auto
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev3_auto_enabled, rev7l_auto_enabled, rev7s_auto_enabled, l_auto_enabled, ema_alert_auto
     global rev3l_auto_enabled, rev4l_auto_enabled, rev5l_auto_enabled, rev6l_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
@@ -2366,6 +2366,15 @@ def handle_telegram_commands():
                     else:
                         rev7l_auto_enabled = rev7s_auto_enabled = True
                         send_tg("Tight 7 (relative-strength leaders LONG + laggards SHORT) ON.")
+                elif text == "/l_start":
+                    l_auto_enabled = True
+                    send_tg("L (signal-only, deep-dip long) ON. Sends every qualifying "
+                            "signal to its own Telegram chat - no orders placed.")
+                elif text == "/l_stop":
+                    l_auto_enabled = False
+                    send_tg("L Auto-scan OFF.")
+                elif text == "/l_status":
+                    send_tg(l_status_text())
                 elif text == "/t7_stop":
                     rev7l_auto_enabled = rev7s_auto_enabled = False
                     send_tg("Tight 7 Auto-trade OFF.")
@@ -5360,6 +5369,178 @@ def short_spare_loop(eng):
     _rev_engine_loop(eng, lambda: True, SHORT_SCAN_SECONDS)
 
 
+# ============================================================================
+# 2026-09-20  ENGINE L — SIGNAL-ONLY (2026-09-19/20 decision, see [[t7-relative-strength]])
+#
+# L is the OLD relative-strength engine (leader long, top 5% RS4h + BTC-4h-down, rally
+# gate). Faisal trades manually on another platform off this bot's signals, so L now
+# places NO exchange order at all - it only sends a Telegram message. He wants EVERY
+# signal, uncapped, and will pick which ones to take himself ("shob diba. ame bachbo").
+# ~150 signals/week uncapped at win ~48% (BEFORE he filters) vs ~10/week at win 57% if
+# capped at 3 - that trade-off is his to make by eye, not this code's to make for him.
+#
+# A third Telegram channel, separate from the trade and journal channels he already has.
+# L_TG_TOKEN / L_TG_CHAT_ID fall back to the existing signal channel if either is unset,
+# so this is safe to deploy before he finishes setting the new bot up.
+# ============================================================================
+L_TG_TOKEN = os.environ.get("L_TG_TOKEN") or TG_TOKEN
+L_TG_CHAT_ID = os.environ.get("L_TG_CHAT_ID") or "957739778"   # Faisal's DM with @fazzsignal_bot
+L_SCAN_SECONDS = int(os.environ.get("L_SCAN_SECONDS", 300))
+L_COOLDOWN_SECONDS = int(os.environ.get("L_COOLDOWN_SECONDS", 24 * 3600))   # dedup 24h per coin
+L_POS_MAX = float(os.environ.get("L_POS_MAX", 0.01))       # close in bottom 1% of 96-bar range
+L_ATRP_MIN = float(os.environ.get("L_ATRP_MIN", 0.012))    # ATR% >= 1.2%
+L_KATR = float(os.environ.get("L_KATR", 8.0))              # reference stop 8 x ATR
+L_TRAIL_ARM = float(os.environ.get("L_TRAIL_ARM", 0.08))
+L_TRAIL_GIVE = float(os.environ.get("L_TRAIL_GIVE", 0.01))
+L_HOLD_SECONDS = int(os.environ.get("L_HOLD_SECONDS", 4 * 24 * 3600))
+
+l_signal_log = {}
+l_paper_book = {}
+l_paper_closed = []
+l_auto_enabled = False
+
+
+def send_l_signal(msg):
+    """L's own Telegram destination. No orders anywhere in L - message only."""
+    try:
+        requests.post(f"https://api.telegram.org/bot{L_TG_TOKEN}/sendMessage",
+                      json={"chat_id": L_TG_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        print(f"[L] telegram send failed: {e}")
+
+
+def l_check_signal(symbol):
+    """2026-09-20 L = DEEP-DIP signal (his spec): the PREVIOUS closed 15m bar sits in the
+    bottom 1% of its own 96-bar range, the LATEST closed bar closes above that bar's high
+    (confirmation - never buy the falling bar), and ATR% >= 1.2%. Returns (px, atr, pos)
+    or None. Places no order."""
+    if time.time() - l_signal_log.get(symbol, 0) < L_COOLDOWN_SECONDS:
+        return None
+    candles = get_candles(symbol, limit=120 + REV_CANDLE_BUFFER, interval="15m")
+    if not candles:
+        return None
+    t = _bar_ms(candles[-1])
+    if t and (t % 900000) != 0:
+        candles = candles[:-1]
+    if len(candles) < 100:
+        return None
+    sig, conf = candles[-2], candles[-1]
+    win = candles[-97:-1]                     # 96 bars ending at the signal bar
+    hi_ = max(h(c) for c in win); lo_ = min(l(c) for c in win)
+    if hi_ <= lo_:
+        return None
+    pos = (cl(sig) - lo_) / (hi_ - lo_)
+    if pos > L_POS_MAX:
+        return None
+    px = cl(conf)
+    if px <= 0 or px <= h(sig):
+        return None
+    atrs = atr_series([h(c) for c in candles], [l(c) for c in candles],
+                      [cl(c) for c in candles], REV_ATR_LEN)
+    if not atrs or not atrs[-1] or atrs[-1] <= 0:
+        return None
+    a = atrs[-1]
+    if a / px < L_ATRP_MIN:
+        return None
+    return (px, a, pos)
+
+
+def l_scan_once():
+    if not l_auto_enabled:
+        return
+    try:
+        syms = get_futures_symbols() or []
+    except Exception as e:
+        print(f"[L] symbol list unavailable: {e}")
+        return
+    for sym in syms:
+        try:
+            hit = l_check_signal(sym)
+        except Exception as e:
+            print(f"[L] {sym} check failed: {e}")
+            continue
+        if hit is None:
+            continue
+        px, a, pos = hit
+        l_signal_log[sym] = time.time()
+        sl = px - L_KATR * a
+        msg = (f"[L SIGNAL] {sym} LONG\n"
+               f"Entry: {px}\n"
+               f"Stop ({L_KATR:.0f}xATR): {round(sl, 8)}  ({(px - sl) / px * 100:.1f}% away)\n"
+               f"Trail: arm +{L_TRAIL_ARM*100:.0f}% / give {L_TRAIL_GIVE*100:.0f}%\n"
+               f"Time stop: {L_HOLD_SECONDS // 86400}d\n"
+               f"Dip depth pos96: {pos:.4f}\n"
+               f"ATR%: {a / px * 100:.2f}%\n"
+               f"(signal only - no order placed)")
+        print(f"[L] {sym} signal sent pos={pos:.4f}")
+        send_l_signal(msg)
+        l_paper_book[sym] = {"entry": px, "sl": sl, "peak": px, "armed": False, "ts": time.time()}
+        time.sleep(0.1)
+
+
+def l_track_paper():
+    """Advances the paper book on the same trail/stop logic as the retired live L
+    engine, purely for /l_status out-of-sample comparison against the backtest. No
+    orders, no margin, no exchange calls beyond a price read."""
+    if not l_paper_book:
+        return
+    for sym in list(l_paper_book.keys()):
+        t = l_paper_book[sym]
+        try:
+            px = get_last_price(sym)
+        except Exception:
+            continue
+        if not px or px <= 0:
+            continue
+        if px <= t["sl"]:
+            pnl_pct = (px - t["entry"]) / t["entry"]
+            l_paper_closed.append({"symbol": sym, "result": "SL", "pnl_pct": pnl_pct})
+            del l_paper_book[sym]
+            continue
+        t["peak"] = max(t["peak"], px)
+        if not t["armed"] and t["peak"] >= t["entry"] * (1 + L_TRAIL_ARM):
+            t["armed"] = True
+        if t["armed"] and px <= t["peak"] * (1 - L_TRAIL_GIVE):
+            pnl_pct = (px - t["entry"]) / t["entry"]
+            l_paper_closed.append({"symbol": sym, "result": "trail", "pnl_pct": pnl_pct})
+            del l_paper_book[sym]
+            continue
+        if time.time() - t["ts"] >= L_HOLD_SECONDS:
+            pnl_pct = (px - t["entry"]) / t["entry"]
+            l_paper_closed.append({"symbol": sym, "result": "time", "pnl_pct": pnl_pct})
+            del l_paper_book[sym]
+
+
+def l_loop():
+    print("[L] signal-only engine loop starting")
+    while True:
+        try:
+            l_scan_once()
+            l_track_paper()
+        except Exception as e:
+            print(f"[L] loop error: {e}")
+        time.sleep(L_SCAN_SECONDS)
+
+
+def l_status_text():
+    closed = l_paper_closed[-200:]
+    n = len(closed)
+    if n == 0:
+        return (f"L (signal-only)\n"
+                f"Status: {'ON' if l_auto_enabled else 'OFF'}\n"
+                f"Open paper signals: {len(l_paper_book)}\n"
+                f"Closed: 0 (no data yet)")
+    wins = sum(1 for c in closed if c["pnl_pct"] > 0)
+    win_pct = wins / n * 100
+    avg_pct = sum(c["pnl_pct"] for c in closed) / n * 100
+    return (f"L (signal-only)\n"
+            f"Status: {'ON' if l_auto_enabled else 'OFF'}\n"
+            f"Open paper signals: {len(l_paper_book)}\n"
+            f"Closed (last {n}): win {win_pct:.1f}%  avg {avg_pct:+.2f}% per signal\n"
+            f"(paper only - no real orders, no real margin)")
+
+
+
 
 # ============================================================================
 # LONG LEGS for T3 / T4 / T5 / T6 (2026-09-07). All four run on DAILY bars built
@@ -7276,4 +7457,7 @@ if __name__ == "__main__":
     # REV_T*S_ENABLED env var is set, so this costs one dead thread each while off.
     for _sp in SHORT_SPARES:
         Thread(target=short_spare_loop, args=(_sp,), daemon=True).start()
+    # 2026-09-20: L is signal-only (no orders) - it still gets its own thread so its
+    # scan cadence is independent of every trading engine.
+    Thread(target=l_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

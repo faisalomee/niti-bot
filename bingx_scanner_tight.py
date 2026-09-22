@@ -2368,11 +2368,11 @@ def handle_telegram_commands():
                         send_tg("Tight 7 (relative-strength leaders LONG + laggards SHORT) ON.")
                 elif text == "/l_start":
                     l_auto_enabled = True
-                    send_tg("L (signal-only, deep-dip long) ON. Sends every qualifying "
+                    send_tg("L1 (signal-only, deep-dip long) ON. Sends every qualifying "
                             "signal to its own Telegram chat - no orders placed.")
                 elif text == "/l_stop":
                     l_auto_enabled = False
-                    send_tg("L Auto-scan OFF.")
+                    send_tg("L1 Auto-scan OFF.")
                 elif text == "/l_status":
                     send_tg(l_status_text())
                 elif text == "/t7_stop":
@@ -5464,7 +5464,7 @@ def l_scan_once():
         px, a, pos = hit
         l_signal_log[sym] = time.time()
         sl = px - L_KATR * a
-        msg = (f"[L SIGNAL] {sym} LONG\n"
+        msg = (f"[L1 SIGNAL] {sym} LONG\n"
                f"Entry: {px}\n"
                f"Stop ({L_KATR:.0f}xATR): {round(sl, 8)}  ({(px - sl) / px * 100:.1f}% away)\n"
                f"Trail: arm +{L_TRAIL_ARM*100:.0f}% / give {L_TRAIL_GIVE*100:.0f}%\n"
@@ -5847,29 +5847,94 @@ def _revl_pack(eng, px):
 
 
 
-# ---------------- T4 LONG = "L-E v2", the strongest long found ----------------
-REV4L_BASE_RANGE = float(os.environ.get("REV4L_BASE_RANGE", 0.30))
-REV4L_TRAIL_ARM  = float(os.environ.get("REV4L_TRAIL_ARM", REVL_TRAIL_ARM))
-REV4L_TRAIL_GIVE = float(os.environ.get("REV4L_TRAIL_GIVE", REVL_TRAIL_GIVE))
+# ---------------- T4 LONG = L2 rally momentum (2026-09-23) ----------------
+# Replaces L-E v2. Bear-off: trades only while revl_gate_open() is True.
+# Entry: BTC 4h > +2%, breadth > 60%, coin in top 25% by 4h return (cross-section of the
+# previous scanned bar), 24h qv >= $1M. Exit: 8xATR stop, 2R TP, 24h hold. Every signal is
+# also sent to the L Telegram chat, including when the cap is full (manual trading).
+REV4L_BASE_RANGE = float(os.environ.get("REV4L_BASE_RANGE", 0.30))   # unused, kept for status text
+REV4L_TRAIL_ARM  = 0.0
+REV4L_TRAIL_GIVE = 0.0
+L2_BTC_MIN    = float(os.environ.get("L2_BTC_MIN", 0.02))
+L2_BREADTH    = float(os.environ.get("L2_BREADTH", 0.60))
+L2_TOP_PCT    = float(os.environ.get("L2_TOP_PCT", 0.25))
+L2_SL_ATR     = float(os.environ.get("L2_SL_ATR", 8.0))
+L2_TP_R       = float(os.environ.get("L2_TP_R", 2.0))
+L2_RISK_USDT  = float(os.environ.get("L2_RISK_USDT", 0.6))    # ~$10 notional at a typical 8xATR stop
+L2_MAX_CONC   = int(os.environ.get("L2_MAX_CONCURRENT", 25))
+L2_MAX_MARGIN = float(os.environ.get("L2_MAX_MARGIN_USDT", 5))  # per trade, caps notional at $15 (3x)
+L2_LEVERAGE   = int(os.environ.get("L2_LEVERAGE", 3))
+L2_MIN_QV     = float(os.environ.get("L2_MIN_QUOTE_VOL", 1_000_000))
+L2_ALERT_S    = int(os.environ.get("L2_ALERT_DEDUP_SECONDS", 4 * 3600))
+
+_l2_xs = {"bar": None, "rets": [], "prev": None}
+_l2_btc = {"bar": None, "ret": None}
+_l2_alerted = {}
+
+
+def _l2_ret4h(symbol):
+    cs = get_candles(symbol, limit=40, interval="15m")
+    if len(cs) < 35:
+        return None
+    k = cs[:-1]                      # closed bars only
+    c0, c1 = cl(k[-17]), cl(k[-1])
+    if c0 <= 0:
+        return None
+    trs = [max(h(k[j]) - l(k[j]), abs(h(k[j]) - cl(k[j - 1])), abs(l(k[j]) - cl(k[j - 1])))
+           for j in range(len(k) - 14, len(k))]
+    return int(k[-1]["time"]), c1 / c0 - 1.0, c1, sum(trs) / 14.0
+
+
+def _l2_note(bar, r):
+    if _l2_xs["bar"] != bar:
+        if _l2_xs["bar"] is not None and len(_l2_xs["rets"]) >= 30:
+            _l2_xs["prev"] = sorted(_l2_xs["rets"])
+        _l2_xs["bar"], _l2_xs["rets"] = bar, []
+    _l2_xs["rets"].append(r)
+    return _l2_xs["prev"]
+
+
+def _l2_btc_ret(bar):
+    if _l2_btc["bar"] != bar:
+        x = _l2_ret4h("BTC-USDT")
+        _l2_btc["bar"], _l2_btc["ret"] = bar, (x[1] if x else None)
+    return _l2_btc["ret"]
 
 
 def rev4l_check_signal(symbol, btc_ret, eng):
-    """Quiet 30d base -> three consecutive higher daily closes -> above EMA20."""
-    c = _revl_common(symbol, eng, 40)
-    if c is None:
+    """L2 rally momentum long (T4 LONG slot)."""
+    if not revl_gate_open():
         return None
-    hi, lo, cls, qv, i, q7 = c
-    if i < 33:
+    x = _l2_ret4h(symbol)
+    if x is None:
         return None
-    br = _revl_base_range(cls, i, 30)
-    if br is None or br >= eng.get("base_range", REV4L_BASE_RANGE):
+    bar, r, px, atr = x
+    prev = _l2_note(bar, r)
+    if prev is None or atr <= 0:
         return None
-    if not (cls[i] > cls[i - 1] > cls[i - 2]):
+    br = sum(1 for z in prev if z > 0) / len(prev)
+    thr = prev[min(len(prev) - 1, int(len(prev) * (1.0 - L2_TOP_PCT)))]
+    b = _l2_btc_ret(bar)
+    if b is None or b <= L2_BTC_MIN or br <= L2_BREADTH or r < thr:
         return None
-    if cls[i] <= _revl_ema(cls[-30:], 20):
+    sl = px - L2_SL_ATR * atr
+    if sl <= 0:
         return None
-    print(f"[T4L] {symbol} BUY 3-up base={br:.2f} close={cls[i]} q7=${q7:,.0f}")
-    return _revl_pack(eng, cls[i])
+    tp = px + L2_TP_R * (px - sl)
+    full = len(eng["open"]) + len(eng["pending"]) >= eng["max_concurrent"]
+    now = time.time()
+    if now - _l2_alerted.get(symbol, 0) >= L2_ALERT_S:
+        _l2_alerted[symbol] = now
+        send_l_signal(f"[L2 SIGNAL] {symbol} LONG\n"
+                      f"Entry: {px}\nStop ({L2_SL_ATR:.0f}xATR): {round(sl, 8)}  "
+                      f"({(px - sl) / px * 100:.1f}% away)\nTP ({L2_TP_R:.1f}R): {round(tp, 8)}\n"
+                      f"Hold: 24h\n4h: {r * 100:+.1f}% | BTC 4h: {b * 100:+.1f}% | "
+                      f"breadth: {br * 100:.0f}%\n"
+                      + ("CAP FULL - manual only" if full else "T4 LONG executing"))
+    if full:
+        return None
+    print(f"[T4L/L2] {symbol} BUY 4h={r*100:+.1f}% btc={b*100:+.1f}% br={br:.2f} sl={sl:.6g}")
+    return ("BUY", px, sl, tp)
 
 
 # ---------------- T5 LONG = "N2", quiet base + volume expansion ----------------
@@ -6046,8 +6111,11 @@ REV_T3L = _revl_desc("t3l", "TIGHT 3 LONG", rev3l_check_signal,
                       "trail_arm": REV3L_TRAIL_ARM, "trail_give": REV3L_TRAIL_GIVE})
 REV_T4L = _revl_desc("t4l", "TIGHT 4 LONG", rev4l_check_signal,
                      (rev4l_open_trades, rev4l_pending, rev4l_last_fire),
-                     {"base_range": REV4L_BASE_RANGE,
-                      "trail_arm": REV4L_TRAIL_ARM, "trail_give": REV4L_TRAIL_GIVE})
+                     {"trail_arm": 0.0, "trail_give": 0.0, "risk_usdt": L2_RISK_USDT,
+                      "max_concurrent": L2_MAX_CONC, "max_margin": L2_MAX_MARGIN,
+                      "leverage": L2_LEVERAGE, "hold_seconds": 24 * 3600,
+                      "cooldown_s": 4 * 3600, "min_quote_vol": L2_MIN_QV,
+                      "exclude_top_n": 0, "sl_cap_pct": 0.60, "scan_when_full": True})
 REV_T5L = _revl_desc("t5l", "TIGHT 5 LONG", rev5l_check_signal,
                      (rev5l_open_trades, rev5l_pending, rev5l_last_fire),
                      {"base_range": REV5L_BASE_RANGE, "vol_mult_l": REV5L_VOL_MULT,
@@ -6071,8 +6139,8 @@ def rev4l_loop():
 
 
 def rev5l_loop():
-    if not REVL_ENGINE_ENABLED: return
-    _rev_engine_loop(REV_T5L, lambda: rev5l_auto_enabled, REVL_SCAN_SECONDS)
+    # 2026-09-23: T5 LONG slot emptied (free for a future engine). No scanning, no orders.
+    print("T5 LONG slot empty - loop idle")
 
 
 def rev6l_loop():
@@ -7119,7 +7187,7 @@ def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
                 continue
 
             open_slots = eng["max_concurrent"] - (len(eng["open"]) + len(eng["pending"]))
-            if open_slots <= 0:
+            if open_slots <= 0 and not eng.get("scan_when_full"):
                 time.sleep(scan_seconds)
                 continue
 
@@ -7137,7 +7205,7 @@ def _rev_engine_loop(eng, is_enabled_fn, scan_seconds):
             _rev_candle_diag()
             scanned = fired = 0
             for sym in symbols:
-                if open_slots <= 0:
+                if open_slots <= 0 and not eng.get("scan_when_full"):
                     break
                 if rev_in_cooldown(sym, eng) or rev_symbol_busy(sym, eng):
                     continue

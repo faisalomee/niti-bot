@@ -2247,7 +2247,7 @@ def _regime_line():
 
 
 def handle_telegram_commands():
-    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev3_auto_enabled, rev7l_auto_enabled, rev7s_auto_enabled, l_auto_enabled, ema_alert_auto
+    global t3_auto_trade_enabled, t2_auto_trade_enabled, t3_scalp_auto_enabled, rev_auto_enabled, rev2_auto_enabled, rev4_auto_enabled, rev5_auto_enabled, rev6_auto_enabled, rev3_auto_enabled, rev7l_auto_enabled, rev7s_auto_enabled, l_auto_enabled, l2_auto_enabled, smcs_auto_enabled, ema_alert_auto
     global rev3l_auto_enabled, rev4l_auto_enabled, rev5l_auto_enabled, rev6l_auto_enabled
     offset = None
     # Discard any stale backlog on startup so an old /start can't silently flip
@@ -2306,6 +2306,8 @@ def handle_telegram_commands():
                         _off.append("LONGS")
                     if REV6_ENGINE_ENABLED: rev6_auto_enabled = True; _on.append("T6")
                     else: _off.append("T6")
+                    l_auto_enabled = l2_auto_enabled = smcs_auto_enabled = True
+                    _on.append("signals L1/L2/SMC-S")
                     _m = "ALL ENGINES ON: " + (", ".join(_on) if _on else "none")
                     if _off:
                         _m += "\nSkipped (disabled at build level): " + ", ".join(_off)
@@ -2321,6 +2323,7 @@ def handle_telegram_commands():
                     rev7l_auto_enabled = rev7s_auto_enabled = False
                     rev3l_auto_enabled = rev4l_auto_enabled = False
                     rev5l_auto_enabled = rev6l_auto_enabled = False
+                    l_auto_enabled = l2_auto_enabled = smcs_auto_enabled = False
                     send_tg("ALL ENGINES OFF: T1, T2, T3, T4, T5, T6 + LONG legs.\n"
                             "Open positions are NOT closed - they keep being tracked "
                             "and will exit on their own SL / TP / time-stop.")
@@ -2365,14 +2368,25 @@ def handle_telegram_commands():
                         send_tg("Tight 7 is disabled at build level (REV7_ENGINE_ENABLED=0).")
                     else:
                         rev7l_auto_enabled = rev7s_auto_enabled = True
-                        send_tg("Tight 7 (relative-strength leaders LONG + laggards SHORT) ON.")
+                        send_tg("Tight 7 ON: LONG = deep-dip, SHORT = laggards.")
                 elif text == "/l_start":
-                    l_auto_enabled = True
-                    send_tg("L1 (signal-only, deep-dip long) ON. Sends every qualifying "
-                            "signal to its own Telegram chat - no orders placed.")
+                    l_auto_enabled = l2_auto_enabled = True
+                    send_tg("L1 + L2 signals ON (signal only, no orders).")
                 elif text == "/l_stop":
-                    l_auto_enabled = False
-                    send_tg("L1 Auto-scan OFF.")
+                    l_auto_enabled = l2_auto_enabled = False
+                    send_tg("L1 + L2 signals OFF.")
+                elif text == "/l1_start":
+                    l_auto_enabled = True; send_tg("L1 signals ON.")
+                elif text == "/l1_stop":
+                    l_auto_enabled = False; send_tg("L1 signals OFF.")
+                elif text == "/l2_start":
+                    l2_auto_enabled = True; send_tg("L2 signals ON (only while the rally gate is open).")
+                elif text == "/l2_stop":
+                    l2_auto_enabled = False; send_tg("L2 signals OFF.")
+                elif text == "/smcs_start":
+                    smcs_auto_enabled = True; send_tg("SMC SHORT signals ON (signal only).")
+                elif text == "/smcs_stop":
+                    smcs_auto_enabled = False; send_tg("SMC SHORT signals OFF.")
                 elif text == "/l_status":
                     send_tg(l_status_text())
                 elif text == "/t7_stop":
@@ -4886,27 +4900,25 @@ def _rev7_common(symbol, eng):
     return _rev7_rs(symbol)
 
 
+T7DD_RISK_USDT = float(os.environ.get("T7DD_RISK_USDT", 6))      # ~$43 notional at a 14% stop
+T7DD_MAX_CONC  = int(os.environ.get("T7DD_MAX_CONCURRENT", 20))
+T7DD_LEVERAGE  = int(os.environ.get("T7DD_LEVERAGE", 5))
+T7DD_ATRP_MIN  = float(os.environ.get("T7DD_ATRP_MIN", 0.012))
+
+
 def rev7l_check_signal(symbol, btc_ret, eng):
-    """T7 LONG - buy the relative-strength leaders while BTC itself is falling."""
-    rs = _rev7_common(symbol, eng)
-    if rs is None or rs < _rev7_rank["long_cut"]:
+    """T7 LONG = deep-dip (2026-09-23, cell B): previous closed bar in the bottom 1% of its
+    96-bar range, latest closed bar closes above that bar's high, ATR% >= 1.2%.
+    Stop 8xATR, trail arm +8% / give 1%, time-stop 4 days. No regime gate."""
+    hit = l_check_signal(symbol, use_cooldown=False, atrp_min=T7DD_ATRP_MIN)
+    if hit is None:
         return None
-    if REV7_BTC_DOWN_FOR_LONG and not _rev7_rank.get("btc_down"):
+    px, a, pos = hit
+    sl = px - 8.0 * a
+    if sl <= 0:
         return None
-    candles = get_candles(symbol, limit=8 + REV_CANDLE_BUFFER, interval="15m")
-    if not candles:
-        return None
-    t = _bar_ms(candles[-1])
-    if t and (t % 900000) != 0:
-        candles = candles[:-1]
-    px = cl(candles[-1])
-    if px <= 0:
-        return None
-    sl = px * (1.0 - REV7L_DSTOP_PCT)
-    tp = px * (1.0 + REV7L_DSTOP_PCT * 3.0)    # far; the trail/timer is the real exit
-    print(f"[T7 LONG] {symbol} BUY rs4h={rs:+.4f} cut={_rev7_rank['long_cut']:+.4f} "
-          f"close={px} sl={round(sl,8)}")
-    return ("BUY", px, sl, tp)
+    print(f"[T7 LONG/DD] {symbol} BUY pos96={pos:.4f} atr%={a / px * 100:.2f} sl={round(sl, 8)}")
+    return ("BUY", px, sl, px * 1.60)    # far TP; trail/timer are the real exits
 
 
 def rev7s_check_signal(symbol, btc_ret, eng):
@@ -4962,9 +4974,11 @@ def _rev7_desc(tag, name, fn, side, dstop, arm, give, hold, notional, lev, cap,
 
 
 REV_T7L = _rev7_desc("t7l", "TIGHT 7 LONG", rev7l_check_signal, "BUY",
-                     REV7L_DSTOP_PCT, REV7L_TRAIL_ARM, REV7L_TRAIL_GIVE,
-                     REV7L_HOLD_SECONDS, REV7L_NOTIONAL_USDT, REV7L_LEVERAGE,
-                     REV7L_MAX_CONCURRENT, rev7l_open_trades, rev7l_pending, rev7l_last_fire)
+                     0.14, 0.08, 0.01, 4 * 24 * 3600, T7DD_RISK_USDT / 0.14, T7DD_LEVERAGE,
+                     T7DD_MAX_CONC, rev7l_open_trades, rev7l_pending, rev7l_last_fire)
+REV_T7L["sl_cap_pct"] = 0.45
+REV_T7L["cooldown_s"] = 24 * 3600
+REV_T7L["risk_usdt"] = T7DD_RISK_USDT
 REV_T7S = _rev7_desc("t7s", "TIGHT 7 SHORT", rev7s_check_signal, "SELL",
                      REV7S_DSTOP_PCT, REV7S_TRAIL_ARM, REV7S_TRAIL_GIVE,
                      REV7S_HOLD_SECONDS, REV7S_NOTIONAL_USDT, REV7S_LEVERAGE,
@@ -5384,7 +5398,7 @@ def short_spare_loop(eng):
 # so this is safe to deploy before he finishes setting the new bot up.
 # ============================================================================
 L_TG_TOKEN = os.environ.get("L_TG_TOKEN") or TG_TOKEN
-L_TG_CHAT_ID = os.environ.get("L_TG_CHAT_ID") or "957739778"   # Faisal's DM with @fazzsignal_bot
+L_TG_CHAT_ID = os.environ.get("L_TG_CHAT_ID") or "1035800369"   # Faisal's DM with @fazzsignal_bot
 L_SCAN_SECONDS = int(os.environ.get("L_SCAN_SECONDS", 300))
 L_COOLDOWN_SECONDS = int(os.environ.get("L_COOLDOWN_SECONDS", 24 * 3600))   # dedup 24h per coin
 L_POS_MAX = float(os.environ.get("L_POS_MAX", 0.01))       # close in bottom 1% of 96-bar range
@@ -5397,7 +5411,12 @@ L_HOLD_SECONDS = int(os.environ.get("L_HOLD_SECONDS", 4 * 24 * 3600))
 l_signal_log = {}
 l_paper_book = {}
 l_paper_closed = []
-l_auto_enabled = False
+_L_AUTO = os.environ.get("L_AUTO_START", "1") == "1"   # signals survive a restart
+l_auto_enabled = _L_AUTO
+l2_auto_enabled = _L_AUTO
+smcs_auto_enabled = _L_AUTO
+SMCS_ALERT_S = int(os.environ.get("SMCS_ALERT_SECONDS", 4 * 3600))
+_smcs_alerted = {}
 
 
 def send_l_signal(msg):
@@ -5409,14 +5428,15 @@ def send_l_signal(msg):
         print(f"[L] telegram send failed: {e}")
 
 
-def l_check_signal(symbol):
+def l_check_signal(symbol, use_cooldown=True, candles=None, atrp_min=None):
     """2026-09-20 L = DEEP-DIP signal (his spec): the PREVIOUS closed 15m bar sits in the
     bottom 1% of its own 96-bar range, the LATEST closed bar closes above that bar's high
     (confirmation - never buy the falling bar), and ATR% >= 1.2%. Returns (px, atr, pos)
     or None. Places no order."""
-    if time.time() - l_signal_log.get(symbol, 0) < L_COOLDOWN_SECONDS:
+    if use_cooldown and time.time() - l_signal_log.get(symbol, 0) < L_COOLDOWN_SECONDS:
         return None
-    candles = get_candles(symbol, limit=120 + REV_CANDLE_BUFFER, interval="15m")
+    if candles is None:
+        candles = get_candles(symbol, limit=130 + REV_CANDLE_BUFFER, interval="15m")
     if not candles:
         return None
     t = _bar_ms(candles[-1])
@@ -5440,13 +5460,81 @@ def l_check_signal(symbol):
     if not atrs or not atrs[-1] or atrs[-1] <= 0:
         return None
     a = atrs[-1]
-    if a / px < L_ATRP_MIN:
+    if a / px < (L_ATRP_MIN if atrp_min is None else atrp_min):
         return None
     return (px, a, pos)
 
 
+def _closed_15m(symbol, n=130):
+    """Fetch once, drop the still-forming bar (same convention as every engine here)."""
+    c = get_candles(symbol, limit=n + REV_CANDLE_BUFFER, interval="15m")
+    if not c:
+        return None
+    t = _bar_ms(c[-1])
+    if t and (t % 900000) != 0:
+        c = c[:-1]
+    return c
+
+
+def _atr14(c):
+    trs = [max(h(c[j]) - l(c[j]), abs(h(c[j]) - cl(c[j - 1])), abs(l(c[j]) - cl(c[j - 1])))
+           for j in range(len(c) - 14, len(c))]
+    return sum(trs) / 14.0
+
+
+def l2_check_signal(symbol, c):
+    """L2 rally-momentum long, SIGNAL ONLY. Bear-off via revl_gate_open()."""
+    if not revl_gate_open() or c is None or len(c) < 35:
+        return None
+    if sum(cl(x) * v(x) for x in c[-96:]) < L2_MIN_QV:
+        return None
+    c0, px = cl(c[-17]), cl(c[-1])
+    if c0 <= 0:
+        return None
+    bar, r, atr = int(c[-1]["time"]), px / c0 - 1.0, _atr14(c)
+    prev = _l2_note(bar, r)
+    if prev is None or atr <= 0:
+        return None
+    br = sum(1 for z in prev if z > 0) / len(prev)
+    thr = prev[min(len(prev) - 1, int(len(prev) * (1.0 - L2_TOP_PCT)))]
+    b = _l2_btc_ret(bar)
+    if b is None or b <= L2_BTC_MIN or br <= L2_BREADTH or r < thr:
+        return None
+    sl = px - L2_SL_ATR * atr
+    if sl <= 0 or time.time() - _l2_alerted.get(symbol, 0) < L2_ALERT_S:
+        return None
+    _l2_alerted[symbol] = time.time()
+    return px, sl, px + L2_TP_R * (px - sl), r, b, br
+
+
+def smcs_check_signal(symbol, c):
+    """SMC SHORT, SIGNAL ONLY: coin up >= 20% in 24h sweeps its 48-bar high by >= 0.7 ATR,
+    closes back below it on a red bar with body >= 1x the 20-bar average, ATR% >= 2%.
+    Stop 10xATR, TP 0.75R, 24h. Validated bull+bear 2026-09-23 (win 71-79%)."""
+    if c is None or len(c) < 110:
+        return None
+    k = c[-1]; px = cl(k)
+    if px <= 0 or px >= o(k):
+        return None
+    hi48 = max(h(x) for x in c[-49:-1])
+    atr = _atr14(c)
+    if atr <= 0 or atr / px < 0.02 or h(k) < hi48 + 0.7 * atr or px >= hi48:
+        return None
+    bavg = sum(abs(cl(x) - o(x)) for x in c[-21:-1]) / 20.0
+    if abs(px - o(k)) < bavg:
+        return None
+    r24 = px / cl(c[-97]) - 1.0
+    if r24 < 0.20 or sum(cl(x) * v(x) for x in c[-96:]) < 1_000_000:
+        return None
+    if time.time() - _smcs_alerted.get(symbol, 0) < SMCS_ALERT_S:
+        return None
+    _smcs_alerted[symbol] = time.time()
+    sl = px + 10 * atr
+    return px, sl, px - 0.75 * (sl - px), r24
+
+
 def l_scan_once():
-    if not l_auto_enabled:
+    if not (l_auto_enabled or l2_auto_enabled or smcs_auto_enabled):
         return
     try:
         syms = get_futures_symbols() or []
@@ -5455,7 +5543,25 @@ def l_scan_once():
         return
     for sym in syms:
         try:
-            hit = l_check_signal(sym)
+            c = _closed_15m(sym)
+            if l2_auto_enabled:
+                x = l2_check_signal(sym, c)
+                if x:
+                    px2, sl2, tp2, r2, b2, br2 = x
+                    send_l_signal(f"[L2 SIGNAL] {sym} LONG\nEntry: {px2}\nStop ({L2_SL_ATR:.0f}xATR): "
+                                  f"{round(sl2, 8)}  ({(px2 - sl2) / px2 * 100:.1f}% away)\n"
+                                  f"TP ({L2_TP_R:.1f}R): {round(tp2, 8)}\nHold: 24h\n"
+                                  f"4h: {r2 * 100:+.1f}% | BTC 4h: {b2 * 100:+.1f}% | breadth: {br2 * 100:.0f}%\n"
+                                  f"(signal only - no order placed)")
+            if smcs_auto_enabled:
+                x = smcs_check_signal(sym, c)
+                if x:
+                    px3, sl3, tp3, r3 = x
+                    send_l_signal(f"[SMC SHORT SIGNAL] {sym} SHORT\nEntry: {px3}\nStop (10xATR): "
+                                  f"{round(sl3, 8)}  ({(sl3 - px3) / px3 * 100:.1f}% away)\n"
+                                  f"TP (0.75R): {round(tp3, 8)}\nHold: 24h\n24h move: {r3 * 100:+.1f}%\n"
+                                  f"(signal only - no order placed)")
+            hit = l_check_signal(sym, candles=c) if (l_auto_enabled and c) else None
         except Exception as e:
             print(f"[L] {sym} check failed: {e}")
             continue
@@ -5901,40 +6007,45 @@ def _l2_btc_ret(bar):
     return _l2_btc["ret"]
 
 
+SMCL_RISK_USDT = float(os.environ.get("SMCL_RISK_USDT", 10))     # stop >= 20% -> notional <= $50
+SMCL_MAX_CONC  = int(os.environ.get("SMCL_MAX_CONCURRENT", 20))
+SMCL_MAX_MARGIN = float(os.environ.get("SMCL_MAX_MARGIN_USDT", 10))
+SMCL_LEVERAGE  = int(os.environ.get("SMCL_LEVERAGE", 5))
+
+
 def rev4l_check_signal(symbol, btc_ret, eng):
-    """L2 rally momentum long (T4 LONG slot)."""
-    if not revl_gate_open():
+    """T4 LONG = SMC dip-sweep LONG (2026-09-23). Coin down >= 20% in 24h sweeps its 20-bar
+    low and closes back above it on a green bar with body >= 1x the 20-bar average,
+    ATR% >= 2%, close below its 4h EMA200 (15m EMA800). Stop 10xATR, TP 1.5R, 24h.
+    Validated bull (win 68%) and bear (win 80%) at cap 20. No regime gate."""
+    c = _closed_15m(symbol)
+    if c is None or len(c) < 110:
         return None
-    x = _l2_ret4h(symbol)
-    if x is None:
+    k = c[-1]; px = cl(k)
+    if px <= 0 or px <= o(k):
         return None
-    bar, r, px, atr = x
-    prev = _l2_note(bar, r)
-    if prev is None or atr <= 0:
+    lo20 = min(l(x) for x in c[-21:-1])
+    if not (l(k) < lo20 < px):
         return None
-    br = sum(1 for z in prev if z > 0) / len(prev)
-    thr = prev[min(len(prev) - 1, int(len(prev) * (1.0 - L2_TOP_PCT)))]
-    b = _l2_btc_ret(bar)
-    if b is None or b <= L2_BTC_MIN or br <= L2_BREADTH or r < thr:
+    atr = _atr14(c)
+    if atr <= 0 or atr / px < 0.02:
         return None
-    sl = px - L2_SL_ATR * atr
+    bavg = sum(abs(cl(x) - o(x)) for x in c[-21:-1]) / 20.0
+    if px - o(k) < bavg or px / cl(c[-97]) - 1.0 > -0.20:
+        return None
+    long_c = get_candles(symbol, limit=1000, interval="15m")
+    if not long_c or len(long_c) < 800:
+        return None
+    ema, a = cl(long_c[0]), 2.0 / 801.0
+    for x in long_c[1:]:
+        ema += a * (cl(x) - ema)
+    if px >= ema:
+        return None
+    sl = px - 10 * atr
     if sl <= 0:
         return None
-    tp = px + L2_TP_R * (px - sl)
-    full = len(eng["open"]) + len(eng["pending"]) >= eng["max_concurrent"]
-    now = time.time()
-    if now - _l2_alerted.get(symbol, 0) >= L2_ALERT_S:
-        _l2_alerted[symbol] = now
-        send_l_signal(f"[L2 SIGNAL] {symbol} LONG\n"
-                      f"Entry: {px}\nStop ({L2_SL_ATR:.0f}xATR): {round(sl, 8)}  "
-                      f"({(px - sl) / px * 100:.1f}% away)\nTP ({L2_TP_R:.1f}R): {round(tp, 8)}\n"
-                      f"Hold: 24h\n4h: {r * 100:+.1f}% | BTC 4h: {b * 100:+.1f}% | "
-                      f"breadth: {br * 100:.0f}%\n"
-                      + ("CAP FULL - manual only" if full else "T4 LONG executing"))
-    if full:
-        return None
-    print(f"[T4L/L2] {symbol} BUY 4h={r*100:+.1f}% btc={b*100:+.1f}% br={br:.2f} sl={sl:.6g}")
-    return ("BUY", px, sl, tp)
+    print(f"[T4L/SMC] {symbol} BUY sweep lo20={lo20:.6g} r24={(px / cl(c[-97]) - 1) * 100:+.1f}% sl={sl:.6g}")
+    return ("BUY", px, sl, px + 1.5 * (px - sl))
 
 
 # ---------------- T5 LONG = "N2", quiet base + volume expansion ----------------
@@ -6111,11 +6222,11 @@ REV_T3L = _revl_desc("t3l", "TIGHT 3 LONG", rev3l_check_signal,
                       "trail_arm": REV3L_TRAIL_ARM, "trail_give": REV3L_TRAIL_GIVE})
 REV_T4L = _revl_desc("t4l", "TIGHT 4 LONG", rev4l_check_signal,
                      (rev4l_open_trades, rev4l_pending, rev4l_last_fire),
-                     {"trail_arm": 0.0, "trail_give": 0.0, "risk_usdt": L2_RISK_USDT,
-                      "max_concurrent": L2_MAX_CONC, "max_margin": L2_MAX_MARGIN,
-                      "leverage": L2_LEVERAGE, "hold_seconds": 24 * 3600,
-                      "cooldown_s": 4 * 3600, "min_quote_vol": L2_MIN_QV,
-                      "exclude_top_n": 0, "sl_cap_pct": 0.60, "scan_when_full": True})
+                     {"trail_arm": 0.0, "trail_give": 0.0, "risk_usdt": SMCL_RISK_USDT,
+                      "max_concurrent": SMCL_MAX_CONC, "max_margin": SMCL_MAX_MARGIN,
+                      "leverage": SMCL_LEVERAGE, "hold_seconds": 24 * 3600,
+                      "cooldown_s": 4 * 3600, "min_quote_vol": 1_000_000,
+                      "exclude_top_n": 0, "sl_cap_pct": 0.90})
 REV_T5L = _revl_desc("t5l", "TIGHT 5 LONG", rev5l_check_signal,
                      (rev5l_open_trades, rev5l_pending, rev5l_last_fire),
                      {"base_range": REV5L_BASE_RANGE, "vol_mult_l": REV5L_VOL_MULT,

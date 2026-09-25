@@ -3513,6 +3513,7 @@ rev2_auto_enabled     = AUTO_RESUME_ON_START   # /t2_start /t2_stop
 # PnL $193 -> $273. Everything up or flat, no trade-off. TRAIN +0.180 / TEST +0.062,
 # flip control -0.210, survives 50bps, top-3 33%.
 REV2_RET_THR          = float(os.environ.get("REV2_RET_THR", 0.07))
+REV2_RET_THR_SHORT    = float(os.environ.get("REV2_RET_THR_SHORT", 0.15))   # 2026-09-23: 7-15% pumps lose in rally
 REV2_VOL_MULT         = float(os.environ.get("REV2_VOL_MULT", 1.1))
 REV2_VOL_MULT_MAX     = float(os.environ.get("REV2_VOL_MULT_MAX", 0.0))
 REV2_ATRP_MAX         = float(os.environ.get("REV2_ATRP_MAX", 0.0))
@@ -3570,7 +3571,7 @@ REV_T2 = {
     "mv_atr_short": 4.0, "mv_atr_long": 8.0,
     "vol_mult_short": 1.1, "vol_mult_long": 1.1,
     "atrp_min_short": 0.006, "atrp_min_long": 0.006,
-    "ret_thr_short": 0.0, "ret_thr_long": 0.0,
+    "ret_thr_short": REV2_RET_THR_SHORT, "ret_thr_long": 0.0,
     "range_regime_short": "CALM", "range_regime_long": None,
     "cvd_filter_short": False, "cvd_filter_long": False,
     "cvd_filter": False, "range_regime": None,

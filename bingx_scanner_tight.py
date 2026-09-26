@@ -3389,6 +3389,8 @@ REV_ATR_LEN          = int(os.environ.get("REV_ATR_LEN", 14))
 REV_LONG_SL_ATR      = float(os.environ.get("REV_LONG_SL_ATR", 3.9))   # 2026-09-09: 3.0 -> 3.9 (SLx1.3)
 REV_LONG_TP_R        = float(os.environ.get("REV_LONG_TP_R", 1.50))  # 2026-09-09: 0.50 -> 1.50
 REV_SHORT_SL_ATR     = float(os.environ.get("REV_SHORT_SL_ATR", 3.0))   # 2026-09-03
+REV1_SHORT_TP_R      = float(os.environ.get("REV1_SHORT_TP_R", 1.0))    # 2026-09-27: 2.5R never reached in rally
+REV1_RET_THR_SHORT   = float(os.environ.get("REV1_RET_THR_SHORT", 0.15))  # 2026-09-27: short only 15%+ 24h pumps
 REV_SHORT_TP_R       = float(os.environ.get("REV_SHORT_TP_R", 2.50))  # 2026-09-09: 1.00 -> 2.50
 REV_SL_CAP_PCT       = float(os.environ.get("REV_SL_CAP_PCT", 0.06))  # skip if SL > 6% away
 REV_BTC_WINDOW       = int(os.environ.get("REV_BTC_WINDOW", 384))     # 384 x 15m = 4 days
@@ -3465,7 +3467,7 @@ REV_T1 = {
     "ret_thr": REV_RET_THR, "vol_mult": REV_VOL_MULT, "vol_mult_max": 0.0,   # 0 = no upper band
     "atrp_max": 0.0,                                                          # 0 = no ATR% ceiling
     "long_sl_atr": REV_LONG_SL_ATR, "long_tp_r": REV_LONG_TP_R,
-    "short_sl_atr": REV_SHORT_SL_ATR, "short_tp_r": REV_SHORT_TP_R,
+    "short_sl_atr": REV_SHORT_SL_ATR, "short_tp_r": REV1_SHORT_TP_R,
     "sl_cap_pct": REV_SL_CAP_PCT, "risk_usdt": REV_RISK_USDT, "leverage": REV_LEVERAGE,
     "max_concurrent": REV_MAX_CONCURRENT, "max_margin": REV_MAX_MARGIN_USDT,
     # ---- 2026-09-03 RETUNE: the legs are tuned separately ----
@@ -3479,7 +3481,7 @@ REV_T1 = {
     "mv_atr_short": 4.0, "mv_atr_long": 0.0,
     "vol_mult_short": 1.5, "vol_mult_long": 2.0,
     "atrp_min_short": 0.010, "atrp_min_long": 0.006,
-    "ret_thr_short": 0.0, "ret_thr_long": REV_RET_THR,
+    "ret_thr_short": REV1_RET_THR_SHORT, "ret_thr_long": REV_RET_THR,
     "range_regime_short": "CALM", "range_regime_long": None,
     "cvd_filter_short": True, "cvd_filter_long": True,
     "cvd_filter": True, "range_regime": "CALM",
@@ -6056,25 +6058,60 @@ REV5L_TRAIL_ARM  = float(os.environ.get("REV5L_TRAIL_ARM", REVL_TRAIL_ARM))
 REV5L_TRAIL_GIVE = float(os.environ.get("REV5L_TRAIL_GIVE", REVL_TRAIL_GIVE))
 
 
+RD_RISK_USDT = float(os.environ.get("RD_RISK_USDT", 6))
+RD_MAX_CONC  = int(os.environ.get("RD_MAX_CONCURRENT", 20))
+RD_LEVERAGE  = int(os.environ.get("RD_LEVERAGE", 5))
+RD_POS_MAX   = float(os.environ.get("RD_POS_MAX", 0.05))
+RD_BREADTH   = float(os.environ.get("RD_BREADTH", 0.60))
+RD_BTC7_MIN  = float(os.environ.get("RD_BTC7_MIN", 0.03))
+_rd_xs = {"bar": None, "n": 0, "up": 0, "prev": None}
+_rd_btc = {"bar": None, "r7": None}
+
+
+def _rd_btc7(bar):
+    if _rd_btc["bar"] != bar:
+        c = get_candles("BTC-USDT", limit=700, interval="15m")
+        r7 = None
+        if c and len(c) >= 674:
+            r7 = cl(c[-2]) / cl(c[-674]) - 1.0
+        _rd_btc["bar"], _rd_btc["r7"] = bar, r7
+    return _rd_btc["r7"]
+
+
 def rev5l_check_signal(symbol, btc_ret, eng):
-    """Quiet 30d base + today's volume >= 2x the 7d average + green close + above EMA20."""
-    c = _revl_common(symbol, eng, 40)
-    if c is None:
+    """T5 LONG = Rally Dip (2026-09-27). In a broad rally (>60% of coins up over 4h AND
+    BTC up >3% over 7 days), buy a coin whose previous closed bar sat in the bottom 5% of
+    its 24h range and whose latest closed bar closed above that bar's high, ATR% >= 1.2%.
+    Stop 8xATR, trail arm +8% / give 1%, 4-day time-stop. Silent outside a rally."""
+    c = _closed_15m(symbol, 120)
+    if c is None or len(c) < 100:
         return None
-    hi, lo, cls, qv, i, q7 = c
-    if i < 33 or q7 <= 0:
+    bar = int(c[-1]["time"])
+    up = cl(c[-1]) > cl(c[-17])
+    if _rd_xs["bar"] != bar:
+        if _rd_xs["bar"] is not None and _rd_xs["n"] >= 30:
+            _rd_xs["prev"] = _rd_xs["up"] / _rd_xs["n"]
+        _rd_xs.update(bar=bar, n=0, up=0)
+    _rd_xs["n"] += 1; _rd_xs["up"] += int(up)
+    br = _rd_xs["prev"]
+    if br is None or br <= RD_BREADTH:
         return None
-    br = _revl_base_range(cls, i, 30)
-    if br is None or br >= eng.get("base_range", REV5L_BASE_RANGE):
+    sig, k = c[-2], c[-1]
+    w = c[-97:-1]
+    hi, lo = max(h(x) for x in w), min(l(x) for x in w)
+    if hi <= lo or (cl(sig) - lo) / (hi - lo) > RD_POS_MAX or cl(k) <= h(sig):
         return None
-    if qv[i] < eng.get("vol_mult_l", REV5L_VOL_MULT) * q7:
+    px = cl(k); atr = _atr14(c)
+    if atr <= 0 or atr / px < 0.012:
         return None
-    if cls[i] <= cls[i - 1]:
+    b7 = _rd_btc7(bar)
+    if b7 is None or b7 <= RD_BTC7_MIN:
         return None
-    if cls[i] <= _revl_ema(cls[-30:], 20):
+    sl = px - 8.0 * atr
+    if sl <= 0:
         return None
-    print(f"[T5L] {symbol} BUY vol {qv[i]/q7:.1f}x base={br:.2f} close={cls[i]}")
-    return _revl_pack(eng, cls[i])
+    print(f"[T5L/RALLY-DIP] {symbol} BUY breadth={br:.2f} btc7={b7 * 100:+.1f}% sl={round(sl, 8)}")
+    return ("BUY", px, sl, px * 1.60)
 
 
 # ---------------- T6 LONG = "V4", low-beta quiet base, winner capped ----------------
@@ -6230,8 +6267,10 @@ REV_T4L = _revl_desc("t4l", "TIGHT 4 LONG", rev4l_check_signal,
                       "exclude_top_n": 0, "sl_cap_pct": 0.90})
 REV_T5L = _revl_desc("t5l", "TIGHT 5 LONG", rev5l_check_signal,
                      (rev5l_open_trades, rev5l_pending, rev5l_last_fire),
-                     {"base_range": REV5L_BASE_RANGE, "vol_mult_l": REV5L_VOL_MULT,
-                      "trail_arm": REV5L_TRAIL_ARM, "trail_give": REV5L_TRAIL_GIVE})
+                     {"trail_arm": 0.08, "trail_give": 0.01, "risk_usdt": RD_RISK_USDT,
+                      "max_concurrent": RD_MAX_CONC, "max_margin": 20, "leverage": RD_LEVERAGE,
+                      "hold_seconds": 4 * 24 * 3600, "cooldown_s": 24 * 3600,
+                      "min_quote_vol": 2_000_000, "exclude_top_n": 0, "sl_cap_pct": 0.45})
 REV_T6L = _revl_desc("t6l", "TIGHT 6 LONG", rev6l_check_signal,
                      (rev6l_open_trades, rev6l_pending, rev6l_last_fire),
                      {"base_range": REV6L_BASE_RANGE, "beta_max": REV6L_BETA_MAX,
@@ -6251,8 +6290,8 @@ def rev4l_loop():
 
 
 def rev5l_loop():
-    # 2026-09-23: T5 LONG slot emptied (free for a future engine). No scanning, no orders.
-    print("T5 LONG slot empty - loop idle")
+    # 2026-09-27: T5 LONG = Rally Dip. Runs even if the old long book is build-disabled.
+    _rev_engine_loop(REV_T5L, lambda: rev5l_auto_enabled, REVL_SCAN_SECONDS)
 
 
 def rev6l_loop():

@@ -812,6 +812,35 @@ def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
     return oid
 
 
+def place_tp_limit_order(symbol, close_side, pos_side, tp_price, qty):
+    """2026-09-29: TP as a resting LIMIT on the close side (maker, no slippage).
+    Hedge mode: close_side + positionSide can only reduce the position."""
+    url = BASE_URL + "/openApi/swap/v2/trade/order"
+    params = build_signed_params({
+        "symbol": symbol, "side": close_side, "positionSide": pos_side,
+        "type": "LIMIT", "price": round(tp_price, 6), "quantity": qty,
+        "timeInForce": "GTC",
+    })
+    r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+    oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
+    if oid == "N/A":
+        print(f"[TP-LIMIT FAIL] {symbol} {close_side} qty={qty} price={tp_price} - BingX: {r}")
+    return oid
+
+
+def place_tp_limit_guarded(symbol, close_side, pos_side, tp_price, qty, label=""):
+    """LIMIT TP with one retry; falls back to the TAKE_PROFIT_MARKET path if both fail."""
+    tp_id = place_tp_limit_order(symbol, close_side, pos_side, tp_price, qty)
+    if tp_id and tp_id != "N/A":
+        return tp_id
+    time.sleep(1)
+    tp_id = place_tp_limit_order(symbol, close_side, pos_side, tp_price, qty)
+    if tp_id and tp_id != "N/A":
+        return tp_id
+    print(f"[TP-LIMIT] {symbol} {label} limit TP failed twice - falling back to TP-market")
+    return place_tp_guarded(symbol, close_side, pos_side, tp_price, qty, label=label)
+
+
 def place_tp_guarded(symbol, close_side, pos_side, tp_price, qty, label=""):
     """Place a TP order with one retry (mirrors place_sl_guarded). Returns tp_id,
     or "N/A" if BOTH attempts failed - caller keeps the position (SL still protects
@@ -1000,6 +1029,15 @@ def get_open_orders_for(symbol):
                 sl_id, sl_price = oid, stop
             elif otype == "TAKE_PROFIT_MARKET" and tp_id is None:
                 tp_id, tp_price = oid, stop
+            elif otype == "LIMIT" and tp_id is None:
+                # 2026-09-29: LIMIT TPs (tp_limit engines). Close side only: SELL on a
+                # LONG position or BUY on a SHORT position. Entry limits are the opposite.
+                _sd = str(od.get("side", "")).upper(); _ps = str(od.get("positionSide", "")).upper()
+                if (_sd == "SELL" and _ps == "LONG") or (_sd == "BUY" and _ps == "SHORT"):
+                    try:
+                        tp_id, tp_price = oid, float(od.get("price", 0) or 0)
+                    except Exception:
+                        pass
     except Exception as e:
         print(f"[OPEN ORDERS ERROR] {symbol}: {e}")
     return sl_id, sl_price, tp_id, tp_price
@@ -3577,6 +3615,9 @@ REV_T2 = {
     "range_regime_short": "CALM", "range_regime_long": None,
     "cvd_filter_short": False, "cvd_filter_long": False,
     "cvd_filter": False, "range_regime": None,
+    # 2026-09-29: T2 LONG merged into T7 LONG (Tier A crash-bounce). Same signal family,
+    # so running both would open the same coin twice. Env REV2_LONG_ON=1 restores it.
+    "side_only": None if os.environ.get("REV2_LONG_ON", "0") == "1" else "SELL",
     "open": rev2_open_trades, "pending": rev2_pending, "last_fire": rev2_last_fire,
 }
 
@@ -4903,13 +4944,71 @@ def _rev7_common(symbol, eng):
     return _rev7_rs(symbol)
 
 
-T7DD_RISK_USDT = float(os.environ.get("T7DD_RISK_USDT", 6))      # ~$43 notional at a 14% stop
-T7DD_MAX_CONC  = int(os.environ.get("T7DD_MAX_CONCURRENT", 20))
+T7DD_RISK_USDT = float(os.environ.get("T7DD_RISK_USDT", 1.0))    # 2026-09-29 Tier A: edge needs ~60 slots, so small risk
+T7DD_MAX_CONC  = int(os.environ.get("T7DD_MAX_CONCURRENT", 60))
+T7A_BTC4H_MAX  = float(os.environ.get("T7A_BTC4H_MAX", -0.02))     # BTC 4h return must be <= -2%
+T7A_POS_MAX    = float(os.environ.get("T7A_POS_MAX", 0.02))
+T7A_MV_ATR     = float(os.environ.get("T7A_MV_ATR", 12.0))
+T7A_ATRP_MIN   = float(os.environ.get("T7A_ATRP_MIN", 0.006))
+T7A_MIN_QV24   = float(os.environ.get("T7A_MIN_QV24", 2_000_000))
+T7A_SL_ATR     = float(os.environ.get("T7A_SL_ATR", 5.0))
+T7A_TP_R       = float(os.environ.get("T7A_TP_R", 0.75))
+T7A_SL_CAP     = float(os.environ.get("T7A_SL_CAP", 0.15))          # liquidation-safe at 5x
 T7DD_LEVERAGE  = int(os.environ.get("T7DD_LEVERAGE", 5))
 T7DD_ATRP_MIN  = float(os.environ.get("T7DD_ATRP_MIN", 0.012))
 
 
+_t7a_btc = {"bar": None, "r4": None}
+
+def _t7a_btc4h(bar):
+    if _t7a_btc["bar"] != bar:
+        b = _closed_15m("BTC-USDT", 30)
+        r4 = None
+        if b and len(b) >= 17 and cl(b[-17]) > 0:
+            r4 = cl(b[-1]) / cl(b[-17]) - 1.0
+        _t7a_btc["bar"], _t7a_btc["r4"] = bar, r4
+    return _t7a_btc["r4"]
+
+
 def rev7l_check_signal(symbol, btc_ret, eng):
+    """2026-09-29 T7 LONG = TIER A CRASH-BOUNCE (replaces the deep-dip confirm entry,
+    which measured win 45-48% / negative on BingX through the live-code harness).
+    Buy the coin sitting at its 24h low after a >=12 ATR fall, ONLY while BTC is down
+    >=2% over 4h (market-wide dump). Stop 5xATR, TP 0.75R (resting LIMIT), 48h.
+    Validated through the harness on Binance bear, BingX and Binance bull (2024-25):
+    win 67-75%, TRAIN/TEST positive on all three, positive at 100bps."""
+    c = _closed_15m(symbol, 130)
+    if c is None or len(c) < 110:
+        return None
+    px = cl(c[-1])
+    if px <= 0:
+        return None
+    r4 = _t7a_btc4h(int(c[-1]["time"]))
+    if r4 is None or r4 > T7A_BTC4H_MAX:
+        return None
+    w = c[-97:]
+    hi_, lo_ = max(h(x) for x in w), min(l(x) for x in w)
+    if hi_ <= lo_ or (px - lo_) / (hi_ - lo_) > T7A_POS_MAX:
+        return None
+    atrs = atr_series([h(x) for x in c], [l(x) for x in c], [cl(x) for x in c], REV_ATR_LEN)
+    if not atrs or not atrs[-1] or atrs[-1] <= 0:
+        return None
+    a = atrs[-1]
+    if a / px < T7A_ATRP_MIN:
+        return None
+    if (cl(c[-97]) - px) / a < T7A_MV_ATR:
+        return None
+    if sum(cl(x) * v(x) for x in c[-96:]) < T7A_MIN_QV24:
+        return None
+    sl = px - T7A_SL_ATR * a
+    if sl <= 0 or (px - sl) / px > T7A_SL_CAP:
+        return None
+    tp = px + T7A_TP_R * (px - sl)
+    print(f"[T7 LONG/A] {symbol} BUY btc4h={r4*100:+.2f}% mv={(cl(c[-97]) - px) / a:.1f}ATR sl={round(sl, 8)} tp={round(tp, 8)}")
+    return ("BUY", px, sl, tp)
+
+
+def _rev7l_deepdip_OLD(symbol, btc_ret, eng):
     """T7 LONG = deep-dip (2026-09-23, cell B): previous closed bar in the bottom 1% of its
     96-bar range, latest closed bar closes above that bar's high, ATR% >= 1.2%.
     Stop 8xATR, trail arm +8% / give 1%, time-stop 4 days. No regime gate."""
@@ -4979,9 +5078,15 @@ def _rev7_desc(tag, name, fn, side, dstop, arm, give, hold, notional, lev, cap,
 REV_T7L = _rev7_desc("t7l", "TIGHT 7 LONG", rev7l_check_signal, "BUY",
                      0.14, 0.08, 0.01, 4 * 24 * 3600, T7DD_RISK_USDT / 0.14, T7DD_LEVERAGE,
                      T7DD_MAX_CONC, rev7l_open_trades, rev7l_pending, rev7l_last_fire)
-REV_T7L["sl_cap_pct"] = 0.45
+REV_T7L["sl_cap_pct"] = T7A_SL_CAP
 REV_T7L["cooldown_s"] = 24 * 3600
 REV_T7L["risk_usdt"] = T7DD_RISK_USDT
+# 2026-09-29 Tier A exits: fixed TP 0.75R as a resting LIMIT, no trail, 48h time-stop.
+REV_T7L["long_tp_r"] = T7A_TP_R
+REV_T7L["trail_arm"] = 0.0
+REV_T7L["trail_give"] = 0.0
+REV_T7L["hold_seconds"] = 48 * 3600
+REV_T7L["tp_limit"] = True
 REV_T7S = _rev7_desc("t7s", "TIGHT 7 SHORT", rev7s_check_signal, "SELL",
                      REV7S_DSTOP_PCT, REV7S_TRAIL_ARM, REV7S_TRAIL_GIVE,
                      REV7S_HOLD_SECONDS, REV7S_NOTIONAL_USDT, REV7S_LEVERAGE,
@@ -5894,20 +5999,35 @@ def revl_gate_shut():
 
 def _revl_daily_series(symbol, eng, need_days):
     """Closed daily bars for a symbol as (highs, lows, closes, qvols, last_close_ms)."""
-    lim = min(need_days * 96 + 96, 1400)
-    candles = get_candles(symbol, limit=lim + REV_CANDLE_BUFFER, interval="15m")
-    if candles:
-        t = _bar_ms(candles[-1])
-        if t and (t % 900000) != 0:
-            candles = candles[:-1]
-    if not candles or len(candles) < 96 * 5:
-        _rev_log_thin(symbol, eng, len(candles) if candles else 0, 96 * 5)
+    # 2026-09-29 BUGFIX: this asked for min(need_days*96+96, 1400) 15m bars = ~14 days,
+    # but T3L/T6L need 70 daily bars, so len(cls) < need_days on every call and both
+    # engines could NEVER fire. Daily bars are now built from 4h candles (6 per day,
+    # only complete days), which fits inside BingX's 1,440-bar request cap.
+    lim = min(need_days * 6 + 24, 1400)
+    candles = get_candles(symbol, limit=lim, interval="4h")
+    if not candles:
+        _rev_log_thin(symbol, eng, 0, need_days * 6)
         return None
-    bars, last_close = _rev5b_daily(candles)
-    if len(bars) < 5:
+    now_ms = time.time() * 1000.0
+    days = {}
+    for x in candles:
+        t = _bar_ms(x)
+        if not t or t % 14400000 != 0 or t + 14400000 > now_ms:
+            continue                      # skip the still-forming 4h bar
+        days.setdefault(t // 86400000, []).append(x)
+    hs, ls, cs, qs = [], [], [], []
+    last_close = 0
+    for k in sorted(days):
+        grp = sorted(days[k], key=_bar_ms)
+        if len(grp) < 6:
+            continue                      # partial day - never read as closed
+        hs.append(max(h(x) for x in grp)); ls.append(min(l(x) for x in grp))
+        cs.append(cl(grp[-1])); qs.append(sum(cl(x) * v(x) for x in grp))
+        last_close = (k + 1) * 86400000
+    if len(cs) < 5:
+        _rev_log_thin(symbol, eng, len(cs), need_days)
         return None
-    return ([b[0] for b in bars], [b[1] for b in bars],
-            [b[2] for b in bars], [b[3] for b in bars], last_close)
+    return (hs, ls, cs, qs, last_close)
 
 
 def _revl_common(symbol, eng, need_days):
@@ -6014,6 +6134,10 @@ SMCL_RISK_USDT = float(os.environ.get("SMCL_RISK_USDT", 10))     # stop >= 20% -
 SMCL_MAX_CONC  = int(os.environ.get("SMCL_MAX_CONCURRENT", 20))
 SMCL_MAX_MARGIN = float(os.environ.get("SMCL_MAX_MARGIN_USDT", 10))
 SMCL_LEVERAGE  = int(os.environ.get("SMCL_LEVERAGE", 5))
+SMCL_ATRP_MIN  = float(os.environ.get("SMCL_ATRP_MIN", 0.006))
+SMCL_BTC4H_MAX = float(os.environ.get("SMCL_BTC4H_MAX", -0.006))
+SMCL_SL_ATR    = float(os.environ.get("SMCL_SL_ATR", 6.0))
+SMCL_TP_R      = float(os.environ.get("SMCL_TP_R", 0.75))
 
 
 def rev4l_check_signal(symbol, btc_ret, eng):
@@ -6031,24 +6155,22 @@ def rev4l_check_signal(symbol, btc_ret, eng):
     if not (l(k) < lo20 < px):
         return None
     atr = _atr14(c)
-    if atr <= 0 or atr / px < 0.02:
+    # 2026-09-29 SMC FIX (harness-measured on 3 datasets): ATR% floor 2% -> 0.6%,
+    # EMA800 filter dropped, BTC 4h <= -0.6% required, stop 10 -> 6 ATR, TP 1.5 -> 0.75R.
+    # The old stop/TP were never reached in 24h (83-92% of exits were time-outs).
+    if atr <= 0 or atr / px < SMCL_ATRP_MIN:
         return None
     bavg = sum(abs(cl(x) - o(x)) for x in c[-21:-1]) / 20.0
     if px - o(k) < bavg or px / cl(c[-97]) - 1.0 > -0.20:
         return None
-    long_c = get_candles(symbol, limit=1000, interval="15m")
-    if not long_c or len(long_c) < 800:
+    r4 = _t7a_btc4h(int(k["time"]))
+    if r4 is None or r4 > SMCL_BTC4H_MAX:
         return None
-    ema, a = cl(long_c[0]), 2.0 / 801.0
-    for x in long_c[1:]:
-        ema += a * (cl(x) - ema)
-    if px >= ema:
+    sl = px - SMCL_SL_ATR * atr
+    if sl <= 0 or (px - sl) / px > 0.18:
         return None
-    sl = px - 10 * atr
-    if sl <= 0:
-        return None
-    print(f"[T4L/SMC] {symbol} BUY sweep lo20={lo20:.6g} r24={(px / cl(c[-97]) - 1) * 100:+.1f}% sl={sl:.6g}")
-    return ("BUY", px, sl, px + 1.5 * (px - sl))
+    print(f"[T4L/SMC] {symbol} BUY sweep lo20={lo20:.6g} r24={(px / cl(c[-97]) - 1) * 100:+.1f}% btc4h={r4*100:+.2f}% sl={sl:.6g}")
+    return ("BUY", px, sl, px + SMCL_TP_R * (px - sl))
 
 
 # ---------------- T5 LONG = "N2", quiet base + volume expansion ----------------
@@ -6130,6 +6252,8 @@ def _rev6l_btc_daily():
     try:
         c = get_candles("BTC-USDT", limit=200, interval="1d") or []
         closes = [cl(x) for x in c if cl(x) > 0]
+        if len(closes) < 70:
+            closes = _revl_btc_daily_closes() or []   # 2026-09-29: 4h fallback if 1d is thin
         if len(closes) >= 70:
             _rev6l_btc["closes"] = closes; _rev6l_btc["ts"] = time.time()
             return closes
@@ -6264,7 +6388,10 @@ REV_T4L = _revl_desc("t4l", "TIGHT 4 LONG", rev4l_check_signal,
                       "max_concurrent": SMCL_MAX_CONC, "max_margin": SMCL_MAX_MARGIN,
                       "leverage": SMCL_LEVERAGE, "hold_seconds": 24 * 3600,
                       "cooldown_s": 4 * 3600, "min_quote_vol": 1_000_000,
-                      "exclude_top_n": 0, "sl_cap_pct": 0.90})
+                      "exclude_top_n": 0, "sl_cap_pct": 0.18,
+                      # 2026-09-29: long_tp_r was 0.0 here, so the fill path placed NO TP
+                      # at all and the signal's TP was silently dropped. Now 0.75R, LIMIT.
+                      "long_tp_r": SMCL_TP_R, "tp_limit": True})
 REV_T5L = _revl_desc("t5l", "TIGHT 5 LONG", rev5l_check_signal,
                      (rev5l_open_trades, rev5l_pending, rev5l_last_fire),
                      {"trail_arm": 0.08, "trail_give": 0.01, "risk_usdt": RD_RISK_USDT,
@@ -7053,7 +7180,10 @@ def rev_track_pending(eng):
                 tp_id = "N/A"          # no fixed target by design: trail + time-stop only
                 print(f"[{name}] {sym} no exchange TP by design (trail/time exit)")
             else:
-                tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label=name)
+                if eng.get("tp_limit"):
+                    tp_id = place_tp_limit_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label=name)
+                else:
+                    tp_id = place_tp_guarded(sym, p["close_side"], p["pos_side"], tp, p["qty"], label=name)
             eng["open"][p["order_id"]] = {
                 "symbol": sym, "side": p["side"], "pos_side": p["pos_side"],
                 "close_side": p["close_side"], "entry": p["entry"], "entry_fill": fill,

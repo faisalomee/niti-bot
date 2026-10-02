@@ -3618,6 +3618,7 @@ REV_T2 = {
     # 2026-09-29: T2 LONG merged into T7 LONG (Tier A crash-bounce). Same signal family,
     # so running both would open the same coin twice. Env REV2_LONG_ON=1 restores it.
     "side_only": None if os.environ.get("REV2_LONG_ON", "0") == "1" else "SELL",
+    # 2026-10-02: T2 SHORT runs the Funding Squeeze Short (fs_check_signal, defined below).
     "open": rev2_open_trades, "pending": rev2_pending, "last_fire": rev2_last_fire,
 }
 
@@ -4944,7 +4945,7 @@ def _rev7_common(symbol, eng):
     return _rev7_rs(symbol)
 
 
-T7DD_RISK_USDT = float(os.environ.get("T7DD_RISK_USDT", 1.0))    # 2026-09-29 Tier A: edge needs ~60 slots, so small risk
+T7DD_RISK_USDT = float(os.environ.get("T7DD_RISK_USDT", 6.0))    # 2026-09-29 Tier A: edge needs ~60 slots, so small risk
 T7DD_MAX_CONC  = int(os.environ.get("T7DD_MAX_CONCURRENT", 60))
 T7A_BTC4H_MAX  = float(os.environ.get("T7A_BTC4H_MAX", -0.02))     # BTC 4h return must be <= -2%
 T7A_POS_MAX    = float(os.environ.get("T7A_POS_MAX", 0.02))
@@ -4952,7 +4953,7 @@ T7A_MV_ATR     = float(os.environ.get("T7A_MV_ATR", 12.0))
 T7A_ATRP_MIN   = float(os.environ.get("T7A_ATRP_MIN", 0.006))
 T7A_MIN_QV24   = float(os.environ.get("T7A_MIN_QV24", 2_000_000))
 T7A_SL_ATR     = float(os.environ.get("T7A_SL_ATR", 5.0))
-T7A_TP_R       = float(os.environ.get("T7A_TP_R", 0.75))
+T7A_TP_R       = float(os.environ.get("T7A_TP_R", 2.0))      # 2026-10-02: RR 1:2
 T7A_SL_CAP     = float(os.environ.get("T7A_SL_CAP", 0.15))          # liquidation-safe at 5x
 T7DD_LEVERAGE  = int(os.environ.get("T7DD_LEVERAGE", 5))
 T7DD_ATRP_MIN  = float(os.environ.get("T7DD_ATRP_MIN", 0.012))
@@ -5214,6 +5215,90 @@ def get_funding_rate(symbol):
     return rate
 
 
+_settled_fund_cache = {}
+
+def get_last_settled_funding(symbol):
+    """2026-10-02: last SETTLED funding (rate, fundingTime ms) from BingX funding history.
+    Cached 10 min. Returns (None, None) when unavailable - callers must SKIP the trade."""
+    now = time.time()
+    hit = _settled_fund_cache.get(symbol)
+    if hit and (now - hit[0]) < 600:
+        return hit[1], hit[2]
+    rate, ftime = None, None
+    try:
+        url = BASE_URL + "/openApi/swap/v2/quote/fundingRate"
+        r = requests.get(url, params={"symbol": symbol, "limit": 3}, timeout=8).json()
+        d = r.get("data") or []
+        if isinstance(d, dict):
+            d = [d]
+        best = None
+        for x in d:
+            ft = int(x.get("fundingTime") or 0)
+            if ft and ft <= now * 1000 and (best is None or ft > best[1]):
+                best = (float(x.get("fundingRate")), ft)
+        if best:
+            rate, ftime = best
+    except Exception as e:
+        print(f"[FS] funding history failed for {symbol}: {e}")
+    _settled_fund_cache[symbol] = (now, rate, ftime)
+    return rate, ftime
+
+
+FS_FR_MAX     = float(os.environ.get("FS_FR_MAX", -0.0003))   # last settled funding <= -0.03%
+FS_R24_MIN    = float(os.environ.get("FS_R24_MIN", 0.05))
+FS_R24_MAX    = float(os.environ.get("FS_R24_MAX", 0.30))
+FS_POS_MAX    = float(os.environ.get("FS_POS_MAX", 0.99))     # not at a 6h/12h/24h top
+FS_MIN_QV24   = float(os.environ.get("FS_MIN_QV24", 2_000_000))
+FS_ATRP_MIN   = float(os.environ.get("FS_ATRP_MIN", 0.006))
+FS_SL_ATR     = float(os.environ.get("FS_SL_ATR", 10.0))
+FS_SL_CAP     = float(os.environ.get("FS_SL_CAP", 0.25))
+FS_TP_R       = float(os.environ.get("FS_TP_R", 2.0))         # RR 1:2
+FS_FIRE_WINDOW_S = int(os.environ.get("FS_FIRE_WINDOW_S", 3600))   # only in the hour after a settlement
+
+
+def fs_check_signal(symbol, btc_ret, eng):
+    """2026-10-02 T2 SHORT = FUNDING SQUEEZE SHORT. Shorts are paying heavy funding
+    (last settled rate <= -0.03%) yet the coin is up 5-30% in 24h and not at a 6h/12h/24h
+    extreme: a squeeze that usually fades. Evaluated only in the hour after a funding
+    settlement (the backtest decided at settlement). SL 10xATR (skip if > 25%), TP 2R.
+    Backtest at $6 risk, 50bps, TP 2R: BingX 29/wk win 66% +$29.7/wk; Binance bear
+    34/wk 59% +$18.4; bull 2024-25 12/wk 52% -$1.3. No overlap with T1/T4/T6 pump shorts."""
+    c = _closed_15m(symbol, 130)
+    if c is None or len(c) < 110:
+        return None
+    px = cl(c[-1])
+    if px <= 0:
+        return None
+    rate, ftime = get_last_settled_funding(symbol)
+    if rate is None or rate > FS_FR_MAX:
+        return None
+    bar_close_ms = int(c[-1]["time"]) + 900000
+    if bar_close_ms - ftime > FS_FIRE_WINDOW_S * 1000 or bar_close_ms < ftime:
+        return None
+    r24 = px / cl(c[-97]) - 1.0
+    if not (FS_R24_MIN < r24 < FS_R24_MAX):
+        return None
+    for win in (25, 49, 97):
+        w = c[-win:]
+        hi_, lo_ = max(h(x) for x in w), min(l(x) for x in w)
+        if hi_ > lo_ and (px - lo_) / (hi_ - lo_) >= FS_POS_MAX:
+            return None
+    if sum(cl(x) * v(x) for x in c[-96:]) < FS_MIN_QV24:
+        return None
+    atrs = atr_series([h(x) for x in c], [l(x) for x in c], [cl(x) for x in c], REV_ATR_LEN)
+    if not atrs or not atrs[-1] or atrs[-1] <= 0:
+        return None
+    a = atrs[-1]
+    if a / px < FS_ATRP_MIN:
+        return None
+    sl = px + FS_SL_ATR * a
+    if (sl - px) / px > FS_SL_CAP:
+        return None
+    tp = px - FS_TP_R * (sl - px)
+    print(f"[T2 SHORT/FS] {symbol} SELL fr={rate*100:.3f}% r24={r24*100:+.1f}% sl={round(sl, 8)} tp={round(tp, 8)}")
+    return ("SELL", px, sl, tp)
+
+
 def _short_entry_setup(symbol, katr, atrp_min=None, need_confirm=True):
     """Shared 15m entry mechanics for every engine in this section.
 
@@ -5408,7 +5493,7 @@ T5S_HOLD     = int(os.environ.get("T5S_HOLD_SECONDS", 4 * 24 * 3600))
 T7S_KATR     = float(os.environ.get("T7S_KATR", 8.0))
 T7S_HOLD     = int(os.environ.get("T7S_HOLD_SECONDS", 4 * 24 * 3600))
 T7S_ATRP_MIN = float(os.environ.get("T7S_ATRP_MIN", 0.012))
-T7S_BEAR_ONLY = os.environ.get("T7S_BEAR_ONLY", "1") == "1"
+T7S_BEAR_ONLY = os.environ.get("T7S_BEAR_ONLY", "0") == "1"   # 2026-10-02: gate removed (better in all samples)
 
 
 # ---------------------------------------------------------------------------
@@ -5427,6 +5512,8 @@ REV_T7S = _short_desc("t7s", "TIGHT 7 SHORT", rev7s_new_check_signal, T7S_KATR, 
                       extra={"open": rev7s_open_trades, "pending": rev7s_pending,
                              "last_fire": rev7s_last_fire,
                              "atrp_min_note": T7S_ATRP_MIN})
+REV_T7S["short_tp_r"] = float(os.environ.get("T7S_TP_R", 2.0))   # 2026-10-02: RR 1:2
+REV_T7S["tp_limit"] = True
 
 # ---------------------------------------------------------------------------
 # THE FOUR SPARES. Coded now, OFF now. Each needs its own books so that turning one on
@@ -6130,14 +6217,14 @@ def _l2_btc_ret(bar):
     return _l2_btc["ret"]
 
 
-SMCL_RISK_USDT = float(os.environ.get("SMCL_RISK_USDT", 10))     # stop >= 20% -> notional <= $50
+SMCL_RISK_USDT = float(os.environ.get("SMCL_RISK_USDT", 6))     # stop >= 20% -> notional <= $50
 SMCL_MAX_CONC  = int(os.environ.get("SMCL_MAX_CONCURRENT", 20))
 SMCL_MAX_MARGIN = float(os.environ.get("SMCL_MAX_MARGIN_USDT", 10))
 SMCL_LEVERAGE  = int(os.environ.get("SMCL_LEVERAGE", 5))
 SMCL_ATRP_MIN  = float(os.environ.get("SMCL_ATRP_MIN", 0.006))
 SMCL_BTC4H_MAX = float(os.environ.get("SMCL_BTC4H_MAX", -0.006))
 SMCL_SL_ATR    = float(os.environ.get("SMCL_SL_ATR", 6.0))
-SMCL_TP_R      = float(os.environ.get("SMCL_TP_R", 0.75))
+SMCL_TP_R      = float(os.environ.get("SMCL_TP_R", 2.0))     # 2026-10-02: RR 1:2
 
 
 def rev4l_check_signal(symbol, btc_ret, eng):
@@ -6392,6 +6479,7 @@ REV_T4L = _revl_desc("t4l", "TIGHT 4 LONG", rev4l_check_signal,
                       # 2026-09-29: long_tp_r was 0.0 here, so the fill path placed NO TP
                       # at all and the signal's TP was silently dropped. Now 0.75R, LIMIT.
                       "long_tp_r": SMCL_TP_R, "tp_limit": True})
+REV_T4L["hold_seconds"] = 48 * 3600   # 2026-10-02: 2R target needs 48h
 REV_T5L = _revl_desc("t5l", "TIGHT 5 LONG", rev5l_check_signal,
                      (rev5l_open_trades, rev5l_pending, rev5l_last_fire),
                      {"trail_arm": 0.08, "trail_give": 0.01, "risk_usdt": RD_RISK_USDT,
@@ -7772,6 +7860,47 @@ def oi_collector_loop():
         time.sleep(OI_SCAN_INTERVAL_SECONDS)
 # ==================== END OI COLLECTOR ====================
 
+
+
+# ---- 2026-10-02: T2 SHORT = Funding Squeeze Short (RR 1:2), wired after all helpers exist ----
+if os.environ.get("REV2_FS_ON", "1") == "1":
+    REV_T2["signal_fn"] = fs_check_signal
+    REV_T2["side_only"] = "SELL"
+    REV_T2["short_tp_r"] = FS_TP_R
+    REV_T2["sl_cap_pct"] = FS_SL_CAP
+    REV_T2["hold_seconds"] = 96 * 3600
+    REV_T2["cooldown_s"] = 8 * 3600
+    REV_T2["risk_usdt"] = float(os.environ.get("FS_RISK_USDT", 6.0))
+    REV_T2["max_concurrent"] = int(os.environ.get("FS_MAX_CONCURRENT", 60))
+    REV_T2["leverage"] = int(os.environ.get("FS_LEVERAGE", 3))   # a 25% stop must sit inside liquidation
+    REV_T2["tp_limit"] = True
+    REV_T2["cvd_filter"] = False
+    REV_T2["range_regime"] = None
+
+# ---- 2026-10-02: T3 LONG execution OFF; T5 LONG signal-only ----
+if os.environ.get("REV3L_EXEC_ON", "0") != "1":
+    REV_T3L["max_concurrent"] = 0
+_t5l_sent = {}
+def _t5l_signal_only(symbol, btc_ret, eng):
+    sig = rev5l_check_signal(symbol, btc_ret, eng)
+    if sig:
+        now = time.time()
+        if now - _t5l_sent.get(symbol, 0) > 24 * 3600:
+            _t5l_sent[symbol] = now
+            side, px, sl, tp = sig
+            send_l_signal(f"T5 LONG signal (no order) {symbol} BUY entry {px} SL {round(sl, 8)} TP {round(tp, 8)}")
+    return None
+if os.environ.get("RD_EXEC_ON", "0") != "1":
+    REV_T5L["signal_fn"] = _t5l_signal_only
+
+
+# ---- 2026-10-02: engines that tested NEGATIVE are OFF (no new entries; open positions are still managed).
+# Each can be turned back on with its env var set to 1.
+for _name, _eng, _env in (("T1 (both legs)", "REV_T1", "T1_EXEC_ON"), ("T3 SHORT", "REV_T3", "T3S_EXEC_ON"),
+                          ("T4 SHORT", "REV_T4", "T4S_EXEC_ON"), ("T5 SHORT", "REV_T5", "T5S_EXEC_ON"),
+                          ("T5B SHORT", "REV_T5B", "T5B_EXEC_ON"), ("T6 SHORT", "REV_T6", "T6S_EXEC_ON")):
+    if os.environ.get(_env, "0") != "1" and isinstance(globals().get(_eng), dict):
+        globals()[_eng]["max_concurrent"] = 0
 
 if __name__ == "__main__":
     # Re-adopt anything already open on BingX BEFORE the engines start, so a restart

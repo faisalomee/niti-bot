@@ -752,6 +752,21 @@ def journal_closed_trade(trade):
 
 
 # ==================== LEVERAGE ====================
+LIQ_SAFETY = float(os.environ.get("LIQ_SAFETY", 0.80))   # stop may use at most 80% of the distance to liquidation
+
+
+def safe_leverage(symbol, want, stop_pct):
+    """2026-10-04: highest leverage <= `want` whose liquidation distance (~1/lev) stays
+    clear of the stop: lev <= LIQ_SAFETY / stop_pct. Never below 1x, never above the
+    symbol's exchange maximum."""
+    try:
+        cap = int(LIQ_SAFETY / stop_pct) if stop_pct > 0 else int(want)
+    except Exception:
+        cap = int(want)
+    lev = max(1, min(int(want), cap, int(symbol_max_lev.get(symbol, want) or want)))
+    return lev
+
+
 def get_fast_leverage(symbol):
     max_lev = symbol_max_lev.get(symbol, 20)
     calc = int(max_lev * 0.20)
@@ -2592,7 +2607,7 @@ def handle_telegram_commands():
                            "\nT3L 30d-high break +vol | T4L quiet base 3-up | T5L base+vol | T6L low-beta base" +
                            "\nEXIT: stop -" + str(round(REVL_DSTOP_PCT * 100)) + "%, then trail from peak. " +
                            "T6L caps a winner at +" + str(round(REV6L_TP_CAP * 100)) + "%." +
-                           "\nNotional $" + str(REVL_NOTIONAL_USDT) + " | leverage " + str(REVL_LEVERAGE) + "x")
+                           "\nRisk $" + str(REVL_RISK_USDT) + " per trade | leverage up to " + str(REVL_LEVERAGE) + "x (lowered per trade so liquidation sits beyond the stop)")
                     for _nm, _bk in (("T3L", rev3l_open_trades), ("T4L", rev4l_open_trades),
                                      ("T5L", rev5l_open_trades), ("T6L", rev6l_open_trades)):
                         _ls += f"\n{_nm}: open {len(_bk)}"
@@ -3462,10 +3477,22 @@ REV_MARGIN_MIN_FREE   = float(os.environ.get("REV_MARGIN_MIN_FREE", 5.0))
 
 
 def rev_margin_in_use():
-    """Margin currently committed across every engine's open + pending trades."""
+    """Margin currently committed across every engine's open + pending trades.
+    2026-10-04: used to count only T1/T2/T4 (+T3 sweep). T7L/T7S/T4L/T6L/T5L and the short
+    spares were invisible, so the 60% budget never saw them. Now every engine
+    descriptor's open/pending books are included (each book counted once)."""
     total = 0.0
-    for book in (rev_open_trades, rev_pending, rev2_open_trades, rev2_pending,
-                 rev4_open_trades, rev4_pending):
+    books, seen = [], set()
+    for b in (rev_open_trades, rev_pending, rev2_open_trades, rev2_pending,
+              rev4_open_trades, rev4_pending):
+        if id(b) not in seen:
+            seen.add(id(b)); books.append(b)
+    for _v in list(globals().values()):
+        if isinstance(_v, dict) and "signal_fn" in _v and "open" in _v and "pending" in _v:
+            for b in (_v.get("open"), _v.get("pending")):
+                if isinstance(b, dict) and id(b) not in seen:
+                    seen.add(id(b)); books.append(b)
+    for book in books:
         for t in list(book.values()):
             try:
                 total += float(t.get("margin_used", 0) or 0)
@@ -5256,6 +5283,52 @@ FS_TP_R       = float(os.environ.get("FS_TP_R", 2.0))         # RR 1:2
 FS_FIRE_WINDOW_S = int(os.environ.get("FS_FIRE_WINDOW_S", 3600))   # only in the hour after a settlement
 
 
+# 2026-10-04 BULL-OFF GATE for the Funding Squeeze short. New entries only when BOTH:
+#   BTC daily close is below its close 180 days earlier, AND BTC's 50-day EMA is falling
+#   (today's EMA below the EMA 3 days ago). Uses completed daily bars only.
+#   Backtest ($6 risk, 50bps + 30bps slip, TP 2R, 96h): Binance bear 22.0/wk win 61.0% +$10.35/wk,
+#   BingX 11.5/wk win 67.4% +$10.23/wk, bull 2024-25 0.2/wk (engine idle, -$0.34/wk).
+#   Off: FS_REGIME_GATE=0.
+FS_REGIME_GATE = os.environ.get("FS_REGIME_GATE", "1") == "1"
+_fs_gate_cache = {"ts": 0.0, "ok": None, "info": ""}
+
+
+def fs_regime_allows():
+    now = time.time()
+    if now - _fs_gate_cache["ts"] < 3600 and _fs_gate_cache["ok"] is not None:
+        return _fs_gate_cache["ok"]
+    ok, info = False, "unavailable"
+    try:
+        d = get_candles("BTC-USDT", limit=200, interval="1d")
+        if d:
+            t = _bar_ms(d[-1])
+            if t and (t % 86400000) != 0:
+                d = d[:-1]          # drop the still-forming day
+        cls = [cl(x) for x in d] if d else []
+        if len(cls) >= 185:
+            ret180 = cls[-1] / cls[-181] - 1.0
+            k = 2.0 / 51.0
+            e = cls[0]; ema = []
+            for x in cls:
+                e = x * k + e * (1 - k); ema.append(e)
+            slope_down = ema[-1] < ema[-4]
+            ok = (ret180 < 0) and slope_down
+            info = f"BTC 180d {ret180*100:+.1f}% | EMA50 {'falling' if slope_down else 'rising'}"
+        else:
+            info = f"only {len(cls)} daily bars"
+    except Exception as e:
+        info = f"error {e}"
+    if _fs_gate_cache["ok"] is None or ok != _fs_gate_cache["ok"]:
+        msg = f"[FS GATE] {'OPEN' if ok else 'CLOSED'} - {info}"
+        print(msg)
+        try:
+            send_tg("T2 SHORT (Funding Squeeze) regime gate " + ("OPEN" if ok else "CLOSED") + "\n" + info)
+        except Exception:
+            pass
+    _fs_gate_cache.update(ts=now, ok=ok, info=info)
+    return ok
+
+
 def fs_check_signal(symbol, btc_ret, eng):
     """2026-10-02 T2 SHORT = FUNDING SQUEEZE SHORT. Shorts are paying heavy funding
     (last settled rate <= -0.03%) yet the coin is up 5-30% in 24h and not at a 6h/12h/24h
@@ -5263,6 +5336,8 @@ def fs_check_signal(symbol, btc_ret, eng):
     settlement (the backtest decided at settlement). SL 10xATR (skip if > 25%), TP 2R.
     Backtest at $6 risk, 50bps, TP 2R: BingX 29/wk win 66% +$29.7/wk; Binance bear
     34/wk 59% +$18.4; bull 2024-25 12/wk 52% -$1.3. No overlap with T1/T4/T6 pump shorts."""
+    if FS_REGIME_GATE and not fs_regime_allows():
+        return None
     c = _closed_15m(symbol, 130)
     if c is None or len(c) < 110:
         return None
@@ -6425,7 +6500,10 @@ rev5l_auto_enabled = AUTO_RESUME_ON_START
 rev6l_auto_enabled = AUTO_RESUME_ON_START
 
 REVL_ENGINE_ENABLED = os.environ.get("REVL_ENGINE_ENABLED", "1") == "1"
-REVL_NOTIONAL_USDT  = float(os.environ.get("REVL_NOTIONAL_USDT", 75))
+REVL_NOTIONAL_USDT  = float(os.environ.get("REVL_NOTIONAL_USDT", 75))   # legacy, no longer used for sizing
+# 2026-10-04: T3L/T6L were sized as $75 notional x 30% stop = $22.5 risk ($25 margin at 3x).
+# Now risk-based like every other live engine: qty = risk / stop distance.
+REVL_RISK_USDT      = float(os.environ.get("REVL_RISK_USDT", 6.0))
 REVL_LEVERAGE       = int(os.environ.get("REVL_LEVERAGE", 3))    # a 30% stop must sit inside liquidation
 # 2026-09-09: 20 -> 100. Nearby cells, all TRAIN>0 and TEST>0: cap40/90d 3.0 tr/wk +536 bps
 # win 62.9% | cap60/90d 4.3 tr/wk +519 win 61.7%. cap 200 is where it BREAKS - 11 tr/wk but
@@ -6454,7 +6532,7 @@ def _revl_desc(tag, name, fn, books, extra):
         "fresh_seconds": REVL_FRESH_SECONDS,
         "dstop_pct": REVL_DSTOP_PCT,
         "sl_cap_pct": max(REVL_DSTOP_PCT * 1.5, REV_SL_CAP_PCT),
-        "risk_usdt": REVL_NOTIONAL_USDT * REVL_DSTOP_PCT,   # derived, never set directly
+        "risk_usdt": REVL_RISK_USDT,   # 2026-10-04: $6 risk, was $75 x 30% = $22.5
         "leverage": REVL_LEVERAGE,
         "max_concurrent": REVL_MAX_CONCURRENT, "max_margin": REVL_MAX_MARGIN,
         "cooldown_s": REVL_COOLDOWN_S, "hold_seconds": REVL_HOLD_SECONDS,
@@ -7145,13 +7223,17 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
     resting, and on a margin/depth skip (so a blocked trade is never silent)."""
     name = eng["name"]
     try:
-        set_leverage_api(symbol, eng["leverage"])
         precision = symbol_precision.get(symbol, 4)
         risk_dist = abs(sl - entry)
         if risk_dist <= 0:
             return None
+        # 2026-10-04: leverage is chosen PER TRADE so the liquidation price always sits
+        # beyond the stop. Before this, T7 SHORT (stops up to 30%) ran 5x and T4 LONG
+        # (stops up to 18%) ran 5x, so a trade could be liquidated before its SL.
+        lev = safe_leverage(symbol, eng["leverage"], risk_dist / entry)
+        set_leverage_api(symbol, lev)
         risk_qty       = eng["risk_usdt"] / risk_dist
-        margin_cap_qty = (eng["max_margin"] * eng["leverage"]) / entry
+        margin_cap_qty = (eng["max_margin"] * lev) / entry
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
             return None
@@ -7162,7 +7244,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         pos_side   = "LONG" if side == "BUY" else "SHORT"
         close_side = "SELL" if side == "BUY" else "BUY"
 
-        required_margin = qty * entry / eng["leverage"]
+        required_margin = qty * entry / lev
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
             print(f"[REV MARGIN SKIP] {name} {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
@@ -7190,12 +7272,12 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
             "order_id": oid, "symbol": symbol, "side": side, "pos_side": pos_side,
             "close_side": close_side, "entry": entry, "sl": sl, "tp": tp,
             "qty": qty, "placed_ts": time.time(),
-            "margin_used": required_margin, "risk_usdt": eng["risk_usdt"],
+            "margin_used": required_margin, "risk_usdt": eng["risk_usdt"], "leverage": lev,
         }
         send_tg(
             f"\u23f3 {name} {symbol} {pos_side} LIMIT RESTING\n"
             f"Entry: {round(entry, 6)} | SL: {round(sl, 6)} | TP: {round(tp, 6)}\n"
-            f"Risk: ${eng['risk_usdt']} | cancels in {REV_FILL_BARS * 15}m"
+            f"Risk: ${eng['risk_usdt']} | Lev: {lev}x | Margin: ${required_margin:.2f} | cancels in {REV_FILL_BARS * 15}m"
         )
         return oid
     except Exception as e:

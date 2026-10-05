@@ -7277,7 +7277,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         send_tg(
             f"\u23f3 {name} {symbol} {pos_side} LIMIT RESTING\n"
             f"Entry: {round(entry, 6)} | SL: {round(sl, 6)} | TP: {round(tp, 6)}\n"
-            f"Risk: ${eng['risk_usdt']} | Lev: {lev}x | Margin: ${required_margin:.2f} | cancels in {REV_FILL_BARS * 15}m"
+            f"Risk: ${eng['risk_usdt']} | Lev: {lev}x | Margin: ${required_margin:.2f} | cancels in {eng.get("fill_bars", REV_FILL_BARS) * 15}m"
         )
         return oid
     except Exception as e:
@@ -7287,7 +7287,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
 
 def rev_track_pending(eng):
     """Resting limits: promote to a live trade once filled (notify), cancel + notify (margin
-    released) after REV_FILL_BARS if never filled."""
+    released) after eng.get("fill_bars", REV_FILL_BARS) if never filled."""
     pend = eng["pending"]
     if not pend:
         return
@@ -7373,15 +7373,15 @@ def rev_track_pending(eng):
             )
             continue
 
-        if now - p["placed_ts"] > REV_FILL_BARS * 15 * 60:
+        if now - p["placed_ts"] > eng.get("fill_bars", REV_FILL_BARS) * 15 * 60:
             try:
                 cancel_order(sym, p["order_id"])
             except Exception as e:
                 print(f"[REV CANCEL {sym}] {e}")
             pend.pop(sym, None)
-            print(f"[REV] {name} {sym} limit unfilled after {REV_FILL_BARS} bars - cancelled")
+            print(f"[REV] {name} {sym} limit unfilled after {eng.get("fill_bars", REV_FILL_BARS)} bars - cancelled")
             send_tg(
-                f"\u274e {name} {sym} {p['pos_side']} LIMIT CANCELLED (unfilled {REV_FILL_BARS * 15}m) "
+                f"\u274e {name} {sym} {p['pos_side']} LIMIT CANCELLED (unfilled {eng.get("fill_bars", REV_FILL_BARS) * 15}m) "
                 f"- margin released"
             )
 
@@ -7983,6 +7983,179 @@ for _name, _eng, _env in (("T1 (both legs)", "REV_T1", "T1_EXEC_ON"), ("T3 SHORT
                           ("T5B SHORT", "REV_T5B", "T5B_EXEC_ON"), ("T6 SHORT", "REV_T6", "T6S_EXEC_ON")):
     if os.environ.get(_env, "0") != "1" and isinstance(globals().get(_eng), dict):
         globals()[_eng]["max_concurrent"] = 0
+
+# ==================== 2026-10-05: FINAL SLOT MAP - only T1/T2/T3 trade ====================
+# LONG : T1 = old T6 LONG (quiet base), T2 = old T7 LONG + BTC 24h <= -3% (TP 1R), T3 = old T4 LONG (SMC)
+# SHORT: T1 = old T7 SHORT + fix C,      T2 = Funding Squeeze,                    T3 = S1 (Binance top-trader crowding)
+# Everything else is OFF. Engines keep their internal tags/books/commands; only names and logic change.
+SLOTMAP_ON = os.environ.get("SLOTMAP_ON", "1") == "1"
+
+_orig_rev_symbol_busy = rev_symbol_busy
+def _all_engine_dicts():
+    return [v for k, v in list(globals().items())
+            if k.startswith("REV_") and isinstance(v, dict) and isinstance(v.get("open"), dict)
+            and isinstance(v.get("pending"), dict)]
+def rev_symbol_busy(symbol, eng):
+    """Cross-engine coin block over EVERY engine book (incl. spares and redefined descriptors)."""
+    if _orig_rev_symbol_busy(symbol, eng):
+        return True
+    for e in _all_engine_dicts():
+        if symbol in e["open"] or symbol in e["pending"]:
+            return True
+    return False
+
+# ---- T2 LONG = T7 LONG Tier A + BTC 24h <= -3%, TP 1R ----
+T2L_BTC24_MAX = float(os.environ.get("T2L_BTC24_MAX", -0.03))
+T2L_TP_R      = float(os.environ.get("T2L_TP_R", 1.0))
+_rev7l_tierA = REV_T7L["signal_fn"]
+def rev7l_slot2_signal(symbol, btc_ret, eng):
+    b24 = rev_btc_24h()
+    if b24 is None or b24 > T2L_BTC24_MAX:          # only real dumps, not small 4h dips in a rally
+        return None
+    sig = _rev7l_tierA(symbol, btc_ret, eng)
+    if not sig:
+        return None
+    side, px, sl, tp = sig
+    return (side, px, sl, px + T2L_TP_R * (px - sl))
+
+# ---- T1 SHORT = T7 SHORT + fix C ----
+T1S_ATRP_MIN    = float(os.environ.get("T1S_ATRP_MIN", 0.015))
+T1S_ENTRY_ATR   = float(os.environ.get("T1S_ENTRY_ATR", 0.5))    # limit 0.5xATR above the close
+T1S_TP_R        = float(os.environ.get("T1S_TP_R", 3.0))
+T1S_BREADTH_MAX = float(os.environ.get("T1S_BREADTH_MAX", 0.5))
+_breadth_cache = {"ts": 0.0, "v": None}
+def market_breadth_24h():
+    """Share of liquid BingX perps (24h quote vol >= $2M) whose 24h change is positive. One ticker
+    call, cached 10 min. None = unreadable (caller then skips, never guesses)."""
+    now = time.time()
+    if now - _breadth_cache["ts"] < 600:
+        return _breadth_cache["v"]
+    v = None
+    try:
+        r = requests.get(BASE_URL + "/openApi/swap/v2/quote/ticker", timeout=10).json()
+        t = r.get("data", []) if isinstance(r, dict) else []
+        up = n = 0
+        for x in t if isinstance(t, list) else []:
+            try:
+                if float(x.get("quoteVolume", 0)) < 2e6:
+                    continue
+                n += 1
+                up += 1 if float(x.get("priceChangePercent", 0)) > 0 else 0
+            except Exception:
+                continue
+        v = up / n if n >= 20 else None
+    except Exception as e:
+        print(f"[BREADTH] {e}")
+    _breadth_cache.update(ts=now, v=v)
+    return v
+_rev7s_base = REV_T7S["signal_fn"]
+def rev7s_slot1_signal(symbol, btc_ret, eng):
+    b24 = rev_btc_24h()
+    if b24 is None or b24 < 0:                       # never short laggards while BTC is falling
+        return None
+    if not _btc_below_ema200_daily():                # bull regime: only when most coins are red
+        br = market_breadth_24h()
+        if br is None or br > T1S_BREADTH_MAX:
+            return None
+    sig = _rev7s_base(symbol, btc_ret, eng)
+    if not sig:
+        return None
+    side, px, sl, tp = sig
+    R = sl - px
+    a = R / T7S_KATR if T7S_KATR else 0
+    if a <= 0 or a / px < T1S_ATRP_MIN:
+        return None
+    lim = px + T1S_ENTRY_ATR * a                     # resting sell limit above the close
+    return ("SELL", lim, lim + R, lim - T1S_TP_R * R)
+
+# ---- T3 SHORT = S1: top-trader account crowding on a coin at the top of its range ----
+S1_RATIO_MIN = float(os.environ.get("S1_RATIO_MIN", 2.96))
+S1_POS_MIN   = float(os.environ.get("S1_POS_MIN", 0.767))
+S1_ATRP_MIN  = float(os.environ.get("S1_ATRP_MIN", 0.0179))
+S1_KATR      = float(os.environ.get("S1_KATR", 8.0))
+S1_TP_R      = float(os.environ.get("S1_TP_R", 2.0))
+_s1_cache = {}
+def binance_top_account_ratio(symbol):
+    """Binance USD-M top-trader ACCOUNT long/short ratio (5m). Public endpoint, cached 5 min."""
+    bn = symbol.replace("-", "")
+    c = _s1_cache.get(bn)
+    if c and time.time() - c[0] < 300:
+        return c[1]
+    v = None
+    try:
+        r = requests.get("https://fapi.binance.com/futures/data/topLongShortAccountRatio",
+                         params={"symbol": bn, "period": "5m", "limit": 1}, timeout=8).json()
+        if isinstance(r, list) and r:
+            v = float(r[-1]["longShortRatio"])
+    except Exception as e:
+        print(f"[S1 RATIO] {symbol} {e}")
+    _s1_cache[bn] = (time.time(), v)
+    return v
+def s1_check_signal(symbol, btc_ret, eng):
+    c = _closed_15m(symbol, 130)
+    if c is None or len(c) < 110:
+        return None
+    px = cl(c[-1])
+    w = c[-97:]
+    hi_, lo_ = max(h(x) for x in w), min(l(x) for x in w)
+    if px <= 0 or hi_ <= lo_ or (px - lo_) / (hi_ - lo_) < S1_POS_MIN:
+        return None
+    atrs = atr_series([h(x) for x in c], [l(x) for x in c], [cl(x) for x in c], REV_ATR_LEN)
+    if not atrs or not atrs[-1] or atrs[-1] <= 0:
+        return None
+    a = atrs[-1]
+    if a / px < S1_ATRP_MIN:
+        return None
+    if sum(cl(x) * v(x) for x in c[-96:]) < 2e6:
+        return None
+    ratio = binance_top_account_ratio(symbol)        # last, so Binance is only hit for real candidates
+    if ratio is None or ratio < S1_RATIO_MIN:
+        return None
+    R = S1_KATR * a
+    if R / px > 0.35:
+        return None
+    print(f"[TIGHT 3 SHORT/S1] {symbol} SELL ratio={ratio:.2f} pos={(px - lo_) / (hi_ - lo_):.2f} atrp={a / px * 100:.2f}%")
+    return ("SELL", px, px + R, px - S1_TP_R * R)
+
+if SLOTMAP_ON:
+    # LONG slots
+    REV_T6L["name"] = "TIGHT 1 LONG"
+    REV_T7L["name"] = "TIGHT 2 LONG"
+    REV_T7L["signal_fn"] = rev7l_slot2_signal
+    REV_T7L["long_tp_r"] = T2L_TP_R
+    REV_T4L["name"] = "TIGHT 3 LONG"
+    # SHORT slots
+    REV_T7S["name"] = "TIGHT 1 SHORT"
+    REV_T7S["signal_fn"] = rev7s_slot1_signal
+    REV_T7S["short_tp_r"] = T1S_TP_R
+    REV_T7S["hold_seconds"] = 48 * 3600
+    REV_T7S["fill_bars"] = int(os.environ.get("T1S_FILL_BARS", 16))   # resting limit lives 4h
+    REV_T7S["tp_limit"] = True
+    REV_T2["name"] = "TIGHT 2 SHORT"
+    REV_T1S["name"] = "TIGHT 3 SHORT"
+    REV_T1S["signal_fn"] = s1_check_signal
+    REV_T1S["_enabled"] = os.environ.get("S1_ON", "1") == "1"
+    REV_T1S["max_concurrent"] = int(os.environ.get("S1_MAX_CONCURRENT", 15)) if REV_T1S["_enabled"] else 0
+    REV_T1S["risk_usdt"] = float(os.environ.get("S1_RISK_USDT", 3.0))
+    REV_T1S["short_tp_r"] = S1_TP_R
+    REV_T1S["hold_seconds"] = 48 * 3600
+    REV_T1S["sl_cap_pct"] = 0.35
+    REV_T1S["tp_limit"] = True
+    # everything else OFF (no new entries; open positions are still managed)
+    for _e in ("REV_T1", "REV_T3", "REV_T4", "REV_T5", "REV_T5B", "REV_T6", "REV_T3L", "REV_T5L"):
+        if isinstance(globals().get(_e), dict):
+            globals()[_e]["max_concurrent"] = 0
+    REV_T5L["signal_fn"] = lambda symbol, btc_ret, eng: None    # T5 LONG signal-only messages also stop
+    # disabled engines get an OFF label so their leftover positions are never confused with the new slots
+    for _e in ("REV_T1", "REV_T3", "REV_T4", "REV_T5", "REV_T5B", "REV_T6", "REV_T3L", "REV_T5L"):
+        if isinstance(globals().get(_e), dict) and not str(globals()[_e]["name"]).startswith("OFF"):
+            globals()[_e]["name"] = "OFF " + str(globals()[_e]["name"])
+    for _sp in (REV_T2S, REV_T4S, REV_T6S):
+        _sp["_enabled"] = False
+        _sp["max_concurrent"] = 0
+    print("[SLOTMAP] LONG T1=quiet-base T2=crash-bounce(BTC24h<=-3%,TP1R) T3=SMC | "
+          "SHORT T1=laggard-C T2=funding-squeeze T3=S1 | all other engines off")
+
 
 if __name__ == "__main__":
     # Re-adopt anything already open on BingX BEFORE the engines start, so a restart

@@ -6043,12 +6043,20 @@ def _revl_warm_breadth():
         print(f"[LONG GATE] breadth warm-up could not list symbols: {e}")
         return 0
     n = errs = 0
-    for sym in syms[:REVL_BREADTH_WARM_N]:
-        if len(_revl_above_ema50) >= 60:
+    # 2026-10-06: BingX now lists non-crypto perps first (NC... forex/commodities, short
+    # histories). They used to count as errors, 5 of them stopped the warm-up, the gate
+    # sat at UNKNOWN after every restart and ALL long engines stood down. Skip them, do
+    # not count "too little history" as an error, and look past the first 45 symbols.
+    tried = 0
+    for sym in syms:
+        if len(_revl_above_ema50) >= 60 or tried >= REVL_BREADTH_WARM_N * 4:
             break
+        if str(sym).startswith("NC"):
+            continue
         if errs >= 5 or api_backoff_active():
             print(f"[LONG GATE] breadth warm-up stopped early after {errs} errors")
             break
+        tried += 1
         try:
             candles = get_candles(sym, limit=REVL_BREADTH_BARS, interval="4h")
             if not candles:
@@ -6056,8 +6064,7 @@ def _revl_warm_breadth():
                 continue
             cls = _revl_daily_from_4h(candles)
             if len(cls) < 60:
-                errs += 1
-                continue
+                continue                     # young coin: not an error, just not usable
             _revl_note_breadth(cls[-1] > _revl_ema(cls[-60:], 50))
             n += 1
         except Exception:
@@ -8157,7 +8164,120 @@ if SLOTMAP_ON:
           "SHORT T1=laggard-C T2=funding-squeeze T3=S1 | all other engines off")
 
 
+# ==================== 2026-10-06: T4 LONG = OI Rally Long (runs on spare slot t2s) ====================
+# Broad rally day (>= 84% of liquid coins green on 24h), coin open interest up >= 3% in 4h
+# (from his own Supabase oi_history collector), quiet coin (ATR% <= 0.53%). LONG, SL 8xATR,
+# TP 2R limit, 48h, cap 10, risk $3. When more coins qualify than free slots, the ones whose
+# OI rose most go first. Measured Aug 10-Oct 4 2026: BingX 10.4/wk 77% +$64/wk at $6 risk.
+T4O_BREADTH_MIN = float(os.environ.get("T4O_BREADTH_MIN", 0.84))
+T4O_OI4H_MIN    = float(os.environ.get("T4O_OI4H_MIN", 0.03))
+T4O_ATRP_MAX    = float(os.environ.get("T4O_ATRP_MAX", 0.0053))
+T4O_KATR        = float(os.environ.get("T4O_KATR", 8.0))
+T4O_TP_R        = float(os.environ.get("T4O_TP_R", 2.0))
+_t4o = {"bucket": None, "top": {}}
+def supabase_oi_change_4h(symbol):
+    """OI value now vs ~4h ago from oi_history. None if the collector has no data."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None
+    try:
+        now_ms = int(time.time() * 1000)
+        r = requests.get(SUPABASE_URL + "/rest/v1/oi_history",
+                         headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": "Bearer " + SUPABASE_SERVICE_KEY},
+                         params={"symbol": "eq." + symbol, "ts": "gte." + str(now_ms - 5 * 3600 * 1000),
+                                 "select": "ts,oi_value", "order": "ts.asc"}, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        rows = [x for x in rows if x.get("oi_value")]
+        if len(rows) < 2:
+            return None
+        last = rows[-1]
+        if now_ms - int(last["ts"]) > 3600 * 1000:
+            return None
+        past = [x for x in rows if int(x["ts"]) <= now_ms - 4 * 3600 * 1000]
+        if not past:
+            return None
+        return float(last["oi_value"]) / float(past[-1]["oi_value"]) - 1.0
+    except Exception as e:
+        print(f"[T4 OI] {symbol} {e}")
+        return None
+def _t4o_refresh(eng):
+    cands = []
+    try:
+        syms = get_liquid_symbols(get_futures_symbols(), min_quote_vol=REV_MIN_QUOTE_VOL, max_n=REV_MAX_SYMBOLS)
+    except Exception as e:
+        print(f"[T4 LONG] symbol list failed: {e}")
+        return {}
+    for sym in syms:
+        if str(sym).startswith("NC") or rev_symbol_busy(sym, eng) or is_tokenized(sym) or coin_too_young(sym):
+            continue
+        c = _closed_15m(sym, 40)
+        if c is None or len(c) < 30:
+            continue
+        px = cl(c[-1])
+        atrs = atr_series([h(x) for x in c], [l(x) for x in c], [cl(x) for x in c], REV_ATR_LEN)
+        if px <= 0 or not atrs or not atrs[-1] or atrs[-1] / px > T4O_ATRP_MAX:
+            continue
+        ch = supabase_oi_change_4h(sym)
+        if ch is None or ch < T4O_OI4H_MIN:
+            continue
+        cands.append((ch, sym, px, atrs[-1]))
+        time.sleep(0.05)
+    cands.sort(reverse=True)
+    free = max(0, eng["max_concurrent"] - len(eng["open"]) - len(eng["pending"]))
+    top = {s: (p, a, ch) for ch, s, p, a in cands[:free]}
+    print(f"[T4 LONG] rally day: {len(cands)} candidates, taking {len(top)}")
+    return top
+def t4o_check_signal(symbol, btc_ret, eng):
+    br = market_breadth_24h()
+    if br is None or br < T4O_BREADTH_MIN:
+        return None
+    bucket = int(time.time() // 900)
+    if _t4o["bucket"] != bucket:
+        _t4o["bucket"] = bucket
+        _t4o["top"] = _t4o_refresh(eng)
+    x = _t4o["top"].pop(symbol, None)
+    if not x:
+        return None
+    px, a, ch = x
+    R = T4O_KATR * a
+    print(f"[TIGHT 4 LONG] {symbol} BUY oi4h={ch * 100:+.1f}% atrp={a / px * 100:.2f}% breadth={br:.2f}")
+    return ("BUY", px, px - R, px + T4O_TP_R * R)
+
+def slotmap_startup_report():
+    time.sleep(180)
+    try:
+        for _ in range(3):
+            g = revl_gate_state()
+            if g != "UNKNOWN":
+                break
+            time.sleep(60)
+        br = market_breadth_24h()
+        bn = binance_top_account_ratio("BTC-USDT")
+        oi = supabase_oi_change_4h("BTC-USDT")
+        send_tg("\U0001F9ED SLOT MAP STATUS\n"
+                f"Long gate: {g} (breadth sample {len(_revl_above_ema50)})\n"
+                f"Market 24h green share: {('%.0f%%' % (br * 100)) if br is not None else 'n/a'}\n"
+                f"Binance top-trader feed (T3 SHORT): {'OK' if bn is not None else 'NOT REACHABLE - T3 SHORT will not trade'}\n"
+                f"Supabase OI feed (T4 LONG): {'OK' if oi is not None else 'NO DATA - T4 LONG will not trade'}\n"
+                "LONG: T1 quiet-base | T2 crash-bounce | T3 SMC | T4 OI rally\n"
+                "SHORT: T1 laggard | T2 funding squeeze | T3 S1")
+    except Exception as e:
+        print(f"[SLOTMAP REPORT] {e}")
+
+if SLOTMAP_ON:
+    REV_T2S["name"] = "TIGHT 4 LONG"
+    REV_T2S["side_only"] = "BUY"
+    REV_T2S["signal_fn"] = t4o_check_signal
+    REV_T2S["_enabled"] = os.environ.get("T4O_ON", "1") == "1"
+    REV_T2S["max_concurrent"] = int(os.environ.get("T4O_MAX_CONCURRENT", 10)) if REV_T2S["_enabled"] else 0
+    REV_T2S["risk_usdt"] = float(os.environ.get("T4O_RISK_USDT", 3.0))
+    REV_T2S["long_tp_r"] = T4O_TP_R
+    REV_T2S["hold_seconds"] = 48 * 3600
+    REV_T2S["sl_cap_pct"] = 0.10
+    REV_T2S["tp_limit"] = True
+
+
 if __name__ == "__main__":
+    _threading.Thread(target=slotmap_startup_report, daemon=True).start()
     # Re-adopt anything already open on BingX BEFORE the engines start, so a restart
     # can't breach the concurrency caps or orphan a trail-managed position.
     try:

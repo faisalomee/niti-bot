@@ -919,8 +919,12 @@ def get_available_margin():
         bal = r.get("data", {}).get("balance", {})
         if isinstance(bal, list):
             bal = next((b for b in bal if b.get("asset") == "USDT"), bal[0] if bal else {})
-        avail = float(bal.get("availableMargin", 0) or 0)
-        return avail if avail > 0 else None
+        # 2026-10-07: a real 0 used to come back as None ("unknown, proceed"), so the
+        # order went to BingX and was rejected silently. Now 0 is 0; only a missing
+        # field / failed call is None.
+        if not isinstance(bal, dict) or "availableMargin" not in bal:
+            return None
+        return max(0.0, float(bal.get("availableMargin") or 0))
     except Exception:
         return None
 
@@ -961,6 +965,8 @@ def get_open_positions():
                 "pos_side": (p.get("positionSide", "") or "").upper(),
                 "amt":      amt,
                 "avg":      float(p.get("avgPrice", 0) or 0),
+                "lev":      float(p.get("leverage", 0) or 0),
+                "margin":   float(p.get("initialMargin", 0) or p.get("margin", 0) or 0),
             })
         return out
     except Exception as e:
@@ -1142,12 +1148,34 @@ def adopt_positions_on_start():
             "eng_tag": _own.get(sym, {}).get("tag", "adopt"), "adopted": True,
             "time": datetime.now(timezone.utc).strftime("%H:%M UTC"),
         }
+        # 2026-10-07: real margin from BingX (budget used to see 0 for adopted trades) and
+        # route the trade back to the engine that owns it, so it keeps that engine's exit
+        # rules (T1 LONG 90d trail etc.) instead of the old Tight 1 48h tracker.
+        _rec = rev_open_trades.pop("adopt-" + sym)
+        _mg = p.get("margin") or 0
+        if not _mg:
+            _lv = p.get("lev") or 3
+            _mg = amt * avg / max(_lv, 1)
+        _rec["margin_used"] = round(float(_mg), 2)
+        _rec["qty"] = amt
+        _rec["no_tp"] = not tp_price
+        try:
+            _ae = _adopt_engine(_own.get(sym, {}).get("tag"), is_long, avg, sl_price)
+        except Exception as _e:
+            print(f"[ADOPT ROUTE] {sym} {_e}")
+            _ae = None
+        if _ae is not None:
+            _rec["label"] = _ae["name"] + " (adopted)"
+            _rec["eng_tag"] = _ae["tag"]
+            _ae["open"]["adopt-" + sym] = _rec
+        else:
+            rev_open_trades["adopt-" + sym] = _rec
         adopted += 1
         lines.append(sym + " " + pos_side + " qty " + str(amt) + " | SL " + str(sl_price) +
                      (" | TP " + str(tp_price) if tp_price else " | no TP on exchange") +
-                     " -> adopted (time-stop restarts now)")
+                     " -> " + _rec["label"] + " | margin $" + str(_rec["margin_used"]))
 
-    print(f"[ADOPT] re-adopted {adopted} position(s) into the Tight 1 tracker")
+    print(f"[ADOPT] re-adopted {adopted} position(s) into their engine books")
     if lines:
         send_tg("STARTUP RE-ADOPT\n------------------------------\n" + "\n".join(lines) +
                 "\n------------------------------\nConcurrency caps and the time-stop now account for these.")
@@ -2677,54 +2705,11 @@ def handle_telegram_commands():
                                    " | closes in " + str(max(0, int(_left // 60))) + "m")
                     send_tg(lines4)
                 elif text == "/status":
-                    backoff = ""
-                    if api_backoff_active():
-                        backoff = f"\nAPI BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining"
-                    send_tg(
-                        "===== NITI BOT STATUS =====\n"
-                        "Tight 1 (24h-reversion): " + ("ON" if rev_auto_enabled else "OFF") +
-                        " | Open: " + str(len(rev_open_trades)) + "/" + str(REV_MAX_CONCURRENT) +
-                        " | Pending: " + str(len(rev_pending)) +
-                        " | " + str(round(REV_RET_THR*100)) + "% vol>=" + str(REV_VOL_MULT) + "x | risk $" + str(int(REV_RISK_USDT)) + "\n"
-                        "Tight 2 (24h-reversion ceiling): " + ("ON" if rev2_auto_enabled else "OFF") +
-                        " | Open: " + str(len(rev2_open_trades)) + "/" + str(REV2_MAX_CONCURRENT) +
-                        " | Pending: " + str(len(rev2_pending)) +
-                        " | " + str(round(REV2_RET_THR*100)) + "% vol " + str(REV2_VOL_MULT) + "-" + str(REV2_VOL_MULT_MAX) + "x ATR%<" + str(round(REV2_ATRP_MAX*100,1)) + "% | risk $" + str(int(REV2_RISK_USDT)) + "\n"
-                        "Tight 3 (HTF clean-break, BEAR only): " + ("ON" if t3_scalp_auto_enabled else "OFF") +
-                        " | Open: " + str(len(t3s_open_trades)) + "/" + str(T3_MAX_CONCURRENT) +
-                        " | Pending: " + str(len(t3s_pending)) +
-                        " | TP " + str(T3_TP_R) + "R risk $" + str(int(T3_RISK_USDT)) + "\n"
-                        "Tight 5 (crash-continuation SHORT, wide-range only): " + ("ON" if rev5_auto_enabled else "OFF") +
-                        " | Open: " + str(len(rev5_open_trades)) + "/" + str(REV5_MAX_CONCURRENT) +
-                        " | risk $" + str(REV5_RISK_USDT) + "\n" +
-                        "Tight 4 (no-stop 24h reversion SHORT): " + ("ON" if rev4_auto_enabled else "OFF") +
-                        " | Open: " + str(len(rev4_open_trades)) + "/" + str(REV4_MAX_CONCURRENT) +
-                        " | Pending: " + str(len(rev4_pending)) +
-                        " | ATR%>=" + str(round(REV4_ATRP_MIN * 100, 2)) + "% pos" +
-                        str(REV4_POS_WINDOW * 15 // 60) + "h | exit " + str(REV4_HOLD_SECONDS // 3600) +
-                        "h timer, no TP | $" + f"{REV4_NOTIONAL_USDT:,.0f}" + " notional\n" +
-                        "Tight 6 (ATR-gated reversion, BOTH legs): " + ("ON" if rev6_auto_enabled else "OFF") +
-                        " | Open: " + str(len(rev6_open_trades)) + "/" + str(REV6_MAX_CONCURRENT) +
-                        " | Pending: " + str(len(rev6_pending)) +
-                        " | ATR%>=" + str(round(REV6_ATRP_MIN * 100, 2)) + "% pos" +
-                        str(REV6_POS_WINDOW * 15 // 60) + "h TP " + str(REV6_TP_R) +
-                        "R | risk $" + str(REV6_RISK_USDT) + "\n" +
-                        # 2026-09-13: T7 row. Both legs share one line because they are
-                        # one engine (leaders long / laggards short) behind one gate.
-                        "Tight 7 (rel-strength vs BTC, " + str(REV7_RS_BARS * 15 // 60) +
-                        "h): LONG " + ("ON" if rev7l_auto_enabled else "OFF") +
-                        " " + str(len(rev7l_open_trades)) + "/" + str(REV7L_MAX_CONCURRENT) +
-                        " | SHORT " + ("ON" if rev7s_auto_enabled else "OFF") +
-                        " " + str(len(rev7s_open_trades)) + "/" + str(REV7S_MAX_CONCURRENT) +
-                        " | top " + str(round(REV7_LONG_PCT * 100)) + "% / bottom " +
-                        str(round(REV7_SHORT_PCT * 100)) + "% | $" +
-                        f"{REV7L_NOTIONAL_USDT:,.0f}" + "/$" + f"{REV7S_NOTIONAL_USDT:,.0f}" +
-                        " notional\n" +
-                        "Rally gate: " + _t7_gate_text() + "\n" +
-                        "EMA" + str(EMA_ALERT_SPAN) + " daily alert: " +
-                        ("ON" if ema_alert_auto else "OFF") + " (notify only, no trades)\n" +
-                        _regime_line() + backoff
-                    )
+                    # 2026-10-07: was a hard-coded legacy list (old T1-T7, showed retired
+                    # engines ON). Now generated from the live slot map.
+                    send_tg(slotmap_status_text())
+                elif text == "/why":
+                    send_tg(why_report_text(reset=False))
         except Exception as e:
             print(f"[TG CMD] error: {e}")
         time.sleep(1)
@@ -7243,9 +7228,11 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         margin_cap_qty = (eng["max_margin"] * lev) / entry
         qty = round(min(risk_qty, margin_cap_qty), precision)
         if qty <= 0:
+            _skip_note(eng, symbol, "qty0", f"qty rounds to 0 (risk ${eng['risk_usdt']}, stop {risk_dist / entry * 100:.1f}%)")
             return None
         if not depth_ok(symbol, entry, sl, qty, side):
             print(f"[REV DEPTH SKIP] {name} {symbol} {side}")
+            _skip_note(eng, symbol, "depth", f"order book too thin for qty {qty}")
             return "DEPTH_SKIP"
 
         pos_side   = "LONG" if side == "BUY" else "SHORT"
@@ -7255,12 +7242,17 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         avail = get_available_margin()
         if avail is not None and avail < required_margin * 1.05:
             print(f"[REV MARGIN SKIP] {name} {symbol} need ~${required_margin:.2f}, have ${avail:.2f}")
+            _skip_note(eng, symbol, "margin", f"need ~${required_margin:.2f}, free ${avail:.2f}")
             return "MARGIN_SKIP"
         # 2026-08-25 shared budget: stops one engine (T2 cap 20) eating everything and
         # starving the others - and removes the long/short asymmetry that killed longs.
         if not rev_margin_allows(required_margin, get_balance()):
             print(f"[REV BUDGET SKIP] {name} {symbol} need ~${required_margin:.2f}, "
                   f"in use ${rev_margin_in_use():.2f}")
+            _bal = get_balance()
+            _skip_note(eng, symbol, "budget",
+                       f"need ~${required_margin:.2f}, bot margin in use ${rev_margin_in_use():.2f} "
+                       f"of budget ${((_bal or 0) * REV_MARGIN_BUDGET_PCT):.2f} ({int(REV_MARGIN_BUDGET_PCT * 100)}% of ${(_bal or 0):.2f})")
             return "MARGIN_SKIP"
 
         url = BASE_URL + "/openApi/swap/v2/trade/order"
@@ -7273,6 +7265,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
         if oid == "N/A":
             print(f"[REV LIMIT FAIL] {name} {symbol} {side} qty={qty} px={entry} - BingX: {r}")
+            _skip_note(eng, symbol, "rejected", f"BingX rejected the order: {str(r)[:160]}")
             return None
 
         eng["pending"][symbol] = {
@@ -7289,6 +7282,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         return oid
     except Exception as e:
         print(f"[REV ORDER {symbol}] {e}")
+        _skip_note(eng, symbol, "error", str(e)[:160])
         return None
 
 
@@ -7308,6 +7302,7 @@ def rev_track_pending(eng):
             continue
 
         if status == "FILLED":
+            _st(eng, "fills")
             fill = get_fill_price(p["order_id"], sym, fallback=p["entry"])
             # ---- 2026-09-01 BUGFIX: do NOT rebuild the TP from the R multiple for
             # engines whose TP is a flat percentage of price (T4's no-stop design).
@@ -7386,6 +7381,7 @@ def rev_track_pending(eng):
             except Exception as e:
                 print(f"[REV CANCEL {sym}] {e}")
             pend.pop(sym, None)
+            _st(eng, "unfilled")
             print(f"[REV] {name} {sym} limit unfilled after {eng.get("fill_bars", REV_FILL_BARS)} bars - cancelled")
             send_tg(
                 f"\u274e {name} {sym} {p['pos_side']} LIMIT CANCELLED (unfilled {eng.get("fill_bars", REV_FILL_BARS) * 15}m) "
@@ -8276,8 +8272,405 @@ if SLOTMAP_ON:
     REV_T2S["tp_limit"] = True
 
 
+# ==================== 2026-10-07: ZERO-TRADE FIX PACK ====================
+# 1. Long-gate deadlock: the breadth sample was fed only by T1 LONG's own scans, which
+#    run only while the gate is OPEN. One SHUT reading froze the sample and the gate
+#    stayed SHUT until the next restart. The sample is now rebuilt every hour from a
+#    fixed spread of liquid coins, independent of the gate and of any engine.
+# 2. Every skipped / rejected order reaches Telegram (was Render log only).
+# 3. 6-hourly "why no trades" report + /why on demand; /status shows the slot map.
+# 4. T3 SHORT gets the Binance top-trader ratio through the Supabase Edge Function
+#    `binance-ratio`, region picked automatically (Render's IP is blocked by Binance).
+# 5. Adopted positions carry real margin and go back to their own engine book.
+from collections import defaultdict as _dd
+
+# ---------- counters ----------
+_eng_stats = _dd(lambda: _dd(int))
+_eng_stats_since = {"ts": time.time()}
+
+def _st(eng, key, n=1):
+    try:
+        _eng_stats[eng.get("tag", "?") if isinstance(eng, dict) else str(eng)][key] += n
+    except Exception:
+        pass
+
+_skip_sent = {}
+_skip_hour = {"ts": 0.0, "n": 0}
+SKIP_TG_REPEAT_S = int(os.environ.get("SKIP_TG_REPEAT_SECONDS", 6 * 3600))
+SKIP_TG_MAX_PER_HOUR = int(os.environ.get("SKIP_TG_MAX_PER_HOUR", 12))
+
+def _skip_note(eng, symbol, reason, detail):
+    """Count the skip and tell Telegram (same coin+reason at most once per 6h, max 12/h)."""
+    _st(eng, "skip_" + reason)
+    try:
+        now = time.time()
+        k = (eng.get("tag", "?"), symbol, reason)
+        if now - _skip_sent.get(k, 0) < SKIP_TG_REPEAT_S:
+            return
+        if now - _skip_hour["ts"] > 3600:
+            _skip_hour.update(ts=now, n=0)
+        if _skip_hour["n"] >= SKIP_TG_MAX_PER_HOUR:
+            return
+        _skip_sent[k] = now
+        _skip_hour["n"] += 1
+        send_tg(f"⛔ {eng.get('name', '?')} {symbol} NOT PLACED - {reason}\n{detail}")
+    except Exception as e:
+        print(f"[SKIP NOTE] {e}")
+
+def _wrap_signal_counter(eng):
+    f = eng.get("signal_fn")
+    if f is None or getattr(f, "_counted", False):
+        return
+    def _w(symbol, btc_ret, e, _f=f):
+        _st(e, "scanned")
+        try:
+            s = _f(symbol, btc_ret, e)
+        except Exception:
+            _st(e, "sig_errors")
+            raise
+        if s:
+            _st(e, "signals")
+        return s
+    _w._counted = True
+    eng["signal_fn"] = _w
+
+# ---------- live slot map ----------
+_SLOTS = [
+    ("LONG T1",  "quiet base (beta<0.9, 30d base, >EMA50)",  "REV_T6L", "rev6l_auto_enabled"),
+    ("LONG T2",  "crash bounce (BTC 24h <= -3%)",            "REV_T7L", "rev7l_auto_enabled"),
+    ("LONG T3",  "SMC dip sweep",                            "REV_T4L", "rev4l_auto_enabled"),
+    ("LONG T4",  "OI rally (>=84% green, OI 4h >= +3%)",     "REV_T2S", None),
+    ("SHORT T1", "laggard C",                                "REV_T7S", "rev7s_auto_enabled"),
+    ("SHORT T2", "funding squeeze (bear gate)",              "REV_T2",  "rev2_auto_enabled"),
+    ("SHORT T3", "S1 top-trader crowding (Binance ratio)",   "REV_T1S", None),
+]
+
+def _slot_engines():
+    out = []
+    for slot, desc, g, flag in _SLOTS:
+        e = globals().get(g)
+        if isinstance(e, dict):
+            on = bool(globals().get(flag, True)) if flag else True
+            out.append((slot, desc, e, on))
+    return out
+
+for _s_slot, _s_desc, _s_eng, _s_on in _slot_engines():
+    _wrap_signal_counter(_s_eng)
+
+def _adopt_engine(tag, is_long, entry, sl):
+    """Engine that should manage a re-adopted position. Owner-map tag first (live engine
+    preferred on tag clashes); else a LONG with a >=20% stop can only be T1 LONG (30%
+    stop); else None -> generic adopt tracker."""
+    if tag:
+        cands = [e for e in _all_engine_dicts() if e.get("tag") == tag]
+        cands.sort(key=lambda e: 0 if e.get("max_concurrent", 0) > 0 else 1)
+        if cands:
+            return cands[0]
+    try:
+        if is_long and entry > 0 and abs(entry - sl) / entry >= 0.20:
+            return REV_T6L
+    except Exception:
+        pass
+    return None
+
+# ---------- 1. long-gate breadth: hourly rebuild, gate-independent ----------
+REVL_BREADTH_REFRESH = int(os.environ.get("REVL_BREADTH_REFRESH_SECONDS", 3600))
+REVL_BREADTH_SAMPLE = int(os.environ.get("REVL_BREADTH_SAMPLE", 150))
+_breadth_meta = {"ts": 0.0, "n": 0, "errs": 0, "tried": 0}
+_breadth_lock = _threading.Lock()
+
+def _revl_note_breadth(above):
+    """No-op since 2026-10-07: engine scans no longer feed the sample (that feed is what
+    froze the gate shut). The hourly rebuild owns the sample."""
+    return None
+
+def _revl_rebuild_breadth():
+    """Share of liquid coins whose last daily close is above their daily EMA50, from an
+    even spread of up to REVL_BREADTH_SAMPLE liquid coins (not just the first listed)."""
+    if not _breadth_lock.acquire(blocking=False):
+        return _breadth_meta["n"]
+    global _revl_above_ema50
+    try:
+        if api_backoff_active():
+            print("[LONG GATE] breadth rebuild skipped - API backoff active")
+            return 0
+        syms = get_liquid_symbols(get_futures_symbols() or [], min_quote_vol=REV_MIN_QUOTE_VOL,
+                                  max_n=600, exclude_top_n=0) or []
+        syms = [s for s in syms if not str(s).startswith("NC") and not is_tokenized(s)]
+        if len(syms) > REVL_BREADTH_SAMPLE:
+            step = len(syms) / float(REVL_BREADTH_SAMPLE)
+            syms = [syms[int(i * step)] for i in range(REVL_BREADTH_SAMPLE)]
+        vals, errs = [], 0
+        for s in syms:
+            if api_backoff_active():
+                break
+            try:
+                c = get_candles(s, limit=REVL_BREADTH_BARS, interval="4h")
+                if not c:
+                    errs += 1
+                    continue
+                cls = _revl_daily_from_4h(c)
+                if len(cls) < 60:
+                    continue
+                vals.append(1 if cls[-1] > _revl_ema(cls[-60:], 50) else 0)
+            except Exception:
+                errs += 1
+            time.sleep(0.2)
+        _breadth_meta.update(ts=time.time(), n=len(vals), errs=errs, tried=len(syms))
+        if len(vals) >= 40:
+            _revl_above_ema50 = deque(vals, maxlen=400)     # atomic swap, readers never see it empty
+            _revl_gate["ts"] = 0                            # re-evaluate the gate on next read
+        print(f"[LONG GATE] breadth rebuilt from {len(vals)}/{len(syms)} coins ({errs} errors), "
+              f"above EMA50 = {sum(vals) / len(vals) * 100 if vals else 0:.0f}%")
+        return len(vals)
+    finally:
+        _breadth_lock.release()
+
+def _revl_warm_breadth():
+    return _revl_rebuild_breadth()
+
+def breadth_refresh_loop():
+    time.sleep(60)
+    while True:
+        try:
+            _revl_rebuild_breadth()
+        except Exception as e:
+            print(f"[LONG GATE] breadth rebuild failed: {e}")
+        time.sleep(REVL_BREADTH_REFRESH)
+
+# ---------- 4. Binance top-trader ratio through Supabase ----------
+S1_RATIO_FN = os.environ.get("S1_RATIO_FN", "binance-ratio")
+S1_REGIONS = [r.strip() for r in os.environ.get(
+    "S1_REGIONS", "eu-central-1,ap-southeast-1,eu-west-3,eu-west-2,ap-northeast-1,ap-southeast-2").split(",") if r.strip()]
+S1_ROUTE_RECHECK_S = int(os.environ.get("S1_ROUTE_RECHECK_SECONDS", 6 * 3600))
+_s1r = {"mode": None, "region": None, "ts": 0.0, "errors": {}}
+_s1fn_cache = {}
+_binance_ratio_direct = binance_top_account_ratio
+
+def _s1_direct_probe():
+    try:
+        r = requests.get("https://fapi.binance.com/futures/data/topLongShortAccountRatio",
+                         params={"symbol": "BTCUSDT", "period": "5m", "limit": 1}, timeout=8)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        j = r.json()
+        if isinstance(j, list) and j:
+            return float(j[-1]["longShortRatio"]), None
+        return None, "empty"
+    except Exception as e:
+        return None, str(e)[:60]
+
+def _s1_fn_get(symbols, region):
+    """-> ({BNSYMBOL: ratio}, error). ({}, err) if every symbol failed, (None, err) on HTTP failure."""
+    try:
+        url = SUPABASE_URL + "/functions/v1/" + S1_RATIO_FN
+        h = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": "Bearer " + SUPABASE_SERVICE_KEY,
+             "x-region": region}
+        r = requests.get(url, params={"symbols": ",".join(symbols)}, headers=h, timeout=15)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code} {r.text[:60]}"
+        j = r.json()
+        out, errs = {}, []
+        for d in j.get("data", []) or []:
+            if d.get("ratio") is not None:
+                out[str(d.get("symbol"))] = float(d["ratio"])
+            else:
+                errs.append(f"Binance {d.get('status')} {str(d.get('error', ''))[:50]}")
+        return out, (errs[0] if errs and not out else None)
+    except Exception as e:
+        return None, str(e)[:60]
+
+def s1_pick_route():
+    errs = {}
+    v, e = _s1_direct_probe()
+    if v is not None:
+        _s1r.update(mode="direct", region=None, ts=time.time(), errors={})
+        print("[S1 ROUTE] Binance reachable directly")
+        return
+    errs["direct"] = e
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        errs["supabase"] = "SUPABASE_URL / SUPABASE_SERVICE_KEY not set"
+    else:
+        for reg in S1_REGIONS:
+            out, e2 = _s1_fn_get(["BTCUSDT"], reg)
+            if out and out.get("BTCUSDT") is not None:
+                _s1r.update(mode="fn", region=reg, ts=time.time(), errors=errs)
+                print(f"[S1 ROUTE] Binance ratio via Supabase {reg}")
+                return
+            errs[reg] = e2 or "no ratio"
+    _s1r.update(mode=None, region=None, ts=time.time(), errors=errs)
+    print(f"[S1 ROUTE] Binance ratio NOT reachable: {errs}")
+
+def s1_route_text():
+    if _s1r["mode"] == "direct":
+        return "OK (direct)"
+    if _s1r["mode"] == "fn":
+        return f"OK (via Supabase {_s1r['region']})"
+    if not _s1r["ts"]:
+        return "not checked yet"
+    errs = "; ".join(f"{k}: {v}" for k, v in _s1r["errors"].items())
+    return "NOT REACHABLE - T3 SHORT will not trade (" + errs[:400] + ")"
+
+def binance_top_account_ratio(symbol):
+    """Binance USD-M top-trader ACCOUNT long/short ratio (5m), direct or via Supabase."""
+    bn = symbol.replace("-", "")
+    if _s1r["mode"] is None and time.time() - _s1r["ts"] > 900:
+        s1_pick_route()
+    if _s1r["mode"] == "direct":
+        return _binance_ratio_direct(symbol)
+    if _s1r["mode"] != "fn":
+        return None
+    c = _s1fn_cache.get(bn)
+    if c and time.time() - c[0] < 300:
+        return c[1]
+    out, e = _s1_fn_get([bn], _s1r["region"])
+    if out is None:
+        print(f"[S1 RATIO] {symbol} via {_s1r['region']} failed: {e} - re-picking route")
+        _s1r.update(mode=None, ts=0.0)
+        return None
+    v = out.get(bn)
+    _s1fn_cache[bn] = (time.time(), v)
+    return v
+
+def s1_route_loop():
+    time.sleep(20)
+    while True:
+        try:
+            s1_pick_route()
+        except Exception as e:
+            print(f"[S1 ROUTE] {e}")
+        time.sleep(S1_ROUTE_RECHECK_S)
+
+# ---------- 3. reports ----------
+def _btc_4h():
+    try:
+        c = get_candles("BTC-USDT", limit=20, interval="15m")
+        if not c or len(c) < 18:
+            return None
+        cs = [cl(x) for x in c]
+        return cs[-1] / cs[-17] - 1.0
+    except Exception:
+        return None
+
+def _fmt_pct(x):
+    return "n/a" if x is None else f"{x * 100:+.1f}%"
+
+def _slot_condition(slot):
+    """What the slot needs to fire, with the live reading."""
+    try:
+        if slot == "LONG T1":
+            g = revl_gate_state()
+            br = _revl_gate.get("breadth")
+            return f"needs long gate OPEN - now {g} (coins above EMA50 {br * 100:.0f}%)" if br is not None else f"needs long gate OPEN - now {g}"
+        if slot == "LONG T2":
+            return f"needs BTC 24h <= {T2L_BTC24_MAX * 100:.0f}% - now {_fmt_pct(rev_btc_24h())}"
+        if slot == "LONG T3":
+            return f"needs a coin -20% in 24h + BTC 4h <= -0.6% - BTC 4h now {_fmt_pct(_btc_4h())}"
+        if slot == "LONG T4":
+            b = market_breadth_24h()
+            return f"needs >= {T4O_BREADTH_MIN * 100:.0f}% coins green - now {('%.0f%%' % (b * 100)) if b is not None else 'n/a'}"
+        if slot == "SHORT T1":
+            b = market_breadth_24h()
+            return (f"needs BTC 24h >= 0 and <= {T1S_BREADTH_MAX * 100:.0f}% coins green - now BTC {_fmt_pct(rev_btc_24h())}, "
+                    f"green {('%.0f%%' % (b * 100)) if b is not None else 'n/a'}")
+        if slot == "SHORT T2":
+            return "bear gate " + ("OPEN" if (not FS_REGIME_GATE or fs_regime_allows()) else "CLOSED (bull) - idle by design")
+        if slot == "SHORT T3":
+            return "Binance ratio " + s1_route_text()
+    except Exception as e:
+        return f"condition unreadable ({e})"
+    return ""
+
+def why_report_text(reset=False):
+    hrs = (time.time() - _eng_stats_since["ts"]) / 3600.0
+    L = [f"\U0001F50E WHY NO TRADES - last {hrs:.1f}h"]
+    off = []
+    for slot, desc, e, on in _slot_engines():
+        s = _eng_stats.get(e.get("tag", "?"), {})
+        skips = {k[5:]: v for k, v in s.items() if k.startswith("skip_") and v}
+        sk = ", ".join(f"{k} {v}" for k, v in skips.items()) or "none"
+        state = "ON" if on else "OFF"
+        if not on:
+            off.append(slot)
+        if e.get("max_concurrent", 0) <= 0:
+            state = "DISABLED (cap 0)"
+        L.append(f"\n{slot} {desc} [{state}] open {len(e['open'])}/{e.get('max_concurrent', 0)} pending {len(e['pending'])}\n"
+                 f"  checked {s.get('scanned', 0)} | signals {s.get('signals', 0)} | filled {s.get('fills', 0)} | "
+                 f"unfilled {s.get('unfilled', 0)} | skipped: {sk}"
+                 + (f" | signal errors {s.get('sig_errors', 0)}" if s.get('sig_errors') else "")
+                 + f"\n  {_slot_condition(slot)}")
+    if off:
+        L.append("\n⚠️ OFF since restart: " + ", ".join(off) + " - send /start")
+    if api_backoff_active():
+        L.append(f"\n⚠️ API BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s left (all scans paused)")
+    if reset:
+        _eng_stats.clear()
+        _eng_stats_since["ts"] = time.time()
+    return "\n".join(L)
+
+WHY_REPORT_S = int(os.environ.get("WHY_REPORT_SECONDS", 6 * 3600))
+
+def why_report_loop():
+    time.sleep(1800)
+    while True:
+        try:
+            send_tg(why_report_text(reset=True))
+        except Exception as e:
+            print(f"[WHY REPORT] {e}")
+        time.sleep(WHY_REPORT_S)
+
+def slotmap_status_text():
+    L = ["===== NITI BOT STATUS (slot map) ====="]
+    for slot, desc, e, on in _slot_engines():
+        state = ("ON" if on else "OFF - send /start") if e.get("max_concurrent", 0) > 0 else "DISABLED"
+        L.append(f"{slot} {desc}: {state} | open {len(e['open'])}/{e.get('max_concurrent', 0)} | "
+                 f"pending {len(e['pending'])} | risk ${e.get('risk_usdt', 0)}")
+    try:
+        g = revl_gate_state()
+        br = _revl_gate.get("breadth")
+        age = (time.time() - _breadth_meta["ts"]) / 60 if _breadth_meta["ts"] else None
+        L.append(f"Long gate: {g} | above EMA50 {('%.0f%%' % (br * 100)) if br is not None else 'n/a'} of "
+                 f"{len(_revl_above_ema50)} coins" + (f", refreshed {age:.0f}m ago" if age is not None else ""))
+    except Exception as ex:
+        L.append(f"Long gate: unreadable ({ex})")
+    b = market_breadth_24h()
+    L.append(f"Market 24h green: {('%.0f%%' % (b * 100)) if b is not None else 'n/a'} | BTC 24h {_fmt_pct(rev_btc_24h())}")
+    L.append("T2 SHORT bear gate: " + ("OPEN" if (not FS_REGIME_GATE or fs_regime_allows()) else "CLOSED"))
+    L.append("Binance ratio (T3 SHORT): " + s1_route_text())
+    try:
+        fr, eq = get_available_margin(), get_balance()
+        L.append(f"Margin: free ${fr if fr is not None else 'n/a'} | equity ${eq if eq is not None else 'n/a'} | "
+                 f"bot in use ${rev_margin_in_use():.2f} of budget ${((eq or 0) * REV_MARGIN_BUDGET_PCT):.2f}")
+    except Exception as ex:
+        L.append(f"Margin: unreadable ({ex})")
+    live_ids = {id(e) for _, _, e, _ in _slot_engines()}
+    old = [f"{e['name']} {len(e['open'])}" for e in _all_engine_dicts()
+           if id(e) not in live_ids and len(e.get("open", {}))]
+    if old:
+        L.append("Old engines still managing positions: " + ", ".join(old))
+    if api_backoff_active():
+        L.append(f"API BACKOFF ACTIVE - {int(_api_backoff_until - time.time())}s remaining")
+    return "\n".join(L)
+
+def slotmap_startup_report():
+    time.sleep(180)
+    try:
+        for _ in range(3):
+            if revl_gate_state() != "UNKNOWN":
+                break
+            time.sleep(60)
+        oi = supabase_oi_change_4h("BTC-USDT")
+        send_tg("\U0001F9ED SLOT MAP STATUS\n" + slotmap_status_text().split("\n", 1)[1] +
+                f"\nSupabase OI feed (T4 LONG): {'OK' if oi is not None else 'NO DATA - T4 LONG will not trade'}"
+                "\n/why = what each engine checked, signalled, filled or skipped")
+    except Exception as e:
+        print(f"[SLOTMAP REPORT] {e}")
+
 if __name__ == "__main__":
     _threading.Thread(target=slotmap_startup_report, daemon=True).start()
+    _threading.Thread(target=breadth_refresh_loop, daemon=True).start()   # 2026-10-07 long-gate deadlock fix
+    _threading.Thread(target=s1_route_loop, daemon=True).start()          # 2026-10-07 Binance ratio via Supabase
+    _threading.Thread(target=why_report_loop, daemon=True).start()        # 2026-10-07 6-hourly why-no-trades
     # Re-adopt anything already open on BingX BEFORE the engines start, so a restart
     # can't breach the concurrency caps or orphan a trail-managed position.
     try:

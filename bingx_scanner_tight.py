@@ -2389,11 +2389,13 @@ def handle_telegram_commands():
                     else: _off.append("T6")
                     l_auto_enabled = l2_auto_enabled = smcs_auto_enabled = True
                     _on.append("signals L1/L2/SMC-S")
+                    _n_cmd_start(_on)
                     _m = "ALL ENGINES ON: " + (", ".join(_on) if _on else "none")
                     if _off:
                         _m += "\nSkipped (disabled at build level): " + ", ".join(_off)
                     send_tg(_m)
                 elif text in ("/stop", "/all_stop"):
+                    _n_cmd_stop()
                     rev_auto_enabled = False
                     rev2_auto_enabled = False
                     t3_scalp_auto_enabled = False
@@ -2405,7 +2407,7 @@ def handle_telegram_commands():
                     rev3l_auto_enabled = rev4l_auto_enabled = False
                     rev5l_auto_enabled = rev6l_auto_enabled = False
                     l_auto_enabled = l2_auto_enabled = smcs_auto_enabled = False
-                    send_tg("ALL ENGINES OFF: T1, T2, T3, T4, T5, T6 + LONG legs.\n"
+                    send_tg("ALL ENGINES OFF: N1, N2 (live) + every T engine (paper).\n"
                             "Open positions are NOT closed - they keep being tracked "
                             "and will exit on their own SL / TP / time-stop.")
                 # ---- Tight 2 Trapped-Block Fade: /t2_start /t2_stop ----
@@ -2704,6 +2706,8 @@ def handle_telegram_commands():
                                    str(_t.get("entry_fill", _t["entry"])) + " | SL " + str(round(_t["sl"], 6)) +
                                    " | closes in " + str(max(0, int(_left // 60))) + "m")
                     send_tg(lines4)
+                elif _n_handle_cmd(text):
+                    pass
                 elif text == "/status":
                     # 2026-10-07: was a hard-coded legacy list (old T1-T7, showed retired
                     # engines ON). Now generated from the live slot map.
@@ -7274,7 +7278,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
             "qty": qty, "placed_ts": time.time(),
             "margin_used": required_margin, "risk_usdt": eng["risk_usdt"], "leverage": lev,
         }
-        send_tg(
+        print(
             f"\u23f3 {name} {symbol} {pos_side} LIMIT RESTING\n"
             f"Entry: {round(entry, 6)} | SL: {round(sl, 6)} | TP: {round(tp, 6)}\n"
             f"Risk: ${eng['risk_usdt']} | Lev: {lev}x | Margin: ${required_margin:.2f} | cancels in {eng.get("fill_bars", REV_FILL_BARS) * 15}m"
@@ -7371,7 +7375,7 @@ def rev_track_pending(eng):
             send_tg(
                 f"\u2705 {name} {sym} {p['pos_side']} FILLED (trade executed)\n"
                 f"Entry: {fill} (limit {round(p['entry'], 6)}, slip {slip:.2f}%)\n"
-                f"SL: {round(p['sl'], 6)} | TP: {round(tp, 6)} | Risk: ${eng['risk_usdt']}"
+                f"SL: {round(p['sl'], 6)} | TP: {(round(tp, 6) if tp is not None else 'none (trail/time exit)')} | Risk: ${eng['risk_usdt']}"
             )
             continue
 
@@ -7383,7 +7387,7 @@ def rev_track_pending(eng):
             pend.pop(sym, None)
             _st(eng, "unfilled")
             print(f"[REV] {name} {sym} limit unfilled after {eng.get("fill_bars", REV_FILL_BARS)} bars - cancelled")
-            send_tg(
+            print(
                 f"\u274e {name} {sym} {p['pos_side']} LIMIT CANCELLED (unfilled {eng.get("fill_bars", REV_FILL_BARS) * 15}m) "
                 f"- margin released"
             )
@@ -8666,44 +8670,2361 @@ def slotmap_startup_report():
     except Exception as e:
         print(f"[SLOTMAP REPORT] {e}")
 
+
+
+# ============================================================================
+# ============================================================================
+# 2026-10-11  N-SERIES BUILD
+#   N1  = 12h volume-zone retest on 40 majors              (LIVE, real orders)
+#   N2  = 1d big-candle retest on top-150 liquid non-majors (LIVE, real orders)
+#   T-series (every REV_* engine) = SIGNAL-ONLY: signal -> @fazzsignal_bot DM,
+#        paper trade tracked by the bot -> Niti Paper channel (TG_PAPER_CHAT_ID)
+#   Follow Up = S/R / structure / trendline break alerts -> TG_MANUAL_CHAT_ID
+#   Journal (TG_JOURNAL_CHAT_ID) = N1 + N2 only.
+#   State (N books, paper books, owner map) persisted in Supabase table bot_state,
+#   falling back to /tmp if the table does not exist yet.
+# ============================================================================
+import statistics as _stats
+
+TG_PAPER_ID = os.environ.get("TG_PAPER_CHAT_ID")
+TG_MANUAL_ID = os.environ.get("TG_MANUAL_CHAT_ID")
+
+# ---------------------------------------------------------------- Telegram
+_tg_lock = _threading.Lock()
+_tg_last = {"ts": 0.0}
+
+
+def _tg_post(token, cid, text):
+    """One Telegram send with pacing, 429 back-off and up to 4 attempts. True on success."""
+    if not token or not cid:
+        print(f"[TG] no token/chat - message dropped: {str(text)[:120]}")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for attempt in range(4):
+        try:
+            with _tg_lock:
+                gap = 0.4 - (time.time() - _tg_last["ts"])
+                if gap > 0:
+                    time.sleep(gap)
+                r = requests.post(url, json={"chat_id": cid, "text": text,
+                                             "disable_web_page_preview": True}, timeout=15)
+                _tg_last["ts"] = time.time()
+            if r.status_code == 200:
+                try:
+                    if r.json().get("ok"):
+                        return True
+                except Exception:
+                    return True
+            if r.status_code == 429:
+                try:
+                    ra = int(r.json().get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    ra = 5
+                print(f"[TG 429] retry in {ra}s (chat {cid})")
+                time.sleep(min(ra, 60) + 1)
+                continue
+            print(f"[TG FAIL] HTTP {r.status_code} chat {cid}: {r.text[:200]}")
+            if r.status_code in (400, 403, 404):
+                return False          # bad chat id / bot not admin - retrying will not help
+        except Exception as e:
+            print(f"[TG ERROR] attempt {attempt + 1}: {e}")
+        time.sleep(2 + attempt * 2)
+    return False
+
+
+def _tg_chunks(text, limit=3900):
+    text = str(text)
+    if len(text) <= limit:
+        return [text]
+    out, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                out.append(cur); cur = ""
+            out.append(line[:limit]); line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            out.append(cur); cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+    if cur:
+        out.append(cur)
+    return out
+
+
+def send_tg(msg, chat_id=None):
+    ok = True
+    for ch in _tg_chunks(msg):
+        ok = _tg_post(TG_TOKEN, chat_id or TG_CHAT_ID, ch) and ok
+    return ok
+
+
+def send_journal(msg):
+    if TG_JOURNAL_ID:
+        send_tg(msg, chat_id=TG_JOURNAL_ID)
+
+
+def send_paper(msg):
+    if TG_PAPER_ID:
+        send_tg(msg, chat_id=TG_PAPER_ID)
+    else:
+        print("[PAPER] TG_PAPER_CHAT_ID not set: " + str(msg)[:200])
+
+
+def send_followup(msg):
+    if TG_MANUAL_ID:
+        send_tg(msg, chat_id=TG_MANUAL_ID)
+    else:
+        print("[FOLLOW UP] TG_MANUAL_CHAT_ID not set: " + str(msg)[:200])
+
+
+def send_l_signal(msg):
+    """Signal-only DM (@fazzsignal_bot): L1/L2/SMC and now every T-series engine."""
+    for ch in _tg_chunks(msg):
+        _tg_post(L_TG_TOKEN, L_TG_CHAT_ID, ch)
+
+
+# ---------------------------------------------------------------- order logging
+# Every exchange order call is printed to the Render log with its result.
+_o_place_market = place_market_order
+_o_place_sl = place_sl_order
+_o_place_tp = place_tp_order
+_o_place_tp_limit = place_tp_limit_order
+_o_cancel = cancel_order
+
+
+def place_market_order(symbol, side, qty, pos_side):
+    r = _o_place_market(symbol, side, qty, pos_side)
+    print(f"[ORDER] MARKET {symbol} {side} {pos_side} qty={qty} -> {r}")
+    return r
+
+
+def place_sl_order(symbol, close_side, pos_side, sl_price, qty):
+    r = _o_place_sl(symbol, close_side, pos_side, sl_price, qty)
+    print(f"[ORDER] SL {symbol} {close_side} {pos_side} stop={sl_price} qty={qty} -> {r}")
+    return r
+
+
+def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
+    r = _o_place_tp(symbol, close_side, pos_side, tp_price, qty)
+    print(f"[ORDER] TP-MKT {symbol} {close_side} {pos_side} stop={tp_price} qty={qty} -> {r}")
+    return r
+
+
+def place_tp_limit_order(symbol, close_side, pos_side, tp_price, qty):
+    r = _o_place_tp_limit(symbol, close_side, pos_side, tp_price, qty)
+    print(f"[ORDER] TP-LIMIT {symbol} {close_side} {pos_side} px={tp_price} qty={qty} -> {r}")
+    return r
+
+
+def cancel_order(symbol, order_id):
+    r = _o_cancel(symbol, order_id)
+    print(f"[ORDER] CANCEL {symbol} {order_id} -> {str(r)[:160]}")
+    return r
+
+
+# ---------------------------------------------------------------- persistent state
+STATE_TABLE = os.environ.get("STATE_TABLE", "bot_state")
+_state_info = {"ok": None, "warned": False, "err": ""}
+
+
+def _state_file(key):
+    return f"/tmp/niti_state_{key}.json"
+
+
+def _sb_headers():
+    return {"apikey": SUPABASE_SERVICE_KEY, "Authorization": "Bearer " + SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json"}
+
+
+def state_get(key, default=None):
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY and _state_info["ok"] is not False:
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/{STATE_TABLE}",
+                             params={"key": f"eq.{key}", "select": "value"},
+                             headers=_sb_headers(), timeout=15)
+            if r.status_code == 200:
+                _state_info["ok"] = True
+                rows = r.json()
+                if rows:
+                    return rows[0].get("value", default)
+                return default
+            _state_info["ok"] = False
+            _state_info["err"] = f"HTTP {r.status_code} {r.text[:120]}"
+            print(f"[STATE] Supabase table {STATE_TABLE} not usable: {_state_info['err']}")
+        except Exception as e:
+            _state_info["err"] = str(e)[:120]
+            print(f"[STATE GET {key}] {e}")
+    try:
+        with open(_state_file(key)) as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def state_put(key, value):
+    try:
+        with open(_state_file(key), "w") as fh:
+            json.dump(value, fh)
+    except Exception as e:
+        print(f"[STATE FILE {key}] {e}")
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY and _state_info["ok"] is not False:
+        try:
+            h = _sb_headers()
+            h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+            r = requests.post(f"{SUPABASE_URL}/rest/v1/{STATE_TABLE}", params={"on_conflict": "key"},
+                              headers=h, json=[{"key": key, "value": value,
+                                                "updated_at": datetime.now(timezone.utc).isoformat()}],
+                              timeout=15)
+            if r.status_code in (200, 201, 204):
+                _state_info["ok"] = True
+                return True
+            _state_info["ok"] = False
+            _state_info["err"] = f"HTTP {r.status_code} {r.text[:120]}"
+            print(f"[STATE PUT {key}] {_state_info['err']}")
+        except Exception as e:
+            print(f"[STATE PUT {key}] {e}")
+    return False
+
+
+def state_status_text():
+    if _state_info["ok"] is True:
+        return f"Supabase {STATE_TABLE} OK"
+    if _state_info["ok"] is False:
+        return f"Supabase {STATE_TABLE} NOT usable ({_state_info['err']}) - using /tmp, lost on redeploy"
+    return "not checked yet"
+
+
+# owner map now survives a redeploy (was /tmp only)
+_owner_put_ts = {"ts": 0.0}
+
+
+def _owner_map_note(eng):
+    try:
+        tag = eng.get("tag", "?")
+        label = eng.get("name", "?")
+        for t in list(eng.get("open", {}).values()):
+            sym = t.get("symbol")
+            if sym:
+                _owner_map[sym] = {"tag": tag, "label": label}
+        if time.time() - _owner_put_ts["ts"] < 300:
+            return
+        _owner_put_ts["ts"] = time.time()
+        state_put("owner_map", _owner_map)
+    except Exception as e:
+        print(f"[OWNER MAP WRITE] {e}")
+
+
+def _owner_map_load():
+    m = state_get("owner_map", None)
+    if isinstance(m, dict):
+        return m
+    return {}
+
+
+# ---------------------------------------------------------------- quieter Telegram
+def _skip_note(eng, symbol, reason, detail):
+    """2026-10-11: skips are counted (see /why) and logged, no longer sent to Telegram."""
+    _st(eng, "skip_" + reason)
+    print(f"[SKIP] {eng.get('name', '?')} {symbol} {reason}: {detail}")
+
+
+def why_report_loop():
+    """2026-10-11: the 6-hourly report is gone (Telegram noise). /why still answers on demand."""
+    while True:
+        time.sleep(86400)
+
+
+# ---------------------------------------------------------------- helpers
+MAJ40 = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "LTC", "BCH", "LINK", "DOT", "AVAX", "TRX",
+         "ETC", "XLM", "ATOM", "UNI", "NEAR", "FIL", "APT", "ARB", "OP", "SUI", "AAVE", "INJ", "TON",
+         "HBAR", "ICP", "SHIB", "PEPE", "WLD", "TIA", "SEI", "RNDR", "RENDER", "ALGO", "VET", "MKR",
+         "LDO", "CRV"]
+_MAJ_SET = set(MAJ40)
+
+
+def _coin_base(sym):
+    b = str(sym).upper().split("-")[0].replace("USDT", "")
+    return b.replace("1000", "")          # identical to the backtest's ism()
+
+
+def is_major(sym):
+    return _coin_base(sym) in _MAJ_SET
+
+
+_price_prec = {}
+_price_prec_ts = {"ts": 0.0}
+
+
+def _load_price_prec():
+    if time.time() - _price_prec_ts["ts"] < 6 * 3600 and _price_prec:
+        return
+    try:
+        r = requests.get(BASE_URL + "/openApi/swap/v2/quote/contracts", timeout=10).json()
+        for c in r.get("data", []) or []:
+            try:
+                _price_prec[c["symbol"]] = int(c.get("pricePrecision", 6))
+            except Exception:
+                pass
+        _price_prec_ts["ts"] = time.time()
+    except Exception as e:
+        print(f"[PRICE PREC] {e}")
+
+
+def px_round(sym, x):
+    _load_price_prec()
+    p = _price_prec.get(sym)
+    if p is None:
+        p = 6 if x >= 0.01 else 10
+    return round(float(x), p)
+
+
+def get_order_info(order_id, symbol):
+    """{status, avg, executed} for one order, or None on failure."""
+    try:
+        params = build_signed_params({"symbol": symbol, "orderId": order_id})
+        r = requests.get(BASE_URL + "/openApi/swap/v2/trade/order", params=params,
+                         headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        od = r.get("data", {}).get("order", {}) or {}
+        if not od:
+            return None
+        return {"status": str(od.get("status", "")).upper(),
+                "avg": float(od.get("avgPrice", 0) or 0),
+                "executed": float(od.get("executedQty", 0) or 0)}
+    except Exception as e:
+        print(f"[ORDER INFO {symbol} {order_id}] {e}")
+        return None
+
+
+def place_limit_entry(symbol, side, pos_side, price, qty):
+    url = BASE_URL + "/openApi/swap/v2/trade/order"
+    params = build_signed_params({
+        "symbol": symbol, "side": side, "positionSide": pos_side,
+        "type": "LIMIT", "price": px_round(symbol, price), "quantity": qty, "timeInForce": "GTC",
+    })
+    r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+    oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
+    print(f"[ORDER] LIMIT-ENTRY {symbol} {side} {pos_side} px={px_round(symbol, price)} qty={qty} -> {oid if oid != 'N/A' else r}")
+    return oid, r
+
+
+def get_income_pnl(symbol, start_ms):
+    """Realized PnL + fees + funding for `symbol` since start_ms, from BingX. None on failure."""
+    try:
+        params = build_signed_params({"symbol": symbol, "startTime": int(start_ms),
+                                      "endTime": int(time.time() * 1000) + 60000, "limit": 1000})
+        r = requests.get(BASE_URL + "/openApi/swap/v2/user/income", params=params,
+                         headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        rows = r.get("data")
+        if not isinstance(rows, list):
+            return None
+        tot, seen = 0.0, False
+        for x in rows:
+            if str(x.get("symbol")) != symbol:
+                continue
+            if str(x.get("incomeType", "")).upper() in ("REALIZED_PNL", "TRADING_FEE", "FUNDING_FEE"):
+                tot += float(x.get("income", 0) or 0)
+                seen = True
+        return tot if seen else None
+    except Exception as e:
+        print(f"[INCOME {symbol}] {e}")
+        return None
+
+
+def _closed_only(cs, bar_ms):
+    now = time.time() * 1000
+    return [c for c in cs if _bar_ms(c) and _bar_ms(c) + bar_ms <= now]
+
+
+def _agg_12h(c4):
+    """12h bars from closed 4h bars, aligned to 00:00/12:00 UTC, complete groups only
+    (exactly how the backtest built them)."""
+    groups = {}
+    for c in c4:
+        t = _bar_ms(c)
+        groups.setdefault(t // 43200000, []).append(c)
+    out = []
+    for g in sorted(groups):
+        b = sorted(groups[g], key=_bar_ms)
+        if len(b) != 3:
+            continue
+        out.append({"time": g * 43200000, "open": o(b[0]), "high": max(h(x) for x in b),
+                    "low": min(l(x) for x in b), "close": cl(b[-1]),
+                    "qv": sum(cl(x) * v(x) for x in b)})
+    return out
+
+
+def _bars_arrays(bars):
+    O = [float(b["open"]) for b in bars]
+    H = [float(b["high"]) for b in bars]
+    L = [float(b["low"]) for b in bars]
+    C = [float(b["close"]) for b in bars]
+    Q = [float(b["qv"]) if "qv" in b else float(b["close"]) * float(b["volume"]) for b in bars]
+    T = [int(b["time"]) for b in bars]
+    return T, O, H, L, C, Q
+
+
+def _positions_map():
+    """{(symbol, LONG|SHORT): amt} or None if the call failed."""
+    try:
+        params = build_signed_params({})
+        r = requests.get(BASE_URL + "/openApi/swap/v2/user/positions", params=params,
+                         headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
+        if not isinstance(r.get("data"), list):
+            return None
+        out = {}
+        for p in r["data"]:
+            amt = abs(float(p.get("positionAmt", 0) or 0))
+            if amt > 0:
+                out[(p.get("symbol", ""), (p.get("positionSide", "") or "").upper())] = amt
+        return out
+    except Exception as e:
+        print(f"[POSITIONS MAP] {e}")
+        return None
+
+
+# pre-existing bug: L paper tracking called an undefined get_last_price (NameError, swallowed)
+get_last_price = get_current_price
+
+
+# ---- pure signal maths (verified against the backtest generator) ----
+# ---- pure N1/N2 signal maths (shared by the bot tail and the offline equivalence test) ----
+def _n_atr(h, l, c):
+    n = len(c)
+    tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, n)]
+    atr = [None] * n
+    if n < 15:
+        return atr
+    a = sum(tr[:14]) / 14.0
+    for i in range(14, n):
+        a = (a * 13 + tr[i]) / 14.0
+        atr[i] = a
+    return atr
+
+
+def _n_pb(c, i, n_bb=20):
+    """Bollinger %B of close i over the last n_bb closes (sample std, like pandas)."""
+    if i + 1 < n_bb:
+        return None
+    w = c[i - n_bb + 1:i + 1]
+    m = sum(w) / n_bb
+    var = sum((x - m) ** 2 for x in w) / (n_bb - 1)
+    sd = var ** 0.5
+    if sd <= 0:
+        return None
+    return (c[i] - (m - 2 * sd)) / (4 * sd)
+
+
+def n_signal_at(o, h, l, c, qv, i, vm, zf, liqbars, bb, atr=None):
+    """Signal on CLOSED bar i, identical to the backtest generator (gen6/gen7 + BB filter).
+    Returns dict(side, entry, sl, R, atr) or None."""
+    n = len(c)
+    if n < 40 or i < 22:
+        return None
+    if atr is None:
+        atr = _n_atr(h, l, c)
+    a = atr[i]
+    if a is None or a <= 0:
+        return None
+    va = sum(qv[i - 20:i]) / 20.0
+    liq = sum(qv[max(0, i - liqbars + 1):i + 1])
+    rng = h[i] - l[i]
+    body = abs(c[i] - o[i])
+    if not (liq >= 2e6 and rng > 0 and body >= 0.5 * rng and rng >= a and va > 0 and qv[i] >= vm * va
+            and c[i] != o[i]):
+        return None
+    d = 1 if c[i] > o[i] else -1
+    E = c[i] - zf * (c[i] - o[i])
+    SL = o[i] - d * 0.25 * a
+    R = abs(E - SL)
+    if R <= 0 or R / E > 0.4 or R / E < 0.005:
+        return None
+    if bb:
+        pb = _n_pb(c, i)
+        if pb is None:
+            return None
+        pbd = pb if d == 1 else 1 - pb
+        if not (pbd <= 1):
+            return None
+    return {"side": "BUY" if d == 1 else "SELL", "entry": E, "sl": SL, "R": R, "atr": a}
+
+
+# ============================================================================
+# N1 / N2 ENGINES (live, real orders)
+# Backtest-identical signal maths (verified bar-for-bar against the research generator:
+# 0 mismatches over 1,754 N1 and 12,065 N2 historical signals).
+# Exit = 50% at +1R (resting limit) then stop to entry; the other 50% trails k x ATR from
+# the best price, updated at each candle close; time stop after H candles.
+# ============================================================================
+N_LOCK = _threading.RLock()
+N_SCAN_GRACE_S = int(os.environ.get("N_SCAN_GRACE_SECONDS", 3600))   # never place a signal older than this
+N_PENDING_EXTRA = int(os.environ.get("N_PENDING_EXTRA", 4))          # resting limits allowed beyond the open cap
+N_REQ_PAUSE = float(os.environ.get("N_REQ_PAUSE", 0.12))
+
+
+def _n_desc(tag, name, tf, bar_ms, vm, zf, trail, pp, W, H, liqbars, bb, risk, cap, lev):
+    return {
+        "tag": tag, "name": name, "tf": tf, "bar_ms": bar_ms, "vm": vm, "zf": zf, "trail": trail,
+        "pp": pp, "W": W, "H": H, "liqbars": liqbars, "bb": bb,
+        "risk_usdt": float(os.environ.get(f"{tag.upper()}_RISK_USD", risk)),
+        "max_concurrent": int(os.environ.get(f"{tag.upper()}_MAX_OPEN", cap)),
+        "leverage": int(os.environ.get(f"{tag.upper()}_LEVERAGE", lev)),
+        "pending": {}, "open": {}, "done": {}, "last_scan_bar": None, "last_scan_note": "",
+    }
+
+
+N1_ENG = _n_desc("n1", "N1", "12h", 43200000, 1.5, 0.33, 2.0, 1.0, 10, 60, 2, True, 6.0, 6, 10)
+N_ENGINES = [N1_ENG]          # N2 is the separate daily extreme-mover engine below (tail X2)
+N_CTRL = {"n1": AUTO_RESUME_ON_START, "n2": AUTO_RESUME_ON_START}
+N_CLOSED = []          # closed N trades (persisted), for the daily/weekly reports
+N2_UNIVERSE_N = int(os.environ.get("N2_UNIVERSE_TOP", 150))
+
+
+def n_save():
+    try:
+        with N_LOCK:
+            books = {e["tag"]: {"pending": e["pending"], "open": e["open"], "done": e["done"]}
+                     for e in N_ENGINES}
+        state_put("n_books", books)
+    except Exception as ex:
+        print(f"[N SAVE] {ex}")
+
+
+def n_load():
+    books = state_get("n_books", {}) or {}
+    with N_LOCK:
+        for e in N_ENGINES:
+            b = books.get(e["tag"]) or {}
+            e["pending"] = dict(b.get("pending") or {})
+            e["open"] = dict(b.get("open") or {})
+            e["done"] = dict(b.get("done") or {})
+        N_CLOSED[:] = list(state_get("n_closed", []) or [])
+    print(f"[N] state loaded: N1 open {len(N1_ENG['open'])} pending {len(N1_ENG['pending'])} | "
+          f"closed {len(N_CLOSED)}")
+
+
+def n_all_symbols():
+    with N_LOCK:
+        s = set()
+        for e in N_ENGINES:
+            s.update(e["open"].keys())
+            s.update(e["pending"].keys())
+        return s
+
+
+_orig_all_open_symbols = all_open_symbols
+
+
+def all_open_symbols():
+    """Every symbol held by any engine, now including N1/N2 books (so the startup adopt,
+    T-series paper and other engines never touch an N coin)."""
+    s = set(_orig_all_open_symbols())
+    try:
+        s |= n_all_symbols()
+    except Exception:
+        pass
+    return s
+
+
+# ---------------------------------------------------------------- daily candle cache
+_dc = {"day": None, "data": {}, "qv24": {}, "busy": False}
+_dc_lock = _threading.Lock()
+DC_MIN_QV24 = float(os.environ.get("DAILY_CACHE_MIN_QV24", 300_000))
+
+
+def _ticker_map():
+    try:
+        r = requests.get(BASE_URL + "/openApi/swap/v2/quote/ticker", timeout=10).json()
+        out = {}
+        for t in r.get("data", []) or []:
+            try:
+                out[t.get("symbol", "")] = t
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        print(f"[TICKER] {e}")
+        return {}
+
+
+def _clean_symbol(s):
+    return ("USDT" in s and not is_tokenized(s) and not is_tokenized_stock(s)
+            and not str(s).startswith("NC"))
+
+
+def daily_cache_refresh(force=False):
+    """Closed 1d candles (+ quote volume) for every listed coin with >= $300k 24h volume.
+    Shared by N2 (universe + signals) and Follow Up (1d alerts). Once per UTC day."""
+    day = int(time.time() // 86400)
+    if _dc["day"] == day and not force:
+        return True
+    if not _dc_lock.acquire(blocking=False):
+        while _dc["busy"]:
+            time.sleep(5)
+        return _dc["day"] == day
+    try:
+        _dc["busy"] = True
+        tick = _ticker_map()
+        syms = [s for s in (get_futures_symbols() or []) if _clean_symbol(s)]
+        qv24 = {}
+        for s in syms:
+            try:
+                qv24[s] = float(tick.get(s, {}).get("quoteVolume", 0) or 0)
+            except Exception:
+                qv24[s] = 0.0
+        want = [s for s in syms if qv24.get(s, 0) >= DC_MIN_QV24 or is_major(s)]
+        data, errs = {}, 0
+        for s in want:
+            while api_backoff_active():
+                time.sleep(30)
+            try:
+                cs = _closed_only(get_candles(s, limit=130, interval="1d") or [], 86400000)
+                if cs:
+                    data[s] = [{"time": _bar_ms(c), "open": o(c), "high": h(c), "low": l(c),
+                                "close": cl(c), "qv": cl(c) * v(c)} for c in cs]
+            except Exception:
+                errs += 1
+            time.sleep(N_REQ_PAUSE)
+        _dc["data"], _dc["qv24"], _dc["day"] = data, qv24, day
+        print(f"[DAILY CACHE] {len(data)} coins cached ({errs} errors)")
+        return True
+    finally:
+        _dc["busy"] = False
+        _dc_lock.release()
+
+
+def n2_universe(target_ts):
+    """Top-N coins by median daily quote volume over the 90 days BEFORE the signal day
+    (min 30 days), majors removed - same as the backtest's rolling(90).median().shift(1)."""
+    meds = []
+    lo = target_ts - 90 * 86400000
+    for s, bars in _dc["data"].items():
+        vals = [b["qv"] for b in bars if lo <= b["time"] < target_ts]
+        if len(vals) >= 30:
+            meds.append((s, _stats.median(vals)))
+    meds.sort(key=lambda x: x[1], reverse=True)
+    top = [s for s, _ in meds[:N2_UNIVERSE_N]]
+    return [s for s in top if not is_major(s)]
+
+
+def n_bars(eng, sym):
+    if eng["tf"] == "12h":
+        c4 = _closed_only(get_candles(sym, limit=720, interval="4h") or [], 14400000)
+        return _agg_12h(c4)
+    bars = _dc["data"].get(sym)
+    if bars:
+        return bars
+    cs = _closed_only(get_candles(sym, limit=130, interval="1d") or [], 86400000)
+    return [{"time": _bar_ms(c), "open": o(c), "high": h(c), "low": l(c), "close": cl(c),
+             "qv": cl(c) * v(c)} for c in cs]
+
+
+# ---------------------------------------------------------------- N1 long gate
+# 2026-10-11 (4h-resolution re-test): N1 takes LONGS only while BTC's last closed daily
+# close is above its daily EMA50. Bear +$3.4 -> +$5.0/wk, bear halves -35/+150 -> -4/+172.
+N1_LONG_GATE = os.environ.get("N1_LONG_GATE", "1") == "1"
+_btc_gate = {"day": None, "open": True}
+
+
+def _ewm_adjusted(vals, span):
+    """pandas ewm(span).mean() with adjust=True (the backtest's definition)."""
+    a = 2.0 / (span + 1.0)
+    num = den = 0.0
+    out = []
+    for x in vals:
+        num = x + (1 - a) * num
+        den = 1.0 + (1 - a) * den
+        out.append(num / den)
+    return out
+
+
+def n1_long_gate_open(bar_ts):
+    day_open = int(bar_ts) // 86400000 * 86400000          # the day the 12h signal bar is in
+    if _btc_gate["day"] == day_open:
+        return _btc_gate["open"]
+    try:
+        cs = [c for c in (get_candles("BTC-USDT", limit=400, interval="1d") or [])
+              if _bar_ms(c) + 86400000 <= day_open]             # days fully closed before it
+        if len(cs) < 60:
+            return True
+        closes = [cl(c) for c in cs]
+        e = _ewm_adjusted(closes, 50)
+        ok = closes[-1] > e[-1]
+        _btc_gate.update(day=day_open, open=ok)
+        print(f"[N1 GATE] BTC daily close {closes[-1]:.0f} vs EMA50 {e[-1]:.0f} -> longs {'ON' if ok else 'OFF'}")
+        return ok
+    except Exception as ex:
+        print(f"[N1 GATE] {ex}")
+        return True
+
+
+# ---------------------------------------------------------------- scanning
+def n_scan(eng, bar_ts):
+    """Signals on the candle that opened at bar_ts and has just closed."""
+    tag, name = eng["tag"], eng["name"]
+    if eng["tf"] == "12h":
+        # BTC is left out of N1: it is N2's hedge instrument (one BTC LONG position on BingX)
+        universe = [s for s in (get_futures_symbols() or []) if is_major(s) and _clean_symbol(s)
+                    and _coin_base(s) != "BTC"]
+    else:
+        universe = n2_universe(bar_ts)
+    pos = _positions_map()
+    if pos is None:
+        print(f"[{name}] positions unavailable - scan postponed")
+        return False
+    held = {s for (s, _ps) in pos.keys()} | set(_orig_all_open_symbols())
+    fired = checked = 0
+    for sym in universe:
+        if api_backoff_active():
+            print(f"[{name}] API backoff - scan postponed")
+            return False
+        with N_LOCK:
+            if sym in eng["open"] or sym in eng["pending"]:
+                continue
+            other = any(sym in e["open"] or sym in e["pending"] for e in N_ENGINES if e is not eng)
+        if other or sym in held:
+            continue
+        try:
+            bars = n_bars(eng, sym)
+        except Exception as ex:
+            print(f"[{name} BARS {sym}] {ex}")
+            continue
+        if eng["tf"] == "12h":
+            time.sleep(N_REQ_PAUSE)
+        if not bars or int(bars[-1]["time"]) != int(bar_ts):
+            continue
+        checked += 1
+        T, O, H, L, C, Q = _bars_arrays(bars)
+        sig = n_signal_at(O, H, L, C, Q, len(C) - 1, eng["vm"], eng["zf"], eng["liqbars"], eng["bb"])
+        if not sig:
+            continue
+        key = f"{sym}|{bar_ts}"
+        if key in eng["done"]:
+            continue
+        if sig["side"] == "BUY" and eng["tag"] == "n1" and N1_LONG_GATE and not n1_long_gate_open(bar_ts):
+            print(f"[{name}] {sym} LONG skipped - BTC below daily EMA50 (long gate)")
+            _st(eng, "skip_btcgate")
+            eng["done"][key] = time.time()
+            continue
+        with N_LOCK:
+            n_open, n_pend = len(eng["open"]), len(eng["pending"])
+        if n_open >= eng["max_concurrent"] or n_open + n_pend >= eng["max_concurrent"] + N_PENDING_EXTRA:
+            print(f"[{name}] {sym} signal skipped - cap (open {n_open}, pending {n_pend})")
+            _st(eng, "skip_cap")
+            eng["done"][key] = time.time()
+            continue
+        res = n_place(eng, sym, sig, bar_ts)
+        eng["done"][key] = time.time()
+        if res:
+            fired += 1
+    # prune old signal keys
+    cut = time.time() - 40 * 86400
+    eng["done"] = {k: t for k, t in eng["done"].items() if t >= cut}
+    eng["last_scan_note"] = (f"{datetime.now(timezone.utc).strftime('%m-%d %H:%M')} UTC: "
+                             f"{checked} coins checked, {fired} order(s) placed")
+    print(f"[{name} SCAN] bar {bar_ts} universe {len(universe)} checked {checked} placed {fired}")
+    n_save()
+    return True
+
+
+def n_place(eng, sym, sig, bar_ts):
+    name = eng["name"]
+    try:
+        side = sig["side"]
+        E, SL, R = sig["entry"], sig["sl"], sig["R"]
+        d = 1 if side == "BUY" else -1
+        pos_side = "LONG" if d == 1 else "SHORT"
+        close_side = "SELL" if d == 1 else "BUY"
+        px = get_current_price(sym)
+        if px and ((d == 1 and px <= SL) or (d == -1 and px >= SL)):
+            print(f"[{name}] {sym} price {px} already beyond SL {SL} - skip")
+            _st(eng, "skip_gap")
+            return None
+        prec = symbol_precision.get(sym, 4)
+        qty = round(eng["risk_usdt"] / R, prec)
+        if qty <= 0:
+            print(f"[{name}] {sym} qty rounds to 0 - skip")
+            _st(eng, "skip_qty0")
+            return None
+        lev = safe_leverage(sym, eng["leverage"], R / E)
+        set_leverage_api(sym, lev)
+        margin = qty * E / lev
+        avail = get_available_margin()
+        if avail is not None and avail < margin * 1.05:
+            print(f"[{name}] {sym} margin skip - need ${margin:.2f}, free ${avail:.2f}")
+            _st(eng, "skip_margin")
+            return None
+        if not depth_ok(sym, E, SL, qty, side):
+            print(f"[{name}] {sym} depth skip")
+            _st(eng, "skip_depth")
+            return None
+        oid, raw = place_limit_entry(sym, side, pos_side, E, qty)
+        if oid == "N/A":
+            _st(eng, "skip_rejected")
+            send_tg(f"⚠️ {name} {sym} order rejected by BingX: {str(raw)[:200]}")
+            return None
+        rec = {"order_id": oid, "symbol": sym, "side": side, "pos_side": pos_side,
+               "close_side": close_side, "entry": E, "sl": SL, "R": R, "qty": qty, "lev": lev,
+               "margin_used": round(margin, 2), "placed_ts": time.time(), "bar_ts": int(bar_ts),
+               "expire_ts": (int(bar_ts) + (eng["W"] + 1) * eng["bar_ms"]) / 1000.0,
+               "atr": sig["atr"]}
+        with N_LOCK:
+            eng["pending"][sym] = rec
+        _st(eng, "placed")
+        print(f"[{name}] {sym} {pos_side} LIMIT {E} SL {SL} qty {qty} lev {lev}x margin ${margin:.2f} "
+              f"(valid until {datetime.fromtimestamp(rec['expire_ts'], timezone.utc).strftime('%m-%d %H:%M')} UTC)")
+        n_save()
+        return oid
+    except Exception as ex:
+        print(f"[{name} PLACE {sym}] {ex}")
+        return None
+
+
+def n_scan_loop():
+    """Fires each engine's scan just after its candle closes (N1 every 12h, N2 daily)."""
+    time.sleep(45)
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+            for eng in N_ENGINES:
+                bm = eng["bar_ms"]
+                boundary = now_ms // bm * bm           # close of the last candle
+                bar_ts = boundary - bm                 # its open time
+                delay = 90 if eng["tf"] == "12h" else 240
+                age_s = (now_ms - boundary) / 1000.0
+                if eng["last_scan_bar"] == bar_ts or age_s < delay:
+                    continue
+                if age_s > N_SCAN_GRACE_S:
+                    eng["last_scan_bar"] = bar_ts      # too old (restart) - wait for the next candle
+                    continue
+                if not N_CTRL.get(eng["tag"]):
+                    eng["last_scan_bar"] = bar_ts
+                    continue
+                if eng["tf"] == "1d":
+                    daily_cache_refresh()
+                if n_scan(eng, bar_ts):
+                    eng["last_scan_bar"] = bar_ts
+        except Exception as ex:
+            print(f"[N SCAN LOOP] {ex}")
+        time.sleep(30)
+
+
+# ---------------------------------------------------------------- order / trade management
+def _n_cancel_quiet(sym, oid):
+    if oid and oid != "N/A":
+        try:
+            cancel_order(sym, oid)
+        except Exception:
+            pass
+
+
+def n_on_fill(eng, sym, p, fill_px, qty_exec):
+    name = eng["name"]
+    prec = symbol_precision.get(sym, 4)
+    qty = round(float(qty_exec), prec)
+    if qty <= 0:
+        with N_LOCK:
+            eng["pending"].pop(sym, None)
+        return
+    fill = float(fill_px or p["entry"])
+    d = 1 if p["side"] == "BUY" else -1
+    E, R, SL = p["entry"], p["R"], p["sl"]
+    sl_id = place_sl_guarded(sym, p["close_side"], p["pos_side"], px_round(sym, SL), qty)
+    if sl_id is None:
+        try:
+            place_market_order(sym, p["close_side"], qty, p["pos_side"])
+        except Exception as ex:
+            print(f"[{name} EMERGENCY CLOSE {sym}] {ex}")
+        send_tg(f"⚠️ {name} {sym} {p['pos_side']}: SL could not be placed - position closed at market (no naked risk).")
+        with N_LOCK:
+            eng["pending"].pop(sym, None)
+        n_save()
+        return
+    half = round(qty / 2.0, prec)
+    rem = round(qty - half, prec)
+    tp1 = E + d * eng["pp"] * R
+    tp1_id = None
+    if half > 0 and rem > 0:
+        tp1_id = place_tp_limit_order(sym, p["close_side"], p["pos_side"], px_round(sym, tp1), half)
+        if not tp1_id or tp1_id == "N/A":
+            time.sleep(1)
+            tp1_id = place_tp_limit_order(sym, p["close_side"], p["pos_side"], px_round(sym, tp1), half)
+        if not tp1_id or tp1_id == "N/A":
+            tp1_id = place_tp_order(sym, p["close_side"], p["pos_side"], px_round(sym, tp1), half)
+        if not tp1_id or tp1_id == "N/A":
+            tp1_id = None           # managed softly from price below
+    else:
+        half, rem = 0.0, qty
+    bm = eng["bar_ms"]
+    now_ms = int(time.time() * 1000)
+    fill_bar = now_ms // bm * bm
+    t = {"symbol": sym, "side": p["side"], "pos_side": p["pos_side"], "close_side": p["close_side"],
+         "entry": E, "entry_fill": fill, "sl": SL, "R": R, "qty": qty, "half_qty": half, "rem_qty": rem,
+         "tp1": tp1, "tp1_id": tp1_id, "tp1_done": False, "tp1_px": None, "sl_id": sl_id,
+         "stp": SL, "best": E, "open_ts": time.time(), "fill_bar": fill_bar, "last_bar_done": fill_bar - bm,
+         "max_hold_ms": fill_bar + (eng["H"] + 1) * bm, "lev": p.get("lev"),
+         "margin_used": round(qty * fill / max(p.get("lev") or 1, 1), 2), "gone": 0, "exit_reason": "",
+         "risk_usdt": eng["risk_usdt"]}
+    with N_LOCK:
+        eng["open"][sym] = t
+        eng["pending"].pop(sym, None)
+    _st(eng, "fills")
+    print(f"[{name}] FILLED {sym} {p['pos_side']} @ {fill} qty {qty} | SL {SL} | TP1 {tp1} ({half})")
+    send_tg(f"✅ {name} {sym} {p['pos_side']} FILLED\n"
+            f"Entry {px_round(sym, fill)} | SL {px_round(sym, SL)} | TP1 50% {px_round(sym, tp1)}\n"
+            f"Risk ${eng['risk_usdt']:.0f} | {p.get('lev')}x | margin ${t['margin_used']:.2f}")
+    n_save()
+
+
+def n_manage_pending(eng, pos):
+    name = eng["name"]
+    for sym, p in list(eng["pending"].items()):
+        info = get_order_info(p["order_id"], sym)
+        if info is None:
+            continue
+        st = info["status"]
+        if st == "FILLED":
+            n_on_fill(eng, sym, p, info["avg"] or p["entry"], info["executed"] or p["qty"])
+            continue
+        if st in ("CANCELLED", "CANCELED", "EXPIRED", "REJECTED", "FAILED"):
+            if info["executed"] > 0:
+                n_on_fill(eng, sym, p, info["avg"] or p["entry"], info["executed"])
+            else:
+                print(f"[{name}] {sym} limit is {st} on BingX - dropped")
+                with N_LOCK:
+                    eng["pending"].pop(sym, None)
+                n_save()
+            continue
+        cap_full = len(eng["open"]) >= eng["max_concurrent"]
+        if time.time() >= p["expire_ts"] or cap_full:
+            _n_cancel_quiet(sym, p["order_id"])
+            time.sleep(1)
+            info2 = get_order_info(p["order_id"], sym) or info
+            if info2["executed"] > 0:
+                n_on_fill(eng, sym, p, info2["avg"] or p["entry"], info2["executed"])
+            else:
+                why = "cap full" if cap_full else "not filled in time"
+                print(f"[{name}] {sym} limit cancelled - {why}")
+                _st(eng, "unfilled")
+                with N_LOCK:
+                    eng["pending"].pop(sym, None)
+                n_save()
+
+
+def _n_close_market(eng, sym, t, pos, reason):
+    amt = pos.get((sym, t["pos_side"]), 0) if pos else 0
+    if amt <= 0:
+        amt = t["rem_qty"] if t["tp1_done"] else t["qty"]
+    t["exit_reason"] = reason
+    place_market_order(sym, t["close_side"], amt, t["pos_side"])
+    print(f"[{eng['name']}] {sym} market close ({reason}) qty {amt}")
+
+
+def n_move_stop(eng, sym, t, new_stp, pos):
+    d = 1 if t["side"] == "BUY" else -1
+    px = get_current_price(sym)
+    if px and ((d == 1 and px <= new_stp) or (d == -1 and px >= new_stp)):
+        _n_close_market(eng, sym, t, pos, "trail")
+        t["stp"] = new_stp
+        n_save()
+        return
+    amt = pos.get((sym, t["pos_side"]), 0) if pos else 0
+    if amt <= 0:
+        amt = t["rem_qty"] if t["tp1_done"] else t["qty"]
+    new_id = place_sl_guarded(sym, t["close_side"], t["pos_side"], px_round(sym, new_stp), amt)
+    if new_id is None:
+        print(f"[{eng['name']}] {sym} could not move stop to {new_stp} - old stop kept")
+        if not t.get("move_warned"):
+            t["move_warned"] = True
+            send_tg(f"⚠️ {eng['name']} {sym}: stop could not be moved to {px_round(sym, new_stp)} - old stop still active.")
+        return
+    _n_cancel_quiet(sym, t.get("sl_id"))
+    t["sl_id"] = new_id
+    t["stp"] = new_stp
+    print(f"[{eng['name']}] {sym} stop moved to {new_stp} (qty {amt})")
+    n_save()
+
+
+def n_manage_open(eng, pos):
+    name = eng["name"]
+    now_ms = int(time.time() * 1000)
+    bm = eng["bar_ms"]
+    for sym, t in list(eng["open"].items()):
+        d = 1 if t["side"] == "BUY" else -1
+        present = pos.get((sym, t["pos_side"]), 0) > 0
+        if not present:
+            t["gone"] = t.get("gone", 0) + 1
+            if t["gone"] >= 2:
+                n_finalize(eng, sym, t)
+            continue
+        t["gone"] = 0
+        E, R = t["entry"], t["R"]
+        # ---- 50% at +1R
+        if not t["tp1_done"] and t["half_qty"] > 0:
+            hit = False
+            if t.get("tp1_id"):
+                info = get_order_info(t["tp1_id"], sym)
+                if info and (info["status"] == "FILLED" or info["executed"] >= t["half_qty"] * 0.999):
+                    hit = True
+                    t["tp1_px"] = info["avg"] or t["tp1"]
+            else:
+                px = get_current_price(sym)
+                if px and ((d == 1 and px >= t["tp1"]) or (d == -1 and px <= t["tp1"])):
+                    place_market_order(sym, t["close_side"], t["half_qty"], t["pos_side"])
+                    hit = True
+                    t["tp1_px"] = px
+            if hit:
+                t["tp1_done"] = True
+                print(f"[{name}] {sym} 50% closed at +1R ({t['tp1_px']}) - stop to entry")
+                be = max(t["stp"], E) if d == 1 else min(t["stp"], E)
+                n_move_stop(eng, sym, t, be, pos)
+                continue
+        # ---- trailing stop on each closed candle
+        cur_bar = now_ms // bm * bm
+        if cur_bar - bm > t["last_bar_done"] and time.time() - t.get("trail_try", 0) >= 300:
+            t["trail_try"] = time.time()
+            try:
+                bars = n_bars(eng, sym) if eng["tf"] == "12h" else _closed_only(
+                    [{"time": _bar_ms(c), "open": o(c), "high": h(c), "low": l(c), "close": cl(c),
+                      "qv": cl(c) * v(c)} for c in (get_candles(sym, limit=130, interval="1d") or [])], bm)
+                if bars:
+                    T, O, H, L, C, Q = _bars_arrays(bars)
+                    atr = _n_atr(H, L, C)
+                    stp, best = t["stp"], t["best"]
+                    for j in range(len(T)):
+                        if T[j] < t["fill_bar"] or T[j] <= t["last_bar_done"] or T[j] + bm > now_ms:
+                            continue
+                        best = max(best, H[j]) if d == 1 else min(best, L[j])
+                        if atr[j] and ((d == 1 and best >= E + R) or (d == -1 and best <= E - R)):
+                            cand = best - d * eng["trail"] * atr[j]
+                            stp = max(stp, cand) if d == 1 else min(stp, cand)
+                        t["last_bar_done"] = T[j]
+                    if t["tp1_done"]:
+                        stp = max(stp, E) if d == 1 else min(stp, E)
+                    t["best"] = best
+                    if (d == 1 and stp > t["stp"] + 0.05 * R) or (d == -1 and stp < t["stp"] - 0.05 * R):
+                        n_move_stop(eng, sym, t, stp, pos)
+                    else:
+                        n_save()
+            except Exception as ex:
+                print(f"[{name} TRAIL {sym}] {ex}")
+        # ---- time stop
+        if now_ms >= t["max_hold_ms"] and not t.get("time_closed"):
+            t["time_closed"] = True
+            _n_close_market(eng, sym, t, pos, "time")
+            n_save()
+
+
+def n_finalize(eng, sym, t):
+    name = eng["name"]
+    d = 1 if t["side"] == "BUY" else -1
+    _n_cancel_quiet(sym, t.get("sl_id"))
+    if not t.get("tp1_done"):
+        _n_cancel_quiet(sym, t.get("tp1_id"))
+    exit_px = 0.0
+    try:
+        if t.get("sl_id"):
+            exit_px = get_fill_price(t["sl_id"], sym, 0.0)
+    except Exception:
+        pass
+    if not exit_px:
+        exit_px = get_current_price(sym) or t["entry_fill"]
+    pnl = get_income_pnl(sym, t["open_ts"] * 1000 - 120000)
+    est = False
+    if pnl is None:
+        est = True
+        ef = t["entry_fill"]
+        if t.get("tp1_done"):
+            pnl = d * ((t.get("tp1_px") or t["tp1"]) - ef) * t["half_qty"] + d * (exit_px - ef) * t["rem_qty"]
+        else:
+            pnl = d * (exit_px - ef) * t["qty"]
+        pnl -= 0.0006 * ef * t["qty"]
+    risk = t.get("risk_usdt") or eng["risk_usdt"]
+    r_mult = pnl / risk if risk else 0.0
+    emoji = "✅" if r_mult > 0.05 else ("❌" if r_mult < -0.05 else "➖")
+    days = (time.time() - t["open_ts"]) / 86400.0
+    if t.get("exit_reason") == "time":
+        how = f"সময়সীমা ({eng['H']} candle) শেষে বন্ধ"
+    elif t.get("tp1_done"):
+        trail_moved = (d == 1 and t["stp"] > t["entry"] * 1.0005) or (d == -1 and t["stp"] < t["entry"] * 0.9995)
+        how = "৫০% বন্ধ +1R-এ, বাকি ৫০% " + ("trailing-এ বন্ধ" if trail_moved else "entry-তে বন্ধ (breakeven)")
+    else:
+        moved = (d == 1 and t["stp"] > t["sl"]) or (d == -1 and t["stp"] < t["sl"])
+        how = "trailing stop-এ বন্ধ" if moved else "SL-এ বন্ধ"
+    sign = "+" if pnl >= 0 else "-"
+    pnl_s = f"{sign}${abs(pnl):.2f}"
+    r_s = f"{r_mult:+.1f}R"
+    send_journal(f"{emoji} {name} · {sym} · {t['pos_side']}\n"
+                 f"Entry {px_round(sym, t['entry_fill'])} → Exit {px_round(sym, exit_px)}\n"
+                 f"{how}\n"
+                 f"PnL {pnl_s} ({r_s}) · {days:.1f} দিন" + (" (আনুমানিক)" if est else "") + "\n"
+                 "Niti Journal")
+    send_tg(f"{emoji} {name} {sym} {t['pos_side']} closed {pnl_s} ({r_s})")
+    with N_LOCK:
+        N_CLOSED.append({"tag": eng["tag"], "symbol": sym, "side": t["pos_side"], "pnl": round(pnl, 2),
+                         "r": round(r_mult, 2), "open_ts": t["open_ts"], "close_ts": time.time()})
+        eng["open"].pop(sym, None)
+        closed = N_CLOSED[-2000:]
+    state_put("n_closed", closed)
+    _st(eng, "closed")
+    print(f"[{name}] CLOSED {sym} {t['pos_side']} pnl {pnl:.2f} ({r_mult:+.2f}R) {how}")
+    n_save()
+
+
+def n_manage_loop():
+    time.sleep(30)
+    while True:
+        try:
+            have = any(e["pending"] or e["open"] for e in N_ENGINES)
+            if have:
+                pos = _positions_map()
+                if pos is not None:
+                    for eng in N_ENGINES:
+                        n_manage_pending(eng, pos)
+                        n_manage_open(eng, pos)
+        except Exception as ex:
+            print(f"[N MANAGE] {ex}")
+        time.sleep(60)
+
+
+def n_startup_verify():
+    """After a restart: every open N trade must still have a stop on BingX."""
+    for eng in N_ENGINES:
+        for sym, t in list(eng["open"].items()):
+            try:
+                sl_id, sl_px, _tid, _tpx = get_open_orders_for(sym)
+                if sl_id is None:
+                    pos = _positions_map() or {}
+                    if pos.get((sym, t["pos_side"]), 0) > 0:
+                        print(f"[{eng['name']}] {sym} had no stop after restart - re-placing at {t['stp']}")
+                        n_move_stop(eng, sym, t, t["stp"], pos)
+                else:
+                    t["sl_id"] = sl_id
+            except Exception as ex:
+                print(f"[N VERIFY {sym}] {ex}")
+
+
+def cleanup_orphan_entry_orders():
+    """T-series is signal-only now, so any resting ENTRY limit left on BingX by the old
+    live engines would fill into an untracked position. Cancel those (never N1/N2 orders,
+    never close-side orders such as TPs)."""
+    try:
+        params = build_signed_params({})
+        r = requests.get(BASE_URL + "/openApi/swap/v2/trade/openOrders", params=params,
+                         headers={"X-BX-APIKEY": API_KEY}, timeout=15).json()
+        orders = r.get("data", {}).get("orders", []) or []
+    except Exception as e:
+        print(f"[ORPHAN CLEANUP] {e}")
+        return
+    keep = {str(p["order_id"]) for e in N_ENGINES for p in e["pending"].values()}
+    gone = []
+    for od in orders:
+        try:
+            if str(od.get("type", "")).upper() != "LIMIT":
+                continue
+            sd, ps = str(od.get("side", "")).upper(), str(od.get("positionSide", "")).upper()
+            if not ((sd == "BUY" and ps == "LONG") or (sd == "SELL" and ps == "SHORT")):
+                continue
+            if str(od.get("orderId")) in keep:
+                continue
+            cancel_order(od.get("symbol"), od.get("orderId"))
+            gone.append(f"{od.get('symbol')} {ps} @ {od.get('price')}")
+        except Exception as e:
+            print(f"[ORPHAN CLEANUP] {e}")
+    if gone:
+        send_tg("🧹 Old T-series entry orders cancelled (T is signal-only now):\n" + "\n".join(gone[:30]))
+
+
+# ============================================================================
+# N2 = EXTREME-MOVER SHORT, BTC-HEDGED (live, real orders)          2026-10-11
+# Daily, just after the 00:00 UTC close. Universe = coins with 7-day average daily
+# quote volume >= $2M, ranked by 14-day return (BTC excluded from the ranking; N1's 40
+# majors removed after ranking, so N2 never trades an N1 coin).
+#   short the top 10% (only on a red day) and the bottom 3% by 14d return,
+#   ATR(14)/price between 8% and 30%, max 5 new per day, max 10 open, one per coin.
+# Entry = market at the daily open; exit = market 10 days later (or the wide stop).
+# Every short is paired with an equal-notional BTC LONG (closed together with it).
+# Realistic backtest ($40 notional): bear 6.6/wk 68% +$5.9 | recent 4.9/wk 56% +$5.8 |
+# bull 6.8/wk 66% +$7.1; both halves positive in all three; beats random-coin control.
+# ============================================================================
+N2X = {
+    "tag": "n2", "name": "N2",
+    "notional": float(os.environ.get("N2_NOTIONAL_USD", 50)),
+    "max_concurrent": int(os.environ.get("N2_MAX_OPEN", 10)),
+    "maxday": int(os.environ.get("N2_MAX_PER_DAY", 5)),
+    "hold_days": int(os.environ.get("N2_HOLD_DAYS", 10)),
+    "stop_pct": float(os.environ.get("N2_STOP_PCT", 0.45)),
+    "leverage": int(os.environ.get("N2_LEVERAGE", 2)),
+    "hedge": os.environ.get("N2_HEDGE", "1") == "1",
+    "top_pct": 0.10, "bot_pct": 0.03, "atr_lo": 0.08, "atr_hi": 0.30, "min_qv7": 2e6,
+    "open": {}, "cool": {}, "done_days": [], "last_note": "",
+}
+N2X_LOCK = _threading.RLock()
+N2X_LATE_S = int(os.environ.get("N2_LATE_SECONDS", 2 * 3600))   # skip entries if the bot is later than this
+BTC_SYM = "BTC-USDT"
+
+
+def n2x_save():
+    with N2X_LOCK:
+        st = {"open": N2X["open"], "cool": N2X["cool"], "done_days": N2X["done_days"][-60:]}
+    state_put("n2x_books", st)
+
+
+def n2x_load():
+    b = state_get("n2x_books", {}) or {}
+    with N2X_LOCK:
+        N2X["open"] = dict(b.get("open") or {})
+        N2X["cool"] = dict(b.get("cool") or {})
+        N2X["done_days"] = list(b.get("done_days") or [])
+    print(f"[N2] state loaded: open {len(N2X['open'])}")
+
+
+def n2x_hedge_qty_total():
+    return sum(float(t.get("hedge_qty") or 0) for t in N2X["open"].values())
+
+
+_prev_all_open_symbols = all_open_symbols
+
+
+def all_open_symbols():
+    s = set(_prev_all_open_symbols())
+    try:
+        s |= set(N2X["open"].keys())
+        if n2x_hedge_qty_total() > 0:
+            s.add(BTC_SYM)
+    except Exception:
+        pass
+    return s
+
+
+def _atr_wilder_first(h_, l_, c_, n=14):
+    """ATR exactly as the research code: seeded with the first TR, then Wilder."""
+    a = None
+    out = []
+    for i in range(len(c_)):
+        tr = h_[i] - l_[i] if i == 0 else max(h_[i] - l_[i], abs(h_[i] - c_[i - 1]), abs(l_[i] - c_[i - 1]))
+        a = tr if a is None else (a * (n - 1) + tr) / n
+        out.append(a)
+    return out
+
+
+def _pct_rank(d):
+    """pandas rank(pct=True) with the default 'average' tie method, no pandas needed."""
+    items = sorted(d.items(), key=lambda kv: kv[1])
+    n = len(items)
+    out = {}
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and items[j + 1][1] == items[i][1]:
+            j += 1
+        avg = (i + 1 + j + 1) / 2.0
+        for k in range(i, j + 1):
+            out[items[k][0]] = avg / n
+        i = j + 1
+    return out
+
+
+def n2x_candidates(day_ts):
+    """Shorts for the daily candle that opened at day_ts (just closed)."""
+    rows = []
+    for sym, bars in _dc["data"].items():
+        if _coin_base(sym) == "BTC":
+            continue
+        k = None
+        for j in range(len(bars) - 1, -1, -1):
+            if int(bars[j]["time"]) == int(day_ts):
+                k = j
+                break
+        if k is None or k < 14:
+            continue
+        T, O, H, L, C, Q = _bars_arrays(bars[:k + 1])
+        q7 = Q[max(0, k - 6):k + 1]
+        if len(q7) < 5:
+            continue
+        qv7 = sum(q7) / len(q7)
+        if qv7 < N2X["min_qv7"] or C[k - 14] <= 0 or C[k - 1] <= 0:
+            continue
+        r14 = C[k] / C[k - 14] - 1
+        r1 = C[k] / C[k - 1] - 1
+        atrp = _atr_wilder_first(H, L, C)[k] / C[k]
+        rows.append((sym, r14, r1, atrp))
+    if len(rows) < 20:
+        return [], len(rows)
+    ser = _pct_rank({s: r for s, r, _a, _b in rows})
+    top, bot = [], []
+    for sym, r14, r1, atrp in rows:
+        if is_major(sym) or not (N2X["atr_lo"] <= atrp <= N2X["atr_hi"]):
+            continue
+        p = ser[sym]
+        if p >= 1 - N2X["top_pct"] and r1 < 0:
+            top.append(sym)
+        elif p <= N2X["bot_pct"]:
+            bot.append(sym)
+    return sorted(top) + sorted(bot), len(rows)
+
+
+def _n2x_market(symbol, side, qty, pos_side):
+    oid = place_market_order(symbol, side, qty, pos_side)
+    if not oid or oid == "N/A":
+        return None, 0.0
+    time.sleep(1)
+    return oid, get_fill_price(oid, symbol, 0.0)
+
+
+def n2x_open(sym, day_ts):
+    name = N2X["name"]
+    px = get_current_price(sym)
+    if not px:
+        return False
+    prec = symbol_precision.get(sym, 4)
+    qty = round(N2X["notional"] / px, prec)
+    if qty <= 0:
+        print(f"[N2] {sym} qty rounds to 0 - skip")
+        return False
+    lev = max(1, min(N2X["leverage"], int(symbol_max_lev.get(sym, N2X["leverage"]) or N2X["leverage"])))
+    set_leverage_api(sym, lev)
+    need = N2X["notional"] / lev + (N2X["notional"] / 10.0 if N2X["hedge"] else 0)
+    avail = get_available_margin()
+    if avail is not None and avail < need * 1.1:
+        print(f"[N2] {sym} margin skip - need ${need:.2f}, free ${avail:.2f}")
+        _st(N2X, "skip_margin")
+        return False
+    oid, fill = _n2x_market(sym, "SELL", qty, "SHORT")
+    if not oid:
+        send_tg(f"⚠️ N2 {sym} short could not be opened (BingX rejected the market order).")
+        return False
+    fill = fill or px
+    sl = fill * (1 + N2X["stop_pct"])
+    sl_id = place_sl_guarded(sym, "BUY", "SHORT", px_round(sym, sl), qty)
+    if sl_id is None:
+        place_market_order(sym, "BUY", qty, "SHORT")
+        send_tg(f"⚠️ N2 {sym}: stop could not be placed - short closed at market (no naked risk).")
+        return False
+    hq, hfill, hid = 0.0, 0.0, None
+    if N2X["hedge"]:
+        bpx = get_current_price(BTC_SYM)
+        hq = round(N2X["notional"] / bpx, symbol_precision.get(BTC_SYM, 4)) if bpx else 0.0
+        if hq > 0:
+            set_leverage_api(BTC_SYM, 10)
+            hid, hfill = _n2x_market(BTC_SYM, "BUY", hq, "LONG")
+            if not hid:
+                hq = 0.0
+                send_tg(f"⚠️ N2 {sym}: BTC hedge could not be opened - short runs unhedged.")
+            hfill = hfill or bpx
+    now = time.time()
+    t = {"symbol": sym, "qty": qty, "entry": fill, "sl": sl, "sl_id": sl_id, "lev": lev,
+         "open_ts": now, "day_ts": int(day_ts),
+         "exit_due": (int(day_ts) + (N2X["hold_days"] + 1) * 86400000) / 1000.0,
+         "hedge_qty": hq, "hedge_entry": hfill, "gone": 0, "margin_used": round(N2X["notional"] / lev, 2)}
+    with N2X_LOCK:
+        N2X["open"][sym] = t
+    _st(N2X, "fills")
+    print(f"[N2] OPEN {sym} SHORT {qty} @ {fill} stop {sl} | hedge BTC {hq} @ {hfill}")
+    send_tg(f"✅ N2 {sym} SHORT opened\n"
+            f"Entry {px_round(sym, fill)} | stop {px_round(sym, sl)} (+{N2X['stop_pct'] * 100:.0f}%) | "
+            f"{N2X['hold_days']} দিন hold\n"
+            f"Notional ${N2X['notional']:.0f}" + (f" + BTC hedge {hq}" if hq else " (no hedge)"))
+    n2x_save()
+    return True
+
+
+def n2x_close(sym, t, reason, pos=None):
+    """Close the short (if still open) and its BTC hedge, then journal."""
+    name = N2X["name"]
+    try:
+        if pos is None:
+            pos = _positions_map() or {}
+        if pos.get((sym, "SHORT"), 0) > 0:
+            place_market_order(sym, "BUY", min(t["qty"], pos[(sym, "SHORT")]), "SHORT")
+            time.sleep(1)
+        if t.get("sl_id"):
+            try:
+                cancel_order(sym, t["sl_id"])
+            except Exception:
+                pass
+        hpnl, bexit = 0.0, 0.0
+        if t.get("hedge_qty"):
+            hid, bexit = _n2x_market(BTC_SYM, "SELL", t["hedge_qty"], "LONG")
+            bexit = bexit or get_current_price(BTC_SYM) or t["hedge_entry"]
+            hpnl = (bexit - t["hedge_entry"]) * t["hedge_qty"] - 0.001 * bexit * t["hedge_qty"]
+        exit_px = 0.0
+        if reason == "stop" and t.get("sl_id"):
+            exit_px = get_fill_price(t["sl_id"], sym, 0.0)
+        exit_px = exit_px or get_current_price(sym) or t["entry"]
+        spnl = get_income_pnl(sym, t["open_ts"] * 1000 - 120000)
+        est = spnl is None
+        if est:
+            spnl = (t["entry"] - exit_px) * t["qty"] - 0.001 * t["entry"] * t["qty"]
+        tot = spnl + hpnl
+        pct = tot / N2X["notional"] * 100
+        emoji = "✅" if tot > 0.02 * N2X["notional"] / 10 else ("❌" if tot < -0.02 * N2X["notional"] / 10 else "➖")
+        days = (time.time() - t["open_ts"]) / 86400.0
+        how = {"time": f"{N2X['hold_days']} দিন পর নির্ধারিত সময়ে বন্ধ", "stop": "stop-এ বন্ধ",
+               "gone": "BingX-এ position বন্ধ পাওয়া গেছে (stop/হাতে)"}.get(reason, reason)
+        send_journal(f"{emoji} N2 · {sym} · SHORT\n"
+                     f"Entry {px_round(sym, t['entry'])} → Exit {px_round(sym, exit_px)}\n"
+                     f"{how}\n"
+                     f"Short {'+' if spnl >= 0 else '-'}${abs(spnl):.2f}"
+                     + (f" · BTC hedge {'+' if hpnl >= 0 else '-'}${abs(hpnl):.2f}" if t.get("hedge_qty") else "") + "\n"
+                     f"মোট PnL {'+' if tot >= 0 else '-'}${abs(tot):.2f} ({pct:+.1f}% notional) · {days:.1f} দিন"
+                     + (" (আনুমানিক)" if est else "") + "\nNiti Journal")
+        send_tg(f"{emoji} N2 {sym} SHORT closed {'+' if tot >= 0 else '-'}${abs(tot):.2f} ({how})")
+        with N2X_LOCK:
+            N2X["open"].pop(sym, None)
+            N2X["cool"][sym] = time.time() + 86400          # backtest: busy until the day after the exit
+            N_CLOSED.append({"tag": "n2", "symbol": sym, "side": "SHORT", "pnl": round(tot, 2),
+                             "r": round(tot / max(N2X["notional"], 1e-9), 4),
+                             "open_ts": t["open_ts"], "close_ts": time.time()})
+            closed = N_CLOSED[-2000:]
+        state_put("n_closed", closed)
+        _st(N2X, "closed")
+        print(f"[N2] CLOSED {sym} {reason} short {spnl:.2f} hedge {hpnl:.2f} total {tot:.2f}")
+        n2x_save()
+    except Exception as ex:
+        print(f"[N2 CLOSE {sym}] {ex}")
+
+
+def n2x_daily(day_ts):
+    """Runs once per UTC day right after the close. Exits first, then new shorts."""
+    now = time.time()
+    pos = _positions_map()
+    if pos is None:
+        return False
+    # cap is counted BEFORE today's exits, as in the backtest (a trade exiting at this
+    # open still occupies its slot today)
+    n_open_before = len(N2X["open"])
+    for sym, t in list(N2X["open"].items()):
+        if now >= t["exit_due"] - 120:
+            n2x_close(sym, t, "time", pos)
+    if not N_CTRL.get("n2") or N2X["max_concurrent"] <= 0:
+        return True
+    late = now - (int(day_ts) + 86400000) / 1000.0
+    if late > N2X_LATE_S:
+        print(f"[N2] daily run is {late / 3600:.1f}h late - no new entries today (prices moved since the open)")
+        return True
+    daily_cache_refresh()
+    cands, nliq = n2x_candidates(day_ts)
+    busy = set(_orig_all_open_symbols()) | n_all_symbols() | {s for (s, _p) in pos.keys()}
+    slots = N2X["max_concurrent"] - n_open_before
+    placed = 0
+    for sym in cands:
+        if slots <= 0 or placed >= N2X["maxday"]:
+            break
+        if sym in N2X["open"] or sym in busy or N2X["cool"].get(sym, 0) > now:
+            continue
+        if n2x_open(sym, day_ts):
+            placed += 1
+            slots -= 1
+    N2X["last_note"] = (f"{datetime.now(timezone.utc).strftime('%m-%d %H:%M')} UTC: {nliq} liquid coins ranked, "
+                        f"{len(cands)} candidates, {placed} short(s) opened")
+    print("[N2] " + N2X["last_note"] + (f" | candidates: {', '.join(cands[:12])}" if cands else ""))
+    N2X["cool"] = {s: v for s, v in N2X["cool"].items() if v > now}
+    n2x_save()
+    return True
+
+
+def n2x_loop():
+    time.sleep(50)
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+            boundary = now_ms // 86400000 * 86400000
+            day_ts = boundary - 86400000
+            if day_ts not in N2X["done_days"] and now_ms - boundary >= 300000:
+                if n2x_daily(day_ts):
+                    N2X["done_days"].append(day_ts)
+                    N2X["done_days"] = N2X["done_days"][-60:]
+                    n2x_save()
+            # overdue exits (e.g. after a restart) and stop / external closes
+            if N2X["open"]:
+                pos = _positions_map()
+                if pos is not None:
+                    for sym, t in list(N2X["open"].items()):
+                        if time.time() >= t["exit_due"] + 600:
+                            n2x_close(sym, t, "time", pos)
+                            continue
+                        if pos.get((sym, "SHORT"), 0) <= 0:
+                            t["gone"] = t.get("gone", 0) + 1
+                            if t["gone"] >= 2:
+                                n2x_close(sym, t, "stop" if t.get("sl_id") else "gone", pos)
+                        else:
+                            t["gone"] = 0
+        except Exception as ex:
+            print(f"[N2 LOOP] {ex}")
+        time.sleep(60)
+
+
+def n2x_startup_verify():
+    for sym, t in list(N2X["open"].items()):
+        try:
+            sl_id, sl_px, _a, _b = get_open_orders_for(sym)
+            pos = _positions_map() or {}
+            if pos.get((sym, "SHORT"), 0) > 0 and sl_id is None:
+                nid = place_sl_guarded(sym, "BUY", "SHORT", px_round(sym, t["sl"]), t["qty"])
+                t["sl_id"] = nid
+                print(f"[N2] {sym} stop re-placed after restart -> {nid}")
+            elif sl_id:
+                t["sl_id"] = sl_id
+        except Exception as ex:
+            print(f"[N2 VERIFY {sym}] {ex}")
+    n2x_save()
+
+
+def n2x_status_lines():
+    opens = ", ".join(f"{s} (exit {datetime.fromtimestamp(t['exit_due'], timezone.utc).strftime('%m-%d')})"
+                      for s, t in N2X["open"].items()) or "none"
+    on = "ON" if N_CTRL.get("n2") else "OFF - send /start"
+    return (f"N2 (daily extreme-mover SHORT{' + BTC hedge' if N2X['hedge'] else ''}): {on} | "
+            f"notional ${N2X['notional']:.0f} | open {len(N2X['open'])}/{N2X['max_concurrent']}\n"
+            f"  open: {opens}\n  last run: {N2X.get('last_note') or 'not yet'}")
+
+
+# ============================================================================
+# T-SERIES = SIGNAL-ONLY + PAPER TRACKING
+# Every REV_* engine keeps scanning exactly as before; place_rev_limit no longer sends an
+# order. It sends the signal to the signal-only DM and opens a PAPER trade that the bot
+# fills / exits on live prices with the engine's own exit rules. Results -> Niti Paper.
+# Per engine back to live: env <TAG>_MODE=live (e.g. T6L_MODE=live) or /tmode t6l live.
+# ============================================================================
+T_MODE_DEFAULT = os.environ.get("T_SERIES_MODE", "signal").lower()
+_tmode_override = {}
+PAPER = {}
+PAPER_CLOSED = []
+PAPER_LOCK = _threading.RLock()
+PAPER_COST = float(os.environ.get("PAPER_COST_PCT", 0.0007))      # maker in + taker out, fraction of price
+PAPER_SL_SLIP = float(os.environ.get("PAPER_SL_SLIP_PCT", 0.0005))
+_paper_save_ts = {"ts": 0.0}
+_paper_started = {"ts": time.time()}
+
+
+def t_mode(eng):
+    tag = str(eng.get("tag", "?"))
+    return (_tmode_override.get(tag) or os.environ.get(f"{tag.upper()}_MODE", T_MODE_DEFAULT)).lower()
+
+
+def _slot_label(eng):
+    try:
+        for slot, desc, e, on in _slot_engines():
+            if e is eng:
+                return slot
+    except Exception:
+        pass
+    return eng.get("name", "?")
+
+
+def _eng_by_tag(tag):
+    for e in _all_engine_dicts():
+        if e.get("tag") == tag and e.get("max_concurrent", 0) > 0:
+            return e
+    for e in _all_engine_dicts():
+        if e.get("tag") == tag:
+            return e
+    return None
+
+
+def _pbook(eng):
+    return PAPER.setdefault(eng["tag"], {"pending": {}, "open": {}})
+
+
+_paper_dirty = {"books": False}
+PAPER_KEEP_DAYS = int(os.environ.get("PAPER_KEEP_DAYS", 60))
+
+
+def _day_key(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y%m%d")
+
+
+def paper_save(force=False):
+    """Books only when they changed, at most once a minute (keeps Supabase traffic tiny)."""
+    if not _paper_dirty["books"] and not force:
+        return
+    if not force and time.time() - _paper_save_ts["ts"] < 180:
+        return
+    _paper_save_ts["ts"] = time.time()
+    _paper_dirty["books"] = False
+    with PAPER_LOCK:
+        books = json.loads(json.dumps(PAPER))
+    state_put("paper_books", books)
+
+
+def _paper_save_day(ts):
+    k = _day_key(ts)
+    with PAPER_LOCK:
+        rows = [x for x in PAPER_CLOSED if _day_key(x.get("close_ts", 0)) == k]
+    state_put("paper_closed_" + k, rows)
+
+
+def paper_load():
+    b = state_get("paper_books", {}) or {}
+    with PAPER_LOCK:
+        PAPER.clear()
+        for tag, bk in b.items():
+            PAPER[tag] = {"pending": dict(bk.get("pending") or {}), "open": dict(bk.get("open") or {})}
+    m = state_get("paper_meta", None)
+    if isinstance(m, dict) and m.get("started"):
+        _paper_started["ts"] = float(m["started"])
+    else:
+        state_put("paper_meta", {"started": _paper_started["ts"]})
+    rows = []
+    start_day = max(_paper_started["ts"], time.time() - PAPER_KEEP_DAYS * 86400)
+    t = start_day
+    while t <= time.time() + 86400:
+        part = state_get("paper_closed_" + _day_key(t), []) or []
+        if isinstance(part, list):
+            rows.extend(part)
+        t += 86400
+    with PAPER_LOCK:
+        PAPER_CLOSED[:] = rows
+    print(f"[PAPER] loaded {sum(len(x['open']) for x in PAPER.values())} open, "
+          f"{sum(len(x['pending']) for x in PAPER.values())} pending, {len(PAPER_CLOSED)} closed")
+
+
+_orig_place_rev_limit = place_rev_limit
+
+
+def place_rev_limit(symbol, side, entry, sl, tp, eng):
+    if t_mode(eng) == "live":
+        return _orig_place_rev_limit(symbol, side, entry, sl, tp, eng)
+    slot = _slot_label(eng)
+    with PAPER_LOCK:
+        bk = _pbook(eng)
+        if symbol in bk["pending"] or symbol in bk["open"]:
+            return None
+        if len(bk["pending"]) + len(bk["open"]) >= max(1, int(eng.get("max_concurrent", 0) or 0)):
+            _st(eng, "skip_papercap")
+            return "MARGIN_SKIP"
+        bk["pending"][symbol] = {"symbol": symbol, "side": side, "entry": float(entry), "sl": float(sl),
+                                 "tp": (float(tp) if tp else None), "placed_ts": time.time(),
+                                 "expire_ts": time.time() + eng.get("fill_bars", REV_FILL_BARS) * 900}
+    _st(eng, "paper_signals")
+    ps = "LONG" if side == "BUY" else "SHORT"
+    send_l_signal(f"📡 {slot} · {ps} · {symbol}\n"
+                  f"Entry {round(float(entry), 8)} (limit) | SL {round(float(sl), 8)} | "
+                  f"TP {round(float(tp), 8) if tp else 'trail/time'}\n"
+                  f"{eng.get('name', '')} · signal only, no order")
+    print(f"[PAPER] {slot} {symbol} {ps} signal entry {entry} sl {sl} tp {tp}")
+    _paper_dirty["books"] = True
+    paper_save()
+    return "PAPER"
+
+
+def _paper_tp_at_fill(eng, side, fill, sl, tp_sig):
+    """Same TP rule rev_track_pending applies to a real fill."""
+    _tpm = eng.get("tp_mult")
+    _ds = eng.get("dstop_pct")
+    _tpr = eng.get("long_tp_r") if side == "BUY" else eng.get("short_tp_r")
+    if (not _tpm) and (not _tpr):
+        return None
+    if _tpm and _ds:
+        return fill * (1.0 + _ds * _tpm) if side == "BUY" else fill * (1.0 - _ds * _tpm)
+    risk = abs(fill - sl)
+    return fill + risk * _tpr if side == "BUY" else fill - risk * _tpr
+
+
+_pc_cache = {}
+
+
+def _paper_bars(sym):
+    c = _pc_cache.get(sym)
+    if c and time.time() - c[0] < 170:
+        return c[1]
+    try:
+        cs = get_candles(sym, limit=4, interval="15m") or []
+    except Exception:
+        cs = []
+    _pc_cache[sym] = (time.time(), cs)
+    return cs
+
+
+def _paper_range(sym, since_ts):
+    """(low, high, last) over 15m bars that overlap [since_ts, now] plus the live price."""
+    cs = _paper_bars(sym)
+    lo, hi, last = None, None, None
+    for c in cs:
+        t0 = _bar_ms(c) / 1000.0
+        if t0 + 900 < since_ts:
+            continue
+        lo = l(c) if lo is None else min(lo, l(c))
+        hi = h(c) if hi is None else max(hi, h(c))
+        last = cl(c)
+    px = get_current_price(sym)
+    if px:
+        lo = px if lo is None else min(lo, px)
+        hi = px if hi is None else max(hi, px)
+        last = px
+    return lo, hi, last
+
+
+def _paper_close(eng, sym, t, exit_px, result):
+    d = 1 if t["side"] == "BUY" else -1
+    E, sl = t["entry"], t["sl"]
+    R = abs(E - sl) or E * 0.01
+    slip = PAPER_SL_SLIP if result == "SL" else 0.0
+    r_mult = d * (exit_px - E) / R - (PAPER_COST + slip) * E / R
+    pnl = r_mult * float(eng.get("risk_usdt", 0) or 0)
+    held_h = (time.time() - t["open_ts"]) / 3600.0
+    slot = _slot_label(eng)
+    with PAPER_LOCK:
+        PAPER_CLOSED.append({"tag": eng["tag"], "slot": slot, "symbol": sym, "side": t["side"],
+                             "result": result, "r": round(r_mult, 3), "pnl": round(pnl, 2),
+                             "open_ts": t["open_ts"], "close_ts": time.time()})
+        _pbook(eng)["open"].pop(sym, None)
+    eng.setdefault("last_fire", {})[sym] = time.time()
+    ps = "LONG" if t["side"] == "BUY" else "SHORT"
+    em = "✅" if r_mult > 0.05 else ("❌" if r_mult < -0.05 else "➖")
+    send_paper(f"📝 PAPER {em} {slot} · {sym} {ps} · {result} · {r_mult:+.2f}R · "
+               f"{'+' if pnl >= 0 else '-'}${abs(pnl):.2f} · {held_h:.0f}h")
+    _paper_dirty["books"] = True
+    _paper_save_day(time.time())
+
+
+def _paper_exit_pos_hit(eng, sym, t):
+    _xp = eng.get("exit_pos", 0.0)
+    if not _xp or _xp <= 0:
+        return None
+    if time.time() - t.get("xp_ts", 0) < 900:
+        return None
+    t["xp_ts"] = time.time()
+    _w = eng.get("exit_pos_window", eng.get("pos_window", 192))
+    _c = get_candles(sym, limit=_w + REV_CANDLE_BUFFER, interval="15m")
+    if _c:
+        _tms = _bar_ms(_c[-1])
+        if _tms and (_tms % 900000) != 0:
+            _c = _c[:-1]
+    if not _c or len(_c) < _w:
+        return None
+    seg = _c[-_w:]
+    hi_, lo_ = max(h(x) for x in seg), min(l(x) for x in seg)
+    if hi_ <= lo_:
+        return None
+    pos = (cl(_c[-1]) - lo_) / (hi_ - lo_)
+    done = (pos <= _xp) if t["side"] == "SELL" else (pos >= (1.0 - _xp))
+    return cl(_c[-1]) if done else None
+
+
+def paper_tick():
+    for tag in list(PAPER.keys()):
+        eng = _eng_by_tag(tag)
+        if eng is None:
+            continue
+        bk = PAPER[tag]
+        # -------- pending -> fill / expire
+        for sym, p in list(bk["pending"].items()):
+            try:
+                lo, hi, last = _paper_range(sym, p.get("last_chk", p["placed_ts"]))
+                p["last_chk"] = time.time()
+                filled = lo is not None and ((p["side"] == "BUY" and lo <= p["entry"]) or
+                                             (p["side"] == "SELL" and hi >= p["entry"]))
+                if filled:
+                    tp = _paper_tp_at_fill(eng, p["side"], p["entry"], p["sl"], p.get("tp"))
+                    with PAPER_LOCK:
+                        bk["open"][sym] = {"symbol": sym, "side": p["side"], "entry": p["entry"],
+                                           "sl": p["sl"], "tp": tp, "open_ts": time.time(),
+                                           "last_chk": time.time(), "peak_fav": 0.0}
+                        bk["pending"].pop(sym, None)
+                    eng.setdefault("last_fire", {})[sym] = time.time()
+                    _st(eng, "paper_fills")
+                    _paper_dirty["books"] = True
+                elif time.time() > p["expire_ts"]:
+                    with PAPER_LOCK:
+                        bk["pending"].pop(sym, None)
+                    _st(eng, "paper_unfilled")
+                    _paper_dirty["books"] = True
+            except Exception as e:
+                print(f"[PAPER PEND {sym}] {e}")
+        if bk["open"]:
+            _paper_dirty["books"] = True       # last_chk / peak_fav move every tick
+        # -------- open -> exits (engine's own rules)
+        for sym, t in list(bk["open"].items()):
+            try:
+                lo, hi, last = _paper_range(sym, t.get("last_chk", t["open_ts"]))
+                t["last_chk"] = time.time()
+                if lo is None or last is None:
+                    continue
+                E, sl, tp, side = t["entry"], t["sl"], t.get("tp"), t["side"]
+                if side == "BUY":
+                    if lo <= sl:
+                        _paper_close(eng, sym, t, sl, "SL"); continue
+                    if tp and hi >= tp:
+                        _paper_close(eng, sym, t, tp, "TP"); continue
+                    fav, fav_best = (last - E) / E, (hi - E) / E
+                else:
+                    if hi >= sl:
+                        _paper_close(eng, sym, t, sl, "SL"); continue
+                    if tp and lo <= tp:
+                        _paper_close(eng, sym, t, tp, "TP"); continue
+                    fav, fav_best = (E - last) / E, (E - lo) / E
+                cap = eng.get("tp_cap", 0.0)
+                if cap and fav_best >= cap:
+                    _paper_close(eng, sym, t, E * (1 + cap) if side == "BUY" else E * (1 - cap), "cap-exit")
+                    continue
+                ta, tg = eng.get("trail_arm", 0.0), eng.get("trail_give", 0.0)
+                if ta and tg:
+                    t["peak_fav"] = max(t.get("peak_fav", 0.0), fav_best)
+                    if t["peak_fav"] >= ta and fav <= t["peak_fav"] - tg:
+                        _paper_close(eng, sym, t, last, "trail-exit"); continue
+                xpx = _paper_exit_pos_hit(eng, sym, t)
+                if xpx:
+                    _paper_close(eng, sym, t, xpx, "signal-exit"); continue
+                if time.time() - t["open_ts"] > eng.get("hold_seconds", REV_HOLD_SECONDS):
+                    _paper_close(eng, sym, t, last, "time-stop"); continue
+            except Exception as e:
+                print(f"[PAPER OPEN {sym}] {e}")
+    paper_save()
+
+
+def paper_loop():
+    time.sleep(40)
+    while True:
+        try:
+            if not api_backoff_active():
+                paper_tick()
+        except Exception as e:
+            print(f"[PAPER LOOP] {e}")
+        time.sleep(60)
+
+
+def _agg_closed(rows):
+    n = len(rows)
+    w = sum(1 for x in rows if x.get("pnl", 0) > 0)
+    p = sum(x.get("pnl", 0) for x in rows)
+    return n, (w / n * 100 if n else 0.0), p
+
+
+def paper_report_text(since_ts=None, title="📝 PAPER (T-series, signal only)"):
+    since_ts = since_ts or _paper_started["ts"]
+    rows = [x for x in PAPER_CLOSED if x.get("close_ts", 0) >= since_ts]
+    days = max((time.time() - since_ts) / 86400.0, 1e-9)
+    L = [f"{title} - last {days:.1f} days"]
+    by = {}
+    for x in rows:
+        by.setdefault(x.get("slot") or x.get("tag"), []).append(x)
+    tags_open = {}
+    for tag, bk in PAPER.items():
+        e = _eng_by_tag(tag)
+        tags_open[_slot_label(e) if e else tag] = (len(bk["open"]), len(bk["pending"]))
+    names = sorted(set(by) | set(tags_open))
+    for nm in names:
+        n, wr, p = _agg_closed(by.get(nm, []))
+        op, pe = tags_open.get(nm, (0, 0))
+        wk = n / days * 7
+        L.append(f"{nm}: {n} trades ({wk:.1f}/wk) | win {wr:.0f}% | {'+' if p >= 0 else '-'}${abs(p):.2f} | open {op} pending {pe}")
+    n, wr, p = _agg_closed(rows)
+    L.append(f"TOTAL: {n} trades | win {wr:.0f}% | {'+' if p >= 0 else '-'}${abs(p):.2f}")
+    return "\n".join(L)
+
+
+# ============================================================================
+# FOLLOW UP = break alerts for manual trading (no orders)  -> TG_MANUAL_CHAT_ID
+# Support/resistance, structure (BOS / CHoCH) and trendline breaks on 4h + 1d candle
+# CLOSES, all coins with >= $2M 24h volume. Volume >= 1.5x required. Follow-ups:
+# retest of the broken level, and failed break (close back inside within 2 candles).
+# ============================================================================
+FU_CTRL = {"on": os.environ.get("FU_AUTO_START", "1") == "1"}
+FU_VOL_MULT = float(os.environ.get("FU_VOL_MULT", 1.5))
+FU_MIN_QV24 = float(os.environ.get("FU_MIN_QVOL", 2_000_000))
+FU_K = int(os.environ.get("FU_PIVOT_K", 3))
+FU_LOOKBACK = int(os.environ.get("FU_LOOKBACK", 150))
+FU_BREAK_ATR = float(os.environ.get("FU_BREAK_ATR", 0.2))
+FU_CLUSTER_ATR = float(os.environ.get("FU_CLUSTER_ATR", 0.5))
+FU_DEDUP_S = int(os.environ.get("FU_DEDUP_SECONDS", 24 * 3600))
+FU_RETEST_BARS = int(os.environ.get("FU_RETEST_BARS", 6))
+FU_FAIL_BARS = int(os.environ.get("FU_FAIL_BARS", 2))
+_fu_sent = {}          # (sym, kind, dir) -> ts
+_fu_watch = {}         # (sym, tf) -> {dir, level, bar_ts, atr, retest, failed}
+_fu_stats = {"last_run": None, "coins": 0, "alerts": 0, "note": ""}
+
+
+def _fu_pivots(H, L, end):
+    """Fractal pivots (K bars each side) between end-FU_LOOKBACK and end (exclusive of the
+    breaking bar). -> lists of (index, price)."""
+    ph, pl = [], []
+    lo_i = max(FU_K, end - FU_LOOKBACK)
+    for i in range(lo_i, end - FU_K):
+        wh = H[i - FU_K:i + FU_K + 1]
+        wl = L[i - FU_K:i + FU_K + 1]
+        if H[i] == max(wh) and wh.count(H[i]) == 1:
+            ph.append((i, H[i]))
+        if L[i] == min(wl) and wl.count(L[i]) == 1:
+            pl.append((i, L[i]))
+    return ph, pl
+
+
+def _fu_levels(ph, pl, atr):
+    pts = sorted([p for _, p in ph] + [p for _, p in pl])
+    levels, grp = [], []
+    for p in pts:
+        if grp and p - grp[0] > FU_CLUSTER_ATR * atr:
+            if len(grp) >= 2:
+                levels.append((sum(grp) / len(grp), len(grp)))
+            grp = []
+        grp.append(p)
+    if len(grp) >= 2:
+        levels.append((sum(grp) / len(grp), len(grp)))
+    return levels
+
+
+def fu_events(bars):
+    """Break events on the LAST bar of `bars` (closed candles). -> (events, levels, atr)."""
+    T, O, H, L, C, Q = _bars_arrays(bars)
+    n = len(C)
+    if n < 60:
+        return [], [], None
+    atr = atr_series(H, L, C, 14)[-1]
+    if not atr or atr <= 0:
+        return [], [], None
+    end = n - 1
+    ph, pl = _fu_pivots(H, L, end)
+    levels = _fu_levels(ph, pl, atr)
+    pc, c = C[-2], C[-1]
+    buf = FU_BREAK_ATR * atr
+    q_avg = sum(Q[-21:-1]) / 20.0
+    vr = Q[-1] / q_avg if q_avg > 0 else 0.0
+    ev = []
+    if vr >= FU_VOL_MULT:
+        up = [(lv, tc) for lv, tc in levels if pc <= lv and c > lv + buf]
+        dn = [(lv, tc) for lv, tc in levels if pc >= lv and c < lv - buf]
+        if up:
+            lv, tc = max(up)
+            ev.append({"kind": "SR", "dir": 1, "level": lv, "touches": tc})
+        if dn:
+            lv, tc = min(dn)
+            ev.append({"kind": "SR", "dir": -1, "level": lv, "touches": tc})
+        if len(ph) >= 2 and len(pl) >= 2:
+            (i1, h1), (i2, h2) = ph[-2], ph[-1]
+            (j1, l1), (j2, l2) = pl[-2], pl[-1]
+            trend = "up" if (h2 > h1 and l2 > l1) else ("down" if (h2 < h1 and l2 < l1) else "range")
+            if pc <= h2 and c > h2 + buf:
+                ev.append({"kind": "CHOCH" if trend == "down" else "BOS", "dir": 1, "level": h2, "trend": trend})
+            if pc >= l2 and c < l2 - buf:
+                ev.append({"kind": "CHOCH" if trend == "up" else "BOS", "dir": -1, "level": l2, "trend": trend})
+            # trendlines through the last two pivots (falling highs / rising lows)
+            if h2 < h1 and i2 - i1 >= 5:
+                slope = (h2 - h1) / (i2 - i1)
+                lt, lp = h2 + slope * (end - i2), h2 + slope * (end - 1 - i2)
+                if lt > 0 and pc <= lp and c > lt + buf:
+                    ev.append({"kind": "TL", "dir": 1, "level": lt})
+            if l2 > l1 and j2 - j1 >= 5:
+                slope = (l2 - l1) / (j2 - j1)
+                lt, lp = l2 + slope * (end - j2), l2 + slope * (end - 1 - j2)
+                if lt > 0 and pc >= lp and c < lt - buf:
+                    ev.append({"kind": "TL", "dir": -1, "level": lt})
+    for e in ev:
+        e["vr"] = vr
+    return ev, levels, atr
+
+
+_FU_NAMES = {("SR", 1): "🟢 RESISTANCE BREAK", ("SR", -1): "🔴 SUPPORT BREAK",
+             ("BOS", 1): "📈 STRUCTURE BREAK (BOS) ↑", ("BOS", -1): "📉 STRUCTURE BREAK (BOS) ↓",
+             ("CHOCH", 1): "🔄 CHoCH ↑ (trend পাল্টানো)", ("CHOCH", -1): "🔄 CHoCH ↓ (trend পাল্টানো)",
+             ("TL", 1): "✏️ TRENDLINE BREAK ↑", ("TL", -1): "✏️ TRENDLINE BREAK ↓"}
+
+
+def _fu_fmt(sym, x):
+    return px_round(sym, x)
+
+
+def _fu_trend_1d(sym):
+    bars = _dc["data"].get(sym)
+    if not bars or len(bars) < 55:
+        return "n/a"
+    cs = [b["close"] for b in bars]
+    e = ema_series(cs, 50)[-1]
+    return "Up (1d EMA50 এর উপরে)" if cs[-1] > e else "Down (1d EMA50 এর নিচে)"
+
+
+def _fu_next_level(levels, close, d):
+    if d == 1:
+        above = [lv for lv, _ in levels if lv > close]
+        return min(above) if above else None
+    below = [lv for lv, _ in levels if lv < close]
+    return max(below) if below else None
+
+
+def _fu_message(sym, d, items, btc24):
+    """items: list of (tf, event, close, levels). One message per coin+direction."""
+    items = sorted(items, key=lambda x: 0 if x[0] == "1d" else 1)
+    tfs = [x[0] for x in items]
+    main_tf, ev, close, levels = items[0]
+    kinds = []
+    for _tf, e, _c, _l in items:
+        nm = _FU_NAMES[(e["kind"], d)]
+        if nm not in kinds:
+            kinds.append(nm)
+    head = " + ".join(kinds) + f" · {_coin_base(sym)} · " + ("4h ⭐1d" if set(tfs) >= {"4h", "1d"} else
+                                                            ("1d ⭐" if tfs == ["1d"] else "4h"))
+    lv = ev["level"]
+    touch = f" ({ev['touches']} touches)" if ev.get("touches") else ""
+    nxt = _fu_next_level(levels, close, d)
+    nxt_s = (f"{_fu_fmt(sym, nxt)} ({(nxt / close - 1) * 100:+.1f}%)" if nxt else "কাছাকাছি নেই")
+    lbl = "পরের resistance" if d == 1 else "পরের support"
+    tv = "https://www.tradingview.com/chart/?symbol=BINGX:" + sym.replace("-", "") + ".P"
+    return (f"{head}\n"
+            f"Level {_fu_fmt(sym, lv)}{touch} → Close {_fu_fmt(sym, close)}\n"
+            f"Volume {ev['vr']:.1f}× · Trend: {_fu_trend_1d(sym)}\n"
+            f"{lbl}: {nxt_s}\n"
+            f"BTC 24h: {_fmt_pct(btc24)}\n"
+            f"TradingView: {tv}")
+
+
+def _fu_followups(sym, tf, bars):
+    """Retest / failed-break messages for an earlier break on this coin+tf."""
+    w = _fu_watch.get((sym, tf))
+    if not w:
+        return []
+    T, O, H, L, C, Q = _bars_arrays(bars)
+    k = sum(1 for t in T if t > w["bar_ts"])
+    out = []
+    lv, d, buf = w["level"], w["dir"], FU_BREAK_ATR * w["atr"]
+    c, lo, hi = C[-1], L[-1], H[-1]
+    if not w["failed"] and 1 <= k <= FU_FAIL_BARS and ((d == 1 and c < lv) or (d == -1 and c > lv)):
+        w["failed"] = True
+        out.append(f"❌ ভুয়া BREAK · {_coin_base(sym)} · {tf}\n"
+                   f"Level {_fu_fmt(sym, lv)}-এর {'নিচে' if d == 1 else 'উপরে'} আবার close: {_fu_fmt(sym, c)}")
+    elif not w["retest"] and not w["failed"] and 1 <= k <= FU_RETEST_BARS and (
+            (d == 1 and lo <= lv + buf and c > lv) or (d == -1 and hi >= lv - buf and c < lv)):
+        w["retest"] = True
+        out.append(f"🔁 RETEST · {_coin_base(sym)} · {tf}\n"
+                   f"ভাঙা level {_fu_fmt(sym, lv)} ছুঁয়ে আবার {'উপরে' if d == 1 else 'নিচে'} close: {_fu_fmt(sym, c)}\n"
+                   f"TradingView: https://www.tradingview.com/chart/?symbol=BINGX:{sym.replace('-', '')}.P")
+    if k > FU_RETEST_BARS:
+        _fu_watch.pop((sym, tf), None)
+    return out
+
+
+def fu_cycle(boundary_ms):
+    """One pass after a 4h close (and the 1d close at 00:00 UTC)."""
+    do_1d = boundary_ms % 86400000 == 0
+    if do_1d:
+        daily_cache_refresh()
+    tick = _ticker_map()
+    syms = []
+    for s, t in tick.items():
+        try:
+            if _clean_symbol(s) and float(t.get("quoteVolume", 0) or 0) >= FU_MIN_QV24:
+                syms.append(s)
+        except Exception:
+            pass
+    btc24 = rev_btc_24h()
+    found = {}            # (sym, dir) -> [(tf, ev, close, levels)]
+    follow = []
+    now = time.time()
+    for s in syms:
+        while api_backoff_active():
+            time.sleep(30)
+        try:
+            c4 = _closed_only(get_candles(s, limit=FU_LOOKBACK + 40, interval="4h") or [], 14400000)
+            time.sleep(N_REQ_PAUSE)
+            b4 = [{"time": _bar_ms(c), "open": o(c), "high": h(c), "low": l(c), "close": cl(c),
+                   "qv": cl(c) * v(c)} for c in c4]
+            sets = []
+            if b4 and int(b4[-1]["time"]) + 14400000 == boundary_ms:
+                sets.append(("4h", b4))
+            if do_1d:
+                bd = _dc["data"].get(s)
+                if bd and int(bd[-1]["time"]) + 86400000 == boundary_ms:
+                    sets.append(("1d", bd))
+            for tf, bars in sets:
+                follow += _fu_followups(s, tf, bars)
+                ev, levels, atr = fu_events(bars)
+                close = float(bars[-1]["close"])
+                for e in ev:
+                    found.setdefault((s, e["dir"]), []).append((tf, e, close, levels))
+                if ev:
+                    e0 = sorted(ev, key=lambda x: {"SR": 0, "BOS": 1, "CHOCH": 1, "TL": 2}[x["kind"]])[0]
+                    _fu_watch[(s, tf)] = {"dir": e0["dir"], "level": e0["level"], "bar_ts": int(bars[-1]["time"]),
+                                          "atr": atr, "retest": False, "failed": False}
+        except Exception as ex:
+            print(f"[FOLLOW UP {s}] {ex}")
+    msgs = []
+    for (s, d), items in found.items():
+        kinds = sorted({e["kind"] for _tf, e, _c, _l in items})
+        key = (s, ",".join(kinds), d)
+        if now - _fu_sent.get(key, 0) < FU_DEDUP_S:
+            continue
+        _fu_sent[key] = now
+        msgs.append(_fu_message(s, d, items, btc24))
+    for k in [k for k, t in _fu_sent.items() if now - t > 3 * FU_DEDUP_S]:
+        _fu_sent.pop(k, None)
+    allm = msgs + follow
+    if allm:
+        batch = ""
+        for m in allm:
+            if len(batch) + len(m) + 2 > 3800:
+                send_followup(batch)
+                batch = ""
+            batch = (batch + "\n\n" + m) if batch else m
+        if batch:
+            send_followup(batch)
+    _fu_stats.update(last_run=now, coins=len(syms), alerts=len(msgs), note=f"{len(follow)} follow-ups")
+    print(f"[FOLLOW UP] {len(syms)} coins, {len(msgs)} break alerts, {len(follow)} follow-ups"
+          + (" (+1d)" if do_1d else ""))
+
+
+def fu_loop():
+    time.sleep(60)
+    last = None
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+            boundary = now_ms // 14400000 * 14400000
+            if FU_CTRL["on"] and last != boundary and now_ms - boundary >= 150000:
+                if now_ms - boundary <= 2 * 3600 * 1000:
+                    fu_cycle(boundary)
+                last = boundary
+        except Exception as ex:
+            print(f"[FOLLOW UP LOOP] {ex}")
+        time.sleep(30)
+
+
+# ============================================================================
+# JOURNAL ROUTING, REPORTS, COMMANDS, STATUS
+# ============================================================================
+def journal_closed_trade(trade):
+    """2026-10-11: the journal is N1/N2 only (they write their own entries). A T-series
+    position that was still LIVE before the switch closes here and is reported in the
+    Niti Paper channel as an old live trade (dedup kept)."""
+    try:
+        _k = _journal_key(trade)
+        _now = time.time()
+        for _old in [k for k, v in _journalled_keys.items() if _now - v > _JOURNAL_DEDUP_SECONDS]:
+            _journalled_keys.pop(_old, None)
+        if _k in _journalled_keys:
+            print(f"[JOURNAL DEDUP] {trade.get('symbol')} already reported - skipping duplicate")
+            return
+        _journalled_keys[_k] = _now
+    except Exception as e:
+        print(f"[JOURNAL DEDUP ERROR] {e}")
+    p = float(trade.get("pnl", 0) or 0)
+    r = trade.get("exit_r")
+    rs = f" · {float(r):+.2f}R" if isinstance(r, (int, float)) else ""
+    send_paper(f"🔚 OLD LIVE (T, opened before the switch) · {trade.get('label', '?')} · "
+               f"{trade.get('symbol')} {trade.get('side')} · {trade.get('result', '?')}{rs} · "
+               f"{'+' if p >= 0 else '-'}${abs(p):.2f}")
+    print(f"[OLD LIVE CLOSE] {trade}")
+
+
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _NZ = _ZI("Pacific/Auckland")
+except Exception:
+    _NZ = timezone(timedelta(hours=13))
+_rep_state = {"daily": None, "weekly": None}
+
+
+def _n_rows(since_ts, tag=None):
+    return [x for x in N_CLOSED if x.get("close_ts", 0) >= since_ts and (tag is None or x.get("tag") == tag)]
+
+
+def n_report_lines(since_ts):
+    out = []
+    for e in N_ENGINES + [N2X]:
+        n, wr, p = _agg_closed(_n_rows(since_ts, e["tag"]))
+        out.append(f"{e['name']}: {n} trades | win {wr:.0f}% | {'+' if p >= 0 else '-'}${abs(p):.2f} | "
+                   f"open {len(e['open'])}" + (f" pending {len(e['pending'])}" if "pending" in e else ""))
+    return out
+
+
+def send_daily_summary():
+    """Called every 30s by trailing_loop. 23:55 NZ: one short day report to the main chat
+    and the paper channel; Sunday 23:55 NZ: weekly N1/N2 summary to the journal."""
+    now = datetime.now(_NZ)
+    if now.hour != 23 or now.minute < 55:
+        return
+    day = now.date()
+    if _rep_state["daily"] == day:
+        return
+    _rep_state["daily"] = day
+    start = datetime(day.year, day.month, day.day, tzinfo=_NZ).timestamp()
+    try:
+        prow = [x for x in PAPER_CLOSED if x.get("close_ts", 0) >= start]
+        pn, pw, pp = _agg_closed(prow)
+        send_tg("📊 আজকের হিসাব (" + day.strftime("%d %b") + ")\n" + "\n".join(n_report_lines(start)) +
+                f"\nPaper T (সব মিলিয়ে): {pn} trades | win {pw:.0f}% | {'+' if pp >= 0 else '-'}${abs(pp):.2f}")
+        send_paper(paper_report_text(since_ts=start, title="📝 PAPER আজ"))
+    except Exception as e:
+        print(f"[DAILY REPORT] {e}")
+    if now.weekday() == 6 and _rep_state["weekly"] != day:
+        _rep_state["weekly"] = day
+        try:
+            wk = time.time() - 7 * 86400
+            send_journal("📅 সাপ্তাহিক হিসাব (শেষ ৭ দিন)\n" + "\n".join(n_report_lines(wk)) + "\nNiti Journal")
+        except Exception as e:
+            print(f"[WEEKLY REPORT] {e}")
+
+
+def n_status_text():
+    L = ["===== N-SERIES (LIVE) ====="]
+    for e in N_ENGINES:
+        on = "ON" if N_CTRL.get(e["tag"]) else "OFF - send /start"
+        opens = ", ".join(f"{s} {t['pos_side']}{' (50% booked)' if t.get('tp1_done') else ''}"
+                          for s, t in e["open"].items()) or "none"
+        pend = ", ".join(f"{s} {p['pos_side']} @ {px_round(s, p['entry'])}" for s, p in e["pending"].items()) or "none"
+        L.append(f"{e['name']} ({e['tf']}): {on} | risk ${e['risk_usdt']:.0f} | open {len(e['open'])}/{e['max_concurrent']}\n"
+                 f"  open: {opens}\n  pending: {pend}\n  last scan: {e.get('last_scan_note') or 'not yet'}")
+    L.append(n2x_status_lines())
+    L.append("Follow Up alerts: " + ("ON" if FU_CTRL["on"] else "OFF") +
+             (f" | last run {datetime.fromtimestamp(_fu_stats['last_run'], timezone.utc).strftime('%m-%d %H:%M')} UTC, "
+              f"{_fu_stats['coins']} coins, {_fu_stats['alerts']} alerts" if _fu_stats["last_run"] else ""))
+    L.append("T-series: " + ("SIGNAL-ONLY (paper)" if T_MODE_DEFAULT != "live" else "LIVE") +
+             (" | overrides: " + ", ".join(f"{k}={v}" for k, v in _tmode_override.items()) if _tmode_override else ""))
+    L.append("State storage: " + state_status_text())
+    return "\n".join(L)
+
+
+_orig_slotmap_status_text = slotmap_status_text
+
+
+def slotmap_status_text():
+    try:
+        base = _orig_slotmap_status_text()
+    except Exception as e:
+        base = f"(slot map unreadable: {e})"
+    tl = []
+    for slot, desc, e, on in _slot_engines():
+        bk = PAPER.get(e.get("tag"), {"open": {}, "pending": {}})
+        live_open = ", ".join(t.get("symbol", "?") for t in e["open"].values())
+        paper_open = ", ".join(bk["open"].keys())
+        tl.append(f"{slot}: paper open {len(bk['open'])} pending {len(bk['pending'])}"
+                  + (f" [{paper_open}]" if paper_open else "")
+                  + (f" | OLD LIVE still open: {live_open}" if live_open else ""))
+    return n_status_text() + "\n\n===== T-SERIES (signal only) =====\n" + "\n".join(tl) + "\n\n" + base
+
+
+def _n_cmd_start(_on):
+    N_CTRL["n1"] = N_CTRL["n2"] = True
+    _on.append("N1 LIVE, N2 LIVE" + (" (BTC-hedged)" if N2X["hedge"] else ""))
+    _on.append("T-series = SIGNAL ONLY (paper)" if T_MODE_DEFAULT != "live" else "T-series LIVE")
+    if FU_CTRL["on"]:
+        _on.append("Follow Up alerts")
+
+
+def _n_cmd_stop():
+    N_CTRL["n1"] = N_CTRL["n2"] = False
+
+
+def _n_handle_cmd(text):
+    """Extra commands. Returns True if handled."""
+    t = text.strip().lower()
+    if t == "/paper":
+        send_tg(paper_report_text())
+        return True
+    if t in ("/n", "/n_status"):
+        send_tg(n_status_text())
+        return True
+    if t in ("/n1_start", "/n2_start", "/n1_stop", "/n2_stop"):
+        tag = t[1:3]
+        N_CTRL[tag] = t.endswith("start")
+        send_tg(f"{tag.upper()} {'ON (live orders)' if N_CTRL[tag] else 'OFF (open trades keep their stops)'}")
+        return True
+    if t in ("/followup_on", "/followup_off", "/fu_on", "/fu_off"):
+        FU_CTRL["on"] = t.endswith("on")
+        send_tg(f"Follow Up alerts {'ON' if FU_CTRL['on'] else 'OFF'}")
+        return True
+    if t.startswith("/tmode"):
+        parts = t.split()
+        if len(parts) == 3 and parts[2] in ("live", "signal"):
+            _tmode_override[parts[1]] = parts[2]
+            send_tg(f"T engine '{parts[1]}' mode -> {parts[2].upper()}")
+        else:
+            send_tg("Use: /tmode <tag> live|signal   e.g. /tmode t6l signal\nTags: " +
+                    ", ".join(sorted({e.get('tag', '?') for e in _all_engine_dicts() if e.get('max_concurrent', 0) > 0})))
+        return True
+    return False
+
+
+def startup_channels_report():
+    time.sleep(25)
+    try:
+        if TG_PAPER_ID:
+            ok = send_tg("📝 Paper journal connected - T-series paper trades will appear here.", chat_id=TG_PAPER_ID)
+            if not ok:
+                send_tg("⚠️ Niti Paper channel not reachable - check TG_PAPER_CHAT_ID and that the bot is admin.")
+        else:
+            send_tg("⚠️ TG_PAPER_CHAT_ID is not set - paper results only in /paper.")
+        if TG_MANUAL_ID:
+            ok = send_tg("🔔 Follow Up connected - S/R, structure and trendline break alerts will appear here "
+                         "(4h + 1d closes, volume >= 1.5x).", chat_id=TG_MANUAL_ID)
+            if not ok:
+                send_tg("⚠️ Follow Up channel not reachable - check TG_MANUAL_CHAT_ID and that the bot is admin.")
+        else:
+            send_tg("⚠️ TG_MANUAL_CHAT_ID is not set - Follow Up alerts are off.")
+        if _state_info["ok"] is False:
+            send_tg("⚠️ State table missing in Supabase - N1/N2 and paper state will NOT survive a redeploy.\n"
+                    "Run the bot_state SQL once in Supabase (SQL editor).")
+    except Exception as e:
+        print(f"[STARTUP CHANNELS] {e}")
+
+
+def slotmap_startup_report():
+    time.sleep(150)
+    try:
+        send_tg("🧭 STARTUP\n" + n_status_text() +
+                "\n\nT-series signals -> signal-only DM, paper -> Niti Paper\n"
+                "/status = full status | /paper = paper results | /n = N1/N2 | /why = scan counters")
+    except Exception as e:
+        print(f"[STARTUP REPORT] {e}")
+
+
 if __name__ == "__main__":
+    # 2026-10-11: restore N1/N2 + paper state BEFORE anything adopts or cancels orders
+    try:
+        n_load()
+    except Exception as e:
+        print(f"[STARTUP N LOAD] {e}")
+    try:
+        n2x_load()
+    except Exception as e:
+        print(f"[STARTUP N2 LOAD] {e}")
+    try:
+        paper_load()
+    except Exception as e:
+        print(f"[STARTUP PAPER LOAD] {e}")
+    _threading.Thread(target=startup_channels_report, daemon=True).start()
     _threading.Thread(target=slotmap_startup_report, daemon=True).start()
     _threading.Thread(target=breadth_refresh_loop, daemon=True).start()   # 2026-10-07 long-gate deadlock fix
     _threading.Thread(target=s1_route_loop, daemon=True).start()          # 2026-10-07 Binance ratio via Supabase
-    _threading.Thread(target=why_report_loop, daemon=True).start()        # 2026-10-07 6-hourly why-no-trades
-    # Re-adopt anything already open on BingX BEFORE the engines start, so a restart
-    # can't breach the concurrency caps or orphan a trail-managed position.
+    # Re-adopt anything already open on BingX BEFORE the engines start (N1/N2 coins are
+    # skipped - they are already in their own books).
     try:
-        get_futures_symbols()          # populate symbol_precision / max_lev first
+        get_futures_symbols()
         adopt_positions_on_start()
     except Exception as e:
         print(f"[STARTUP ADOPT ERROR] {e}")
+    try:
+        cleanup_orphan_entry_orders()
+    except Exception as e:
+        print(f"[STARTUP ORPHAN CLEANUP] {e}")
+    try:
+        n_startup_verify()
+        n2x_startup_verify()
+    except Exception as e:
+        print(f"[STARTUP N VERIFY] {e}")
 
-    # Thread(target=t2_loop, ...) RETIRED 2026-08-20: old block-based Tight 2 (SHORT resistance-block)
-    # removed. Tight 2 is now the ceiling 24h-reversion engine (rev2_loop) below.
-    Thread(target=rev2_loop,                daemon=True).start()   # Tight 2 = 24h-reversion CEILING (2026-08-20)
-    Thread(target=trailing_loop,            daemon=True).start()
-    # Thread(target=t3_loop, ...) DISABLED 2026-08-23: old dormant/OI watchlist T3 retired; superseded by S/R Sweep SHORT (t3_scalp_loop).
+    Thread(target=rev2_loop,                daemon=True).start()
+    Thread(target=trailing_loop,            daemon=True).start()   # also runs the daily/weekly reports
     Thread(target=handle_telegram_commands, daemon=True).start()
-    Thread(target=oi_collector_loop,        daemon=True).start()   # OI logger -> Supabase (2026-08-10)
-    Thread(target=t3_scalp_loop,            daemon=True).start()   # Tight 3 = S/R Sweep SHORT bear engine (2026-08-23)
-    Thread(target=rev_loop,                 daemon=True).start()   # Tight 1 = 24h-reversion, resting-limit entry (2026-08-20)
-    Thread(target=rev4_loop,                daemon=True).start()   # Tight 4 = 4h range-extreme reversion SHORT, bull/flat only (2026-08-28)
-    Thread(target=rev5_loop,                daemon=True).start()   # Tight 5 = crash-continuation SHORT (2026-08-30)
-    Thread(target=rev3_loop,                daemon=True).start()   # Tight 3 = 10d-low breakdown SHORT, bear-gated (2026-09-09)
-    Thread(target=ema_alert_loop,           daemon=True).start()   # daily EMA40 cross notifier (2026-09-13)
-    Thread(target=rev7l_loop,               daemon=True).start()   # Tight 7 LONG  = RS leaders, rally-gated (2026-09-13)
-    Thread(target=rev7s_loop,               daemon=True).start()   # Tight 7 SHORT = RS laggards, rally-gated (2026-09-13)
-    Thread(target=rev3l_loop,               daemon=True).start()   # long legs (2026-09-07)
+    Thread(target=oi_collector_loop,        daemon=True).start()
+    Thread(target=t3_scalp_loop,            daemon=True).start()
+    Thread(target=rev_loop,                 daemon=True).start()
+    Thread(target=rev4_loop,                daemon=True).start()
+    Thread(target=rev5_loop,                daemon=True).start()
+    Thread(target=rev3_loop,                daemon=True).start()
+    Thread(target=ema_alert_loop,           daemon=True).start()
+    Thread(target=rev7l_loop,               daemon=True).start()
+    Thread(target=rev7s_loop,               daemon=True).start()
+    Thread(target=rev3l_loop,               daemon=True).start()
     Thread(target=rev4l_loop,               daemon=True).start()
     Thread(target=rev5l_loop,               daemon=True).start()
     Thread(target=rev6l_loop,               daemon=True).start()
-    Thread(target=rev6_loop,                daemon=True).start()   # Tight 6 = ATR%-gated range-extreme reversion (2026-08-31)
-    # 2026-09-17: the four spare shorts. Each loop returns immediately unless its
-    # REV_T*S_ENABLED env var is set, so this costs one dead thread each while off.
+    Thread(target=rev6_loop,                daemon=True).start()
     for _sp in SHORT_SPARES:
         Thread(target=short_spare_loop, args=(_sp,), daemon=True).start()
-    # 2026-09-20: L is signal-only (no orders) - it still gets its own thread so its
-    # scan cadence is independent of every trading engine.
-    Thread(target=l_loop, daemon=True).start()
+    Thread(target=l_loop,                   daemon=True).start()
+    # 2026-10-11 N-series build
+    Thread(target=n_scan_loop,              daemon=True).start()   # N1 12h / N2 1d signal scans
+    Thread(target=n_manage_loop,            daemon=True).start()   # N1/N2 fills, 50% at 1R, trailing, time stop
+    Thread(target=n2x_loop,                 daemon=True).start()   # N2 daily extreme-mover shorts + BTC hedge
+    Thread(target=paper_loop,               daemon=True).start()   # T-series paper fills / exits
+    Thread(target=fu_loop,                  daemon=True).start()   # Follow Up break alerts
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

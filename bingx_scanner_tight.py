@@ -1,4 +1,4 @@
-import os, time, hmac, hashlib, json, requests
+import os, time, hmac, hashlib, json, requests, math
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone, timedelta
@@ -10180,6 +10180,494 @@ def n2x_status_lines():
 
 
 # ============================================================================
+# N2 = ZONE SWEEP (Pine 1 logic, live orders, 15m)                  2026-10-21
+# Replaces the old extreme-mover N2 (that one now only closes out what it already has).
+# Every 15m close: coins with 24h quote volume >= $1M that moved a lot in 24h.
+#   SHORT: 24h >= +11%, ATR% >= 1%, red candle, body >= avg body (20), high >= 12h high
+#          + 0.7 ATR and close back below the 12h high (48 bars).
+#   LONG:  24h <= -6%, ATR% >= 1%, green candle, body >= 1.5x avg body, volume >= 1.5x avg,
+#          low <= 12h low - 0.5 ATR and close back above the 12h low.
+# Entry market at the next bar, SL 2 ATR, TP 2R (both on the exchange), time exit after
+# 32 bars (8h). Risk $6 per trade, leverage from the stop distance, max 5 open, one per coin.
+# A+ = the swept 12h level sits inside a confluence zone with score >= 2 (same zones as
+# the Pine 1 indicator / backtest). Every signal is messaged, also when the bot cannot open.
+# Backtest ($6 risk, cap 5): bear 5.1/wk +$6.3 | recent 19.4/wk +$26.9 | bull 12.6/wk +$6.4.
+# ============================================================================
+N2X["max_concurrent"] = 0      # old N2: no new entries, existing positions keep their exits
+
+N2Z = {
+    "tag": "n2z", "name": "N2",
+    "risk": float(os.environ.get("N2Z_RISK_USD", 6)),
+    "max_concurrent": int(os.environ.get("N2Z_MAX_OPEN", 5)),
+    "max_lev": int(os.environ.get("N2Z_MAX_LEV", 20)),
+    "min_qv24": float(os.environ.get("N2Z_MIN_QV24", 1e6)),
+    "short_move": 0.11, "long_move": 0.06, "lb": 48, "s_depth": 0.7, "l_depth": 0.5,
+    "l_body": 1.5, "l_vol": 1.5, "min_atr_pct": 0.01, "sl_atr": 2.0, "tp_r": 2.0, "hold_bars": 32,
+    "late_s": int(os.environ.get("N2Z_LATE_SECONDS", 600)),
+    "open": {}, "cool": {}, "done_bars": [], "last_note": "",
+}
+N2Z_LOCK = _threading.RLock()
+N2Z_BAR = 900000
+
+
+def n2z_save():
+    with N2Z_LOCK:
+        st = {"open": N2Z["open"], "cool": N2Z["cool"], "done_bars": N2Z["done_bars"][-200:]}
+    state_put("n2z_books", st)
+
+
+def n2z_load():
+    b = state_get("n2z_books", {}) or {}
+    with N2Z_LOCK:
+        N2Z["open"] = dict(b.get("open") or {})
+        N2Z["cool"] = dict(b.get("cool") or {})
+        N2Z["done_bars"] = list(b.get("done_bars") or [])
+    print(f"[N2] zone-sweep state loaded: open {len(N2Z['open'])}")
+
+
+_prev2_all_open_symbols = all_open_symbols
+
+
+def all_open_symbols():
+    s = set(_prev2_all_open_symbols())
+    try:
+        s |= set(N2Z["open"].keys())
+    except Exception:
+        pass
+    return s
+
+
+def _n2z_bars(sym, limit):
+    cs = get_candles(sym, limit=limit, interval="15m") or []
+    cs = [c for c in _closed_only(cs, N2Z_BAR) if _bar_ms(c) % N2Z_BAR == 0]
+    out = []
+    for c in cs:
+        try:
+            out.append({"time": _bar_ms(c), "open": o(c), "high": h(c), "low": l(c), "close": cl(c),
+                        "qv": cl(c) * v(c)})
+        except Exception:
+            pass
+    return out
+
+
+def n2z_signal(O, H, L, C, Q, i):
+    """Pure signal maths on closed 15m bars, bar i = the bar that just closed.
+    Returns (side, atr, swept_level, r24) or None. Same rules as the backtest / Pine 1."""
+    if i < 100:
+        return None
+    A = _atr_wilder_first(H, L, C)
+    atr = A[i]
+    if C[i] <= 0 or C[i - 96] <= 0 or atr <= 0:
+        return None
+    r24 = C[i] / C[i - 96] - 1
+    lb = N2Z["lb"]
+    hi12 = max(H[i - lb:i])
+    lo12 = min(L[i - lb:i])
+    body = abs(C[i] - O[i])
+    ab = sum(abs(C[k] - O[k]) for k in range(i - 20, i)) / 20.0
+    vma = sum(Q[i - 20:i]) / 20.0
+    if atr / C[i] < N2Z["min_atr_pct"]:
+        return None
+    if (r24 >= N2Z["short_move"] and C[i] < O[i] and body >= ab
+            and H[i] >= hi12 + N2Z["s_depth"] * atr and C[i] < hi12):
+        return ("SHORT", atr, hi12, r24)
+    if (r24 <= -N2Z["long_move"] and C[i] > O[i] and body >= N2Z["l_body"] * ab
+            and Q[i] >= N2Z["l_vol"] * vma and L[i] <= lo12 - N2Z["l_depth"] * atr and C[i] > lo12):
+        return ("LONG", atr, lo12, r24)
+    return None
+
+
+def _n2z_vp(tp, vol, nb=40):
+    lo, hi = min(tp), max(tp)
+    if hi <= lo:
+        return lo, lo, lo
+    hist = [0.0] * nb
+    for x, w in zip(tp, vol):
+        b = min(nb - 1, max(0, int((x - lo) / (hi - lo) * nb)))
+        hist[b] += w
+    p = max(range(nb), key=lambda k: hist[k])
+    a = bb = p
+    tot = sum(hist)
+    s = hist[p]
+    while s < 0.7 * tot and (a > 0 or bb < nb - 1):
+        la = hist[a - 1] if a > 0 else -1.0
+        rb = hist[bb + 1] if bb < nb - 1 else -1.0
+        if la >= rb:
+            a -= 1
+            s += la
+        else:
+            bb += 1
+            s += rb
+    w = (hi - lo) / nb
+    return lo + (p + 0.5) * w, lo + (bb + 1) * w, lo + a * w
+
+
+def n2z_zones(bars, i):
+    """Confluence zones for the UTC day of bar i (Pine 1 / backtest rules).
+    Returns [(lo, hi, score)] or [] when there is not enough history."""
+    T = [b["time"] for b in bars]
+    Hh = [b["high"] for b in bars]
+    Ll = [b["low"] for b in bars]
+    Cc = [b["close"] for b in bars]
+    Oo = [b["open"] for b in bars]
+    Qq = [b["qv"] for b in bars]
+    days = {}
+    order = []
+    for k, t in enumerate(T[:i + 1]):
+        d = t // 86400000
+        if d not in days:
+            days[d] = [k, k]
+            order.append(d)
+        days[d][1] = k
+    today = T[i] // 86400000
+    if today not in days or len(order) < 7:
+        return []
+    di = order.index(today)
+    prev = order[:di]
+    if len(prev) < 5:
+        return []
+    DH = {d: max(Hh[days[d][0]:days[d][1] + 1]) for d in prev}
+    DL = {d: min(Ll[days[d][0]:days[d][1] + 1]) for d in prev}
+    adr_days = prev[-14:]
+    adr = sum(DH[d] - DL[d] for d in adr_days) / len(adr_days)
+    if adr <= 0:
+        return []
+    y = prev[-1]
+    ya, yb = days[y]
+    t0 = days[today][0]
+    DO = Oo[t0]
+    poc, vah, val = _n2z_vp([(Hh[k] + Ll[k] + Cc[k]) / 3 for k in range(ya, yb + 1)], Qq[ya:yb + 1])
+    lev = [(DH[y], 1), (DL[y], 2), (Cc[yb], 3), (DO, 4), (poc, 5), (vah, 6), (val, 7)]
+    w7 = prev[-7:]
+    lev += [(max(DH[d] for d in w7), 8), (min(DL[d] for d in w7), 9)]
+    K = 16
+    phs, pls = [], []
+    for k in range(max(K, t0 - 960), t0 - K):
+        lo_k, hi_k = k - K, k + K + 1
+        if hi_k > len(Hh):
+            break
+        if Hh[k] == max(Hh[lo_k:hi_k]):
+            phs.append(Hh[k])
+        if Ll[k] == min(Ll[lo_k:hi_k]):
+            pls.append(Ll[k])
+    lev += [(x, 10) for x in phs[-6:]] + [(x, 11) for x in pls[-6:]]
+    if DO > 0:
+        mag = 10 ** math.floor(math.log10(DO))
+        for m in (1, 2, 5):
+            step = m * mag / 10
+            lev.append((round(DO / step) * step, 12))
+    lev.sort(key=lambda x: x[0])
+    tol = 0.15 * adr
+    out, cur = [], [lev[0]]
+    for x in lev[1:]:
+        if x[0] - cur[0][0] <= tol:
+            cur.append(x)
+        else:
+            out.append(cur)
+            cur = [x]
+    out.append(cur)
+    zones = []
+    for g in out:
+        ps = [x[0] for x in g]
+        mid = (min(ps) + max(ps)) / 2
+        half = max((max(ps) - min(ps)) / 2, 0.05 * adr)
+        zones.append((mid - half, mid + half, len(set(x[1] for x in g))))
+    return zones
+
+
+def n2z_aplus(sym, bar_ts, level, atr):
+    """True / False, or None if the zone history could not be loaded."""
+    try:
+        bars = _n2z_bars(sym, 1440)
+        idx = next((k for k in range(len(bars) - 1, -1, -1) if bars[k]["time"] == bar_ts), None)
+        if idx is None:
+            return None
+        zs = n2z_zones(bars, idx)
+        if not zs:
+            return None
+        return any(sc >= 2 and lo - 0.5 * atr <= level <= hi + 0.5 * atr for lo, hi, sc in zs)
+    except Exception as e:
+        print(f"[N2 A+ {sym}] {e}")
+        return None
+
+
+def _n2z_lev(stop_pct, sym):
+    lev = int(1.0 / max(1.5 * stop_pct, 1e-6))
+    cap = min(N2Z["max_lev"], int(symbol_max_lev.get(sym, N2Z["max_lev"]) or N2Z["max_lev"]))
+    return max(1, min(lev, cap))
+
+
+def _n2z_candidates(tick):
+    out = []
+    for sym, t in tick.items():
+        try:
+            if not _clean_symbol(sym) or _coin_base(sym) == "BTC":
+                continue
+            if float(t.get("quoteVolume", 0) or 0) < N2Z["min_qv24"]:
+                continue
+            op = float(t.get("openPrice", 0) or 0)
+            last = float(t.get("lastPrice", 0) or 0)
+            if op > 0 and last > 0:
+                mv = abs(last / op - 1)
+                ok = mv >= 0.05
+            else:
+                raw = _ticker_gain_raw(t)
+                ok = raw is not None and (abs(raw[0]) >= 5 or 0.05 <= abs(raw[0]) < 1)
+            if ok:
+                out.append(sym)
+        except Exception:
+            pass
+    return sorted(out)
+
+
+def _n2z_msg_signal(sym, side, entry, sl, tp, qty, ap, r24, why):
+    tag = " A+" if ap else ""
+    send_tg(f"🔔 N2 SIGNAL{tag} (not opened: {why})\n{sym} {side}\n"
+            f"Entry ~{px_round(sym, entry)} | SL {px_round(sym, sl)} | TP {px_round(sym, tp)}\n"
+            f"qty {qty} (${N2Z['risk']:.0f} risk) | 24h {r24 * 100:+.0f}%")
+
+
+def n2z_open(sym, sig, bar_ts):
+    side, atr, level, r24 = sig
+    d = 1 if side == "LONG" else -1
+    R = N2Z["sl_atr"] * atr
+    px = get_current_price(sym)
+    if not px or R <= 0:
+        return "no price"
+    prec = symbol_precision.get(sym, 4)
+    qty = round(N2Z["risk"] / R, prec)
+    ap = n2z_aplus(sym, bar_ts, level, atr)
+    sl0, tp0 = px - d * R, px + d * N2Z["tp_r"] * R
+    if qty <= 0:
+        _n2z_msg_signal(sym, side, px, sl0, tp0, qty, ap, r24, "qty rounds to 0")
+        return "qty0"
+    lev = _n2z_lev(R / px, sym)
+    need = qty * px / lev
+    avail = get_available_margin()
+    if avail is not None and avail < need * 1.2:
+        _n2z_msg_signal(sym, side, px, sl0, tp0, qty, ap, r24, f"margin: need ${need:.1f}, free ${avail:.1f}")
+        _st(N2Z, "skip_margin")
+        return "margin"
+    set_leverage_api(sym, lev)
+    oid = place_market_order(sym, "BUY" if d == 1 else "SELL", qty, side)
+    if not oid or oid == "N/A":
+        _n2z_msg_signal(sym, side, px, sl0, tp0, qty, ap, r24, "BingX rejected the market order")
+        return "rejected"
+    time.sleep(1)
+    fill = get_fill_price(oid, sym, 0.0) or px
+    sl, tp = fill - d * R, fill + d * N2Z["tp_r"] * R
+    close_side = "SELL" if d == 1 else "BUY"
+    sl_id = place_sl_guarded(sym, close_side, side, px_round(sym, sl), qty)
+    if sl_id is None:
+        place_market_order(sym, close_side, qty, side)
+        send_tg(f"⚠️ N2 {sym}: stop could not be placed - position closed at market (no naked risk).")
+        return "no stop"
+    tp_id = place_tp_order(sym, close_side, side, px_round(sym, tp), qty)
+    if not tp_id or tp_id == "N/A":
+        tp_id = None
+    t = {"symbol": sym, "side": side, "qty": qty, "entry": fill, "sl": sl, "tp": tp, "R": R,
+         "sl_id": sl_id, "tp_id": tp_id, "tp_tries": 0, "lev": lev, "open_ts": time.time(),
+         "bar_ts": int(bar_ts), "exit_due": (int(bar_ts) + (N2Z["hold_bars"] + 1) * N2Z_BAR) / 1000.0,
+         "aplus": bool(ap), "r24": r24, "gone": 0}
+    with N2Z_LOCK:
+        N2Z["open"][sym] = t
+    _st(N2Z, "fills")
+    n2z_save()
+    print(f"[N2] OPEN {sym} {side} {qty} @ {fill} SL {sl} TP {tp} lev {lev} A+={ap}")
+    send_tg(f"✅ N2 {sym} {side}{' A+' if ap else ''} FILLED\n"
+            f"Entry {px_round(sym, fill)} | SL {px_round(sym, sl)} | TP {px_round(sym, tp)} (2R)\n"
+            f"Risk ${N2Z['risk']:.0f} | {lev}x | margin ${qty * fill / lev:.2f} | 24h {r24 * 100:+.0f}% | max 8h"
+            + ("" if tp_id else "\n⚠️ TP order not accepted yet - bot will retry"))
+    return "opened"
+
+
+def n2z_finalize(sym, t, reason, pos=None):
+    try:
+        if pos is None:
+            pos = _positions_map() or {}
+        close_side = "SELL" if t["side"] == "LONG" else "BUY"
+        left = pos.get((sym, t["side"]), 0)
+        if left > 0:
+            place_market_order(sym, close_side, min(t["qty"], left), t["side"])
+            time.sleep(1)
+        for k in ("sl_id", "tp_id"):
+            if t.get(k):
+                try:
+                    cancel_order(sym, t[k])
+                except Exception:
+                    pass
+        exit_px = 0.0
+        if reason == "gone":
+            tpf = get_fill_price(t["tp_id"], sym, 0.0) if t.get("tp_id") else 0.0
+            slf = get_fill_price(t["sl_id"], sym, 0.0) if t.get("sl_id") else 0.0
+            if tpf:
+                reason, exit_px = "tp", tpf
+            elif slf:
+                reason, exit_px = "sl", slf
+        exit_px = exit_px or get_current_price(sym) or t["entry"]
+        d = 1 if t["side"] == "LONG" else -1
+        pnl = get_income_pnl(sym, t["open_ts"] * 1000 - 120000)
+        est = pnl is None
+        if est:
+            pnl = d * (exit_px - t["entry"]) * t["qty"] - 0.0011 * t["entry"] * t["qty"]
+        r = pnl / max(N2Z["risk"], 1e-9)
+        emoji = "✅" if pnl > 0.1 else ("❌" if pnl < -0.1 else "➖")
+        how = {"tp": "TP (2R) লেগেছে", "sl": "SL লেগেছে", "time": "৮ ঘণ্টা শেষ, market-এ বন্ধ",
+               "gone": "BingX-এ position বন্ধ পাওয়া গেছে"}.get(reason, reason)
+        hrs = (time.time() - t["open_ts"]) / 3600.0
+        send_journal(f"{emoji} N2 · {sym} · {t['side']}{' A+' if t.get('aplus') else ''}\n"
+                     f"Entry {px_round(sym, t['entry'])} → Exit {px_round(sym, exit_px)}\n{how}\n"
+                     f"PnL {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} ({r:+.2f}R) · {hrs:.1f} ঘণ্টা"
+                     + (" (আনুমানিক)" if est else "") + "\nNiti Journal")
+        send_tg(f"{emoji} N2 {sym} {t['side']} closed {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} ({how})")
+        with N2Z_LOCK:
+            N2Z["open"].pop(sym, None)
+            N2Z["cool"][sym] = time.time() + 60
+            N_CLOSED.append({"tag": "n2z", "symbol": sym, "side": t["side"], "pnl": round(pnl, 2),
+                             "r": round(r, 3), "open_ts": t["open_ts"], "close_ts": time.time()})
+            closed = N_CLOSED[-2000:]
+        state_put("n_closed", closed)
+        _st(N2Z, "closed")
+        n2z_save()
+        print(f"[N2] CLOSED {sym} {reason} pnl {pnl:.2f}")
+    except Exception as ex:
+        print(f"[N2 CLOSE {sym}] {ex}")
+
+
+def n2z_manage():
+    if not N2Z["open"]:
+        return
+    pos = _positions_map()
+    if pos is None:
+        return
+    now = time.time()
+    for sym, t in list(N2Z["open"].items()):
+        if now >= t["exit_due"]:
+            n2z_finalize(sym, t, "time", pos)
+            continue
+        if pos.get((sym, t["side"]), 0) <= 0:
+            t["gone"] = t.get("gone", 0) + 1
+            if t["gone"] >= 2:
+                n2z_finalize(sym, t, "gone", pos)
+            continue
+        t["gone"] = 0
+        if not t.get("tp_id") and t.get("tp_tries", 0) < 5:
+            t["tp_tries"] = t.get("tp_tries", 0) + 1
+            cs = "SELL" if t["side"] == "LONG" else "BUY"
+            tid = place_tp_order(sym, cs, t["side"], px_round(sym, t["tp"]), t["qty"])
+            if tid and tid != "N/A":
+                t["tp_id"] = tid
+                n2z_save()
+
+
+def n2z_scan(bar_ts):
+    tick = _ticker_map()
+    if not tick:
+        return False
+    cands = _n2z_candidates(tick)
+    late = time.time() - (bar_ts + N2Z_BAR) / 1000.0
+    sigs = []
+    for sym in cands:
+        while api_backoff_active():
+            time.sleep(20)
+        try:
+            bars = _n2z_bars(sym, 200)
+            if not bars or bars[-1]["time"] != bar_ts:
+                continue
+            T, O, H, L, C, Q = _bars_arrays(bars)
+            s = n2z_signal(O, H, L, C, Q, len(C) - 1)
+            if s:
+                sigs.append((sym, s))
+        except Exception as e:
+            print(f"[N2 SCAN {sym}] {e}")
+        time.sleep(N_REQ_PAUSE)
+    opened = 0
+    for sym, s in sigs:
+        side, atr, level, r24 = s
+        d = 1 if side == "LONG" else -1
+        px = get_current_price(sym) or 0.0
+        R = N2Z["sl_atr"] * atr
+        qty = round(N2Z["risk"] / R, symbol_precision.get(sym, 4)) if R > 0 else 0
+        sl0, tp0 = px - d * R, px + d * N2Z["tp_r"] * R
+        why = None
+        if not N_CTRL.get("n2"):
+            why = "N2 is OFF"
+        elif late > N2Z["late_s"]:
+            why = f"bot {late / 60:.0f} min late"
+        elif sym in N2Z["open"]:
+            why = "already in a N2 trade"
+        elif len(N2Z["open"]) >= N2Z["max_concurrent"]:
+            why = f"bot cap full ({len(N2Z['open'])}/{N2Z['max_concurrent']})"
+        else:
+            pos = _positions_map() or {}
+            busy = (all_open_symbols() - set(N2Z["open"].keys())) | {sy for (sy, _p) in pos.keys()}
+            if sym in busy:
+                why = "coin already used by another engine"
+        if why:
+            ap = n2z_aplus(sym, bar_ts, level, atr)
+            _n2z_msg_signal(sym, side, px, sl0, tp0, qty, ap, r24, why)
+            continue
+        if n2z_open(sym, s, bar_ts) == "opened":
+            opened += 1
+    N2Z["last_note"] = (f"{datetime.fromtimestamp(bar_ts / 1000 + 900, timezone.utc).strftime('%m-%d %H:%M')} UTC: "
+                        f"{len(cands)} movers checked, {len(sigs)} signal(s), {opened} opened")
+    if sigs:
+        print("[N2] " + N2Z["last_note"])
+    return True
+
+
+def n2z_loop():
+    time.sleep(70)
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+            boundary = now_ms // N2Z_BAR * N2Z_BAR
+            bar_ts = boundary - N2Z_BAR
+            if bar_ts not in N2Z["done_bars"] and now_ms - boundary >= 15000:
+                if n2z_scan(bar_ts):
+                    N2Z["done_bars"].append(bar_ts)
+                    N2Z["done_bars"] = N2Z["done_bars"][-200:]
+                    N2Z["cool"] = {s: v for s, v in N2Z["cool"].items() if v > time.time()}
+                    n2z_save()
+            n2z_manage()
+        except Exception as ex:
+            print(f"[N2 LOOP] {ex}")
+        time.sleep(20)
+
+
+def n2z_startup_verify():
+    pos = _positions_map() or {}
+    for sym, t in list(N2Z["open"].items()):
+        try:
+            if pos.get((sym, t["side"]), 0) <= 0:
+                continue          # the manage loop finalizes it after two checks
+            sl_id, _sp, tp_id, _tp = get_open_orders_for(sym)
+            cs = "SELL" if t["side"] == "LONG" else "BUY"
+            if sl_id is None:
+                sl_id = place_sl_guarded(sym, cs, t["side"], px_round(sym, t["sl"]), t["qty"])
+                print(f"[N2] {sym} stop re-placed after restart -> {sl_id}")
+            if tp_id is None:
+                tid = place_tp_order(sym, cs, t["side"], px_round(sym, t["tp"]), t["qty"])
+                tp_id = tid if tid and tid != "N/A" else None
+            t["sl_id"], t["tp_id"] = sl_id, tp_id
+        except Exception as ex:
+            print(f"[N2 VERIFY {sym}] {ex}")
+    n2z_save()
+
+
+def n2z_status_lines():
+    on = "ON" if N_CTRL.get("n2") else "OFF - send /start"
+    opens = ", ".join(f"{s} {t['side']}{' A+' if t.get('aplus') else ''}" for s, t in N2Z["open"].items()) or "none"
+    L = [f"N2 (Zone Sweep 15m, long+short): {on} | risk ${N2Z['risk']:.0f} | open {len(N2Z['open'])}/{N2Z['max_concurrent']}\n"
+         f"  open: {opens}\n  last scan: {N2Z.get('last_note') or 'not yet'}"]
+    if N2X["open"]:
+        L.append("N2-old (extreme-mover, closing out only): " +
+                 ", ".join(f"{s} (exit {datetime.fromtimestamp(t['exit_due'], timezone.utc).strftime('%m-%d')})"
+                           for s, t in N2X["open"].items()))
+    return "\n".join(L)
+
+
+# ============================================================================
 # T-SERIES = SIGNAL-ONLY + PAPER TRACKING
 # Every REV_* engine keeps scanning exactly as before; place_rev_limit no longer sends an
 # order. It sends the signal to the signal-only DM and opens a PAPER trade that the bot
@@ -10818,7 +11306,7 @@ def _n_rows(since_ts, tag=None):
 
 def n_report_lines(since_ts):
     out = []
-    for e in N_ENGINES + [N2X]:
+    for e in N_ENGINES + [N2Z] + ([N2X] if N2X["open"] else []):
         n, wr, p = _agg_closed(_n_rows(since_ts, e["tag"]))
         out.append(f"{e['name']}: {n} trades | win {wr:.0f}% | {'+' if p >= 0 else '-'}${abs(p):.2f} | "
                    f"open {len(e['open'])}" + (f" pending {len(e['pending'])}" if "pending" in e else ""))
@@ -10862,7 +11350,7 @@ def n_status_text():
         pend = ", ".join(f"{s} {p['pos_side']} @ {px_round(s, p['entry'])}" for s, p in e["pending"].items()) or "none"
         L.append(f"{e['name']} ({e['tf']}): {on} | risk ${e['risk_usdt']:.0f} | open {len(e['open'])}/{e['max_concurrent']}\n"
                  f"  open: {opens}\n  pending: {pend}\n  last scan: {e.get('last_scan_note') or 'not yet'}")
-    L.append(n2x_status_lines())
+    L.append(n2z_status_lines())
     L.append("Follow Up alerts: " + ("ON" if FU_CTRL["on"] else "OFF") +
              (f" | last run {datetime.fromtimestamp(_fu_stats['last_run'], timezone.utc).strftime('%m-%d %H:%M')} UTC, "
               f"{_fu_stats['coins']} coins, {_fu_stats['alerts']} alerts" if _fu_stats["last_run"] else ""))
@@ -10893,7 +11381,7 @@ def slotmap_status_text():
 
 def _n_cmd_start(_on):
     N_CTRL["n1"] = N_CTRL["n2"] = True
-    _on.append("N1 LIVE, N2 LIVE" + (" (BTC-hedged)" if N2X["hedge"] else ""))
+    _on.append("N1 LIVE, N2 LIVE (Zone Sweep 15m)")
     _on.append("T-series = SIGNAL ONLY (paper)" if T_MODE_DEFAULT != "live" else "T-series LIVE")
     if FU_CTRL["on"]:
         _on.append("Follow Up alerts")
@@ -10977,6 +11465,10 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[STARTUP N2 LOAD] {e}")
     try:
+        n2z_load()
+    except Exception as e:
+        print(f"[STARTUP N2Z LOAD] {e}")
+    try:
         paper_load()
     except Exception as e:
         print(f"[STARTUP PAPER LOAD] {e}")
@@ -10998,6 +11490,7 @@ if __name__ == "__main__":
     try:
         n_startup_verify()
         n2x_startup_verify()
+        n2z_startup_verify()
     except Exception as e:
         print(f"[STARTUP N VERIFY] {e}")
 
@@ -11024,7 +11517,8 @@ if __name__ == "__main__":
     # 2026-10-11 N-series build
     Thread(target=n_scan_loop,              daemon=True).start()   # N1 12h / N2 1d signal scans
     Thread(target=n_manage_loop,            daemon=True).start()   # N1/N2 fills, 50% at 1R, trailing, time stop
-    Thread(target=n2x_loop,                 daemon=True).start()   # N2 daily extreme-mover shorts + BTC hedge
+    Thread(target=n2x_loop,                 daemon=True).start()   # old N2: closes out existing shorts only
+    Thread(target=n2z_loop,                 daemon=True).start()   # N2 = Zone Sweep (Pine 1 logic), 15m
     Thread(target=paper_loop,               daemon=True).start()   # T-series paper fills / exits
     Thread(target=fu_loop,                  daemon=True).start()   # Follow Up break alerts
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

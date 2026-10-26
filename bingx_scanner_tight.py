@@ -802,8 +802,8 @@ def place_sl_order(symbol, close_side, pos_side, sl_price, qty):
     url = BASE_URL + "/openApi/swap/v2/trade/order"
     params = build_signed_params({
         "symbol": symbol, "side": close_side, "positionSide": pos_side,
-        "type": "STOP_MARKET", "stopPrice": round(sl_price, 6), "quantity": qty,
-        "workingType": "MARK_PRICE",
+        "type": "STOP_MARKET", "stopPrice": px_round(symbol, sl_price), "quantity": qty,
+        "workingType": "CONTRACT_PRICE",   # 2026-10-25: was MARK_PRICE - mark lags last price on thin pumping coins, stop fired late -> loss far beyond 1R
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     print(f"[SL] {symbol}: {r}")
@@ -814,8 +814,8 @@ def place_tp_order(symbol, close_side, pos_side, tp_price, qty):
     url = BASE_URL + "/openApi/swap/v2/trade/order"
     params = build_signed_params({
         "symbol": symbol, "side": close_side, "positionSide": pos_side,
-        "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp_price, 6), "quantity": qty,
-        "workingType": "MARK_PRICE",
+        "type": "TAKE_PROFIT_MARKET", "stopPrice": px_round(symbol, tp_price), "quantity": qty,
+        "workingType": "CONTRACT_PRICE",
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
     oid = r.get("data", {}).get("order", {}).get("orderId", "N/A")
@@ -833,7 +833,7 @@ def place_tp_limit_order(symbol, close_side, pos_side, tp_price, qty):
     url = BASE_URL + "/openApi/swap/v2/trade/order"
     params = build_signed_params({
         "symbol": symbol, "side": close_side, "positionSide": pos_side,
-        "type": "LIMIT", "price": round(tp_price, 6), "quantity": qty,
+        "type": "LIMIT", "price": px_round(symbol, tp_price), "quantity": qty,
         "timeInForce": "GTC",
     })
     r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
@@ -3107,7 +3107,7 @@ def place_t3_limit(symbol, side, entry, sl, tp):
         url = BASE_URL + "/openApi/swap/v2/trade/order"
         params = build_signed_params({
             "symbol": symbol, "side": order_side, "positionSide": pos_side,
-            "type": "LIMIT", "price": round(entry, 6), "quantity": qty,
+            "type": "LIMIT", "price": px_round(symbol, entry), "quantity": qty,
             "timeInForce": "GTC",
         })
         r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
@@ -7262,7 +7262,7 @@ def place_rev_limit(symbol, side, entry, sl, tp, eng):
         url = BASE_URL + "/openApi/swap/v2/trade/order"
         params = build_signed_params({
             "symbol": symbol, "side": side, "positionSide": pos_side,
-            "type": "LIMIT", "price": round(entry, 6), "quantity": qty,
+            "type": "LIMIT", "price": px_round(symbol, entry), "quantity": qty,
             "timeInForce": "GTC",
         })
         r = requests.post(url, params=params, headers={"X-BX-APIKEY": API_KEY}, timeout=10).json()
@@ -10204,6 +10204,9 @@ N2Z = {
     "short_move": 0.11, "long_move": 0.06, "lb": 48, "s_depth": 0.7, "l_depth": 0.5,
     "l_body": 1.5, "l_vol": 1.5, "min_atr_pct": 0.01, "sl_atr": 2.0, "tp_r": 2.0, "hold_bars": 32,
     "late_s": int(os.environ.get("N2Z_LATE_SECONDS", 600)),
+    "min_qv7": float(os.environ.get("N2Z_MIN_QV7", 1e6)),        # 2026-10-25: 7-day AVERAGE daily volume, same as the backtest (live used 24h volume -> thin pumping coins got in)
+    "min_age_short": int(os.environ.get("N2Z_MIN_AGE_DAYS", 14)), # 2026-10-25: no SHORT on a coin listed < 14 days
+    "guard_r": float(os.environ.get("N2Z_GUARD_R", 1.3)),         # 2026-10-25: close at market if a trade is losing more than this many R
     "open": {}, "cool": {}, "done_bars": [], "last_note": "",
 }
 N2Z_LOCK = _threading.RLock()
@@ -10397,6 +10400,27 @@ def _n2z_lev(stop_pct, sym):
     return max(1, min(lev, cap))
 
 
+def _n2z_quality(sym, side):
+    """2026-10-25 fix. Returns a skip reason or None.
+    Liquidity = average daily quote volume of the last 7 COMPLETE days (backtest rule),
+    and SHORTS need >= 14 days of listing history."""
+    try:
+        ds = get_candles(sym, limit=30, interval="1d") or []
+        ds = sorted([c for c in ds if _bar_ms(c)], key=_bar_ms)
+    except Exception as e:
+        return f"daily candles failed ({e})"
+    if len(ds) < 2:
+        return "no daily history"
+    full = ds[:-1]                       # drop today's unfinished day
+    if side == "SHORT" and len(full) < N2Z["min_age_short"]:
+        return f"new listing ({len(full)} days old, need {N2Z['min_age_short']})"
+    last7 = full[-7:]
+    qv7 = sum(cl(c) * v(c) for c in last7) / 7.0
+    if qv7 < N2Z["min_qv7"]:
+        return f"thin coin (7d avg volume ${qv7 / 1e6:.2f}M < ${N2Z['min_qv7'] / 1e6:.1f}M)"
+    return None
+
+
 def _n2z_candidates(tick):
     out = []
     for sym, t in tick.items():
@@ -10513,7 +10537,8 @@ def n2z_finalize(sym, t, reason, pos=None):
         r = pnl / max(N2Z["risk"], 1e-9)
         emoji = "✅" if pnl > 0.1 else ("❌" if pnl < -0.1 else "➖")
         how = {"tp": "TP (2R) লেগেছে", "sl": "SL লেগেছে", "time": "৮ ঘণ্টা শেষ, market-এ বন্ধ",
-               "gone": "BingX-এ position বন্ধ পাওয়া গেছে"}.get(reason, reason)
+               "gone": "BingX-এ position বন্ধ পাওয়া গেছে",
+               "guard": "লস-গার্ড: ১.৩R পেরিয়েছিল, market-এ বন্ধ"}.get(reason, reason)
         hrs = (time.time() - t["open_ts"]) / 3600.0
         send_journal(f"{emoji} N2 · {sym} · {t['side']}{' A+' if t.get('aplus') else ''}\n"
                      f"Entry {px_round(sym, t['entry'])} → Exit {px_round(sym, exit_px)}\n{how}\n"
@@ -10551,6 +10576,17 @@ def n2z_manage():
                 n2z_finalize(sym, t, "gone", pos)
             continue
         t["gone"] = 0
+        try:
+            px = get_current_price(sym)
+            if px and t.get("R"):
+                d = 1 if t["side"] == "LONG" else -1
+                loss_r = -d * (px - t["entry"]) / t["R"]
+                if loss_r >= N2Z["guard_r"]:
+                    print(f"[N2 GUARD] {sym} losing {loss_r:.2f}R at {px} - closing at market")
+                    n2z_finalize(sym, t, "guard", pos)
+                    continue
+        except Exception as e:
+            print(f"[N2 GUARD {sym}] {e}")
         if not t.get("tp_id") and t.get("tp_tries", 0) < 5:
             t["tp_tries"] = t.get("tp_tries", 0) + 1
             cs = "SELL" if t["side"] == "LONG" else "BUY"
@@ -10603,6 +10639,8 @@ def n2z_scan(bar_ts):
             busy = (all_open_symbols() - set(N2Z["open"].keys())) | {sy for (sy, _p) in pos.keys()}
             if sym in busy:
                 why = "coin already used by another engine"
+        if not why:
+            why = _n2z_quality(sym, side)
         if why:
             ap = n2z_aplus(sym, bar_ts, level, atr)
             _n2z_msg_signal(sym, side, px, sl0, tp0, qty, ap, r24, why)

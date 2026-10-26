@@ -10198,11 +10198,15 @@ N2X["max_concurrent"] = 0      # old N2: no new entries, existing positions keep
 N2Z = {
     "tag": "n2z", "name": "N2",
     "risk": float(os.environ.get("N2Z_RISK_USD", 6)),
-    "max_concurrent": int(os.environ.get("N2Z_MAX_OPEN", 5)),
+    "max_concurrent": int(os.environ.get("N2Z_MAX_OPEN", 16)),   # 2026-10-27 bench config: 16
     "max_lev": int(os.environ.get("N2Z_MAX_LEV", 20)),
-    "min_qv24": float(os.environ.get("N2Z_MIN_QV24", 1e6)),
-    "short_move": 0.11, "long_move": 0.06, "lb": 48, "s_depth": 0.7, "l_depth": 0.5,
-    "l_body": 1.5, "l_vol": 1.5, "min_atr_pct": 0.01, "sl_atr": 2.0, "tp_r": 2.0, "hold_bars": 32,
+    "min_qv24": float(os.environ.get("N2Z_MIN_QV24", 3e5)),     # ticker pre-filter only (speed); the real liquidity rule is min_qv7
+    "short_move": 0.11, "long_move": 0.11, "lb": 48, "s_depth": 0.7, "l_depth": 0.7,   # 2026-10-26: long = tested cell (-11% / 0.7 ATR / body 1x / vol 1.5x), was -6% / 0.5 / 1.5x
+    "l_body": 1.0, "l_vol": 1.5, "min_atr_pct": 0.0125, "sl_atr": 3.5, "tp_r": 2.0, "hold_bars": 48,
+    # 2026-10-27 FROZEN-BENCH CONFIG (tested on Binance Aug25-Jul26, BingX Dec25-Jul26, BingX Aug-Oct26, Bull Feb24-Jul25):
+    "dump_move": 0.20, "dump_lb": 8, "dump_depth": 0.3,          # S2 dump-sweep short: 24h <= -20%, sweep of last 2h high by 0.3 ATR
+    "ext_bars": 144, "ext_thr": 0.5, "ext_lock": 0.25,           # at 12h: if >= +0.5R keep up to 36h with stop at +0.25R, else close
+    "crash_dd": 0.08, "crash_days": 14,                          # no SHORTS if BTC was >8% below its 30d high at any time in the last 14 days
     "late_s": int(os.environ.get("N2Z_LATE_SECONDS", 600)),
     "min_qv7": float(os.environ.get("N2Z_MIN_QV7", 1e6)),        # 2026-10-25: 7-day AVERAGE daily volume, same as the backtest (live used 24h volume -> thin pumping coins got in)
     "min_age_short": int(os.environ.get("N2Z_MIN_AGE_DAYS", 14)), # 2026-10-25: no SHORT on a coin listed < 14 days
@@ -10271,9 +10275,17 @@ def n2z_signal(O, H, L, C, Q, i):
     vma = sum(Q[i - 20:i]) / 20.0
     if atr / C[i] < N2Z["min_atr_pct"]:
         return None
+    w0 = max(0, i - 671)
+    if i + 1 - w0 < 96 or sum(Q[w0:i + 1]) / 7.0 < N2Z["min_qv7"]:   # = backtest rolling(672, min 96).sum()/7
+        return None
     if (r24 >= N2Z["short_move"] and C[i] < O[i] and body >= ab
             and H[i] >= hi12 + N2Z["s_depth"] * atr and C[i] < hi12):
         return ("SHORT", atr, hi12, r24)
+    db = N2Z["dump_lb"]
+    hi2 = max(H[i - db:i])
+    if (r24 <= -N2Z["dump_move"] and C[i] < O[i] and body >= ab
+            and H[i] >= hi2 + N2Z["dump_depth"] * atr and C[i] < hi2):
+        return ("SHORT", atr, hi2, r24)
     if (r24 <= -N2Z["long_move"] and C[i] > O[i] and body >= N2Z["l_body"] * ab
             and Q[i] >= N2Z["l_vol"] * vma and L[i] <= lo12 - N2Z["l_depth"] * atr and C[i] > lo12):
         return ("LONG", atr, lo12, r24)
@@ -10400,6 +10412,53 @@ def _n2z_lev(stop_pct, sym):
     return max(1, min(lev, cap))
 
 
+N2Z_CRASH = {"bar": None, "mdd": None, "ok": None}
+
+
+def n2z_crash_state(bar_ts):
+    """2026-10-27. Same maths as the backtest: dd = BTC close / max(high of last 2880 15m bars) - 1,
+    mdd = min(dd over the last 14 days of 15m bars). Shorts blocked when mdd < -8%.
+    Returns (shorts_allowed, mdd). On data failure shorts are BLOCKED (fail safe)."""
+    if N2Z_CRASH["bar"] == bar_ts and N2Z_CRASH["ok"] is not None:
+        return N2Z_CRASH["ok"], N2Z_CRASH["mdd"]
+    try:
+        need = 2880 + N2Z["crash_days"] * 96 + 50
+        rows, end = {}, None
+        for _ in range(5):
+            cs = get_candles("BTC-USDT", limit=1440, interval="15m", end_time=end) or []
+            cs = [c for c in cs if _bar_ms(c) and _bar_ms(c) % N2Z_BAR == 0]
+            if not cs:
+                break
+            for c in cs:
+                rows[_bar_ms(c)] = (h(c), cl(c))
+            oldest = min(_bar_ms(c) for c in cs)
+            if len(rows) >= need:
+                break
+            end = oldest - 1
+        ts = sorted(t for t in rows if t <= bar_ts)
+        if len(ts) < 300:
+            raise ValueError(f"only {len(ts)} BTC bars")
+        Hs = [rows[t][0] for t in ts]; Cs = [rows[t][1] for t in ts]
+        n = len(ts); W = 2880; M = N2Z["crash_days"] * 96
+        dq = deque(); dd = []
+        for k in range(n):
+            while dq and Hs[dq[-1]] <= Hs[k]:
+                dq.pop()
+            dq.append(k)
+            if dq[0] <= k - W:
+                dq.popleft()
+            dd.append(Cs[k] / Hs[dq[0]] - 1 if k + 1 >= 200 else None)
+        recent = [x for x in dd[-M:] if x is not None]
+        mdd = min(recent) if len(recent) >= 96 else 0.0
+        ok = mdd >= -N2Z["crash_dd"]
+        N2Z_CRASH.update({"bar": bar_ts, "mdd": mdd, "ok": ok})
+        return ok, mdd
+    except Exception as e:
+        print(f"[N2 CRASH GATE] {e} - shorts blocked this bar")
+        N2Z_CRASH.update({"bar": bar_ts, "mdd": None, "ok": False})
+        return False, None
+
+
 def _n2z_quality(sym, side):
     """2026-10-25 fix. Returns a skip reason or None.
     Liquidity = average daily quote volume of the last 7 COMPLETE days (backtest rule),
@@ -10500,7 +10559,7 @@ def n2z_open(sym, sig, bar_ts):
     print(f"[N2] OPEN {sym} {side} {qty} @ {fill} SL {sl} TP {tp} lev {lev} A+={ap}")
     send_tg(f"✅ N2 {sym} {side}{' A+' if ap else ''} FILLED\n"
             f"Entry {px_round(sym, fill)} | SL {px_round(sym, sl)} | TP {px_round(sym, tp)} (2R)\n"
-            f"Risk ${N2Z['risk']:.0f} | {lev}x | margin ${qty * fill / lev:.2f} | 24h {r24 * 100:+.0f}% | max 8h"
+            f"Risk ${N2Z['risk']:.0f} | {lev}x | margin ${qty * fill / lev:.2f} | 24h {r24 * 100:+.0f}% | max 12h (36h if >= +0.5R)"
             + ("" if tp_id else "\n⚠️ TP order not accepted yet - bot will retry"))
     return "opened"
 
@@ -10536,7 +10595,7 @@ def n2z_finalize(sym, t, reason, pos=None):
             pnl = d * (exit_px - t["entry"]) * t["qty"] - 0.0011 * t["entry"] * t["qty"]
         r = pnl / max(N2Z["risk"], 1e-9)
         emoji = "✅" if pnl > 0.1 else ("❌" if pnl < -0.1 else "➖")
-        how = {"tp": "TP (2R) লেগেছে", "sl": "SL লেগেছে", "time": "৮ ঘণ্টা শেষ, market-এ বন্ধ",
+        how = {"tp": "TP (2R) লেগেছে", "sl": "SL লেগেছে", "time": "সময় শেষ (১২/৩৬ ঘণ্টা), market-এ বন্ধ",
                "gone": "BingX-এ position বন্ধ পাওয়া গেছে",
                "guard": "লস-গার্ড: ১.৩R পেরিয়েছিল, market-এ বন্ধ"}.get(reason, reason)
         hrs = (time.time() - t["open_ts"]) / 3600.0
@@ -10568,6 +10627,30 @@ def n2z_manage():
     now = time.time()
     for sym, t in list(N2Z["open"].items()):
         if now >= t["exit_due"]:
+            if not t.get("ext") and pos.get((sym, t["side"]), 0) > 0:
+                try:
+                    px = get_current_price(sym)
+                    d = 1 if t["side"] == "LONG" else -1
+                    cur = d * (px - t["entry"]) / t["R"] if px and t.get("R") else -9
+                except Exception:
+                    cur = -9
+                if cur >= N2Z["ext_thr"]:
+                    cs = "SELL" if d == 1 else "BUY"
+                    new_sl = t["entry"] + d * N2Z["ext_lock"] * t["R"]
+                    if t.get("sl_id"):
+                        try:
+                            cancel_order(sym, t["sl_id"])
+                        except Exception:
+                            pass
+                    sid = place_sl_guarded(sym, cs, t["side"], px_round(sym, new_sl), t["qty"])
+                    if sid is None:
+                        n2z_finalize(sym, t, "time", pos)
+                        continue
+                    t.update({"ext": True, "sl_id": sid, "sl": new_sl,
+                              "exit_due": (t["bar_ts"] + (N2Z["ext_bars"] + 1) * N2Z_BAR) / 1000.0})
+                    n2z_save()
+                    send_tg(f"⏩ N2 {sym} {t['side']}: +{cur:.2f}R at 12h - kept open up to 36h, stop moved to +{N2Z['ext_lock']}R")
+                    continue
             n2z_finalize(sym, t, "time", pos)
             continue
         if pos.get((sym, t["side"]), 0) <= 0:
@@ -10607,7 +10690,7 @@ def n2z_scan(bar_ts):
         while api_backoff_active():
             time.sleep(20)
         try:
-            bars = _n2z_bars(sym, 200)
+            bars = _n2z_bars(sym, 700)
             if not bars or bars[-1]["time"] != bar_ts:
                 continue
             T, O, H, L, C, Q = _bars_arrays(bars)
@@ -10639,8 +10722,11 @@ def n2z_scan(bar_ts):
             busy = (all_open_symbols() - set(N2Z["open"].keys())) | {sy for (sy, _p) in pos.keys()}
             if sym in busy:
                 why = "coin already used by another engine"
-        if not why:
-            why = _n2z_quality(sym, side)
+        if not why and side == "SHORT":
+            ok_sh, mdd = n2z_crash_state(bar_ts)
+            if not ok_sh:
+                why = ("crash filter: BTC " + (f"{mdd * 100:.1f}%" if mdd is not None else "data n/a")
+                       + " below its 30d high within 14d - no shorts")
         if why:
             ap = n2z_aplus(sym, bar_ts, level, atr)
             _n2z_msg_signal(sym, side, px, sl0, tp0, qty, ap, r24, why)
@@ -10696,8 +10782,11 @@ def n2z_startup_verify():
 def n2z_status_lines():
     on = "ON" if N_CTRL.get("n2") else "OFF - send /start"
     opens = ", ".join(f"{s} {t['side']}{' A+' if t.get('aplus') else ''}" for s, t in N2Z["open"].items()) or "none"
-    L = [f"N2 (Zone Sweep 15m, long+short): {on} | risk ${N2Z['risk']:.0f} | open {len(N2Z['open'])}/{N2Z['max_concurrent']}\n"
-         f"  open: {opens}\n  last scan: {N2Z.get('last_note') or 'not yet'}"]
+    L = [f"N2 (Zone Sweep 15m, SL 3.5ATR, 12h/36h): {on} | risk ${N2Z['risk']:.0f} | open {len(N2Z['open'])}/{N2Z['max_concurrent']}\n"
+         f"  open: {opens}\n  last scan: {N2Z.get('last_note') or 'not yet'}\n"
+         f"  crash filter: " + ("not checked yet" if N2Z_CRASH["ok"] is None else
+                               ("shorts ALLOWED" if N2Z_CRASH["ok"] else "shorts BLOCKED")
+                               + (f" (BTC 14d worst {N2Z_CRASH['mdd'] * 100:.1f}% from 30d high)" if N2Z_CRASH["mdd"] is not None else ""))]
     if N2X["open"]:
         L.append("N2-old (extreme-mover, closing out only): " +
                  ", ".join(f"{s} (exit {datetime.fromtimestamp(t['exit_due'], timezone.utc).strftime('%m-%d')})"

@@ -11746,12 +11746,15 @@ def all_open_symbols():
 #   } catch (e) { return Response.json({ error: String(e) }, { status: 502 }); }
 # });
 # ------------------------------------------------
-N3_BN_FN = os.environ.get("N3_BINANCE_FN", "binance-n3")
-_N3_ROUTE = {"mode": None, "region": None, "ts": 0.0, "err": ""}
+# 2026-10-29: the function was deployed in Supabase as "rapid-responder" (Supabase picked
+# the name). The bot tries both names, no Render setting needed.
+N3_BN_FNS = [f for f in dict.fromkeys([os.environ.get("N3_BINANCE_FN", ""), "rapid-responder", "binance-n3"]) if f]
+N3_BN_FN = N3_BN_FNS[0]
+_N3_ROUTE = {"mode": None, "region": None, "fn": None, "ts": 0.0, "err": ""}
 
 
-def _n3_fn_call(params, region):
-    url = SUPABASE_URL + "/functions/v1/" + N3_BN_FN
+def _n3_fn_call(params, region, fn=None):
+    url = SUPABASE_URL + "/functions/v1/" + (fn or _N3_ROUTE.get("fn") or N3_BN_FN)
     hd = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": "Bearer " + SUPABASE_SERVICE_KEY, "x-region": region}
     r = requests.get(url, params=params, headers=hd, timeout=20)
     if r.status_code != 200:
@@ -11785,16 +11788,19 @@ def _n3_pick_route():
     except Exception as e:
         errs.append(f"direct: {str(e)[:50]}")
     if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-        for reg in S1_REGIONS:
-            try:
-                j = _n3_fn_call({"op": "symbols"}, reg)
-                if j.get("symbols"):
-                    _N3_ROUTE.update(mode="fn", region=reg, ts=time.time(), err="")
-                    print(f"[N3 ROUTE] Binance via Supabase {reg}")
-                    return
-                errs.append(f"{reg}: {str(j)[:50]}")
-            except Exception as e:
-                errs.append(f"{reg}: {str(e)[:50]}")
+        for fn in N3_BN_FNS:
+            for reg in S1_REGIONS:
+                try:
+                    j = _n3_fn_call({"op": "symbols"}, reg, fn)
+                    if j.get("symbols"):
+                        _N3_ROUTE.update(mode="fn", region=reg, fn=fn, ts=time.time(), err="")
+                        print(f"[N3 ROUTE] Binance via Supabase {fn} {reg}")
+                        return
+                    errs.append(f"{fn} {reg}: {str(j)[:50]}")
+                except Exception as e:
+                    errs.append(f"{fn} {reg}: {str(e)[:50]}")
+                    if "404" in str(e):
+                        break                              # this name does not exist - next name
     else:
         errs.append("SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
     _N3_ROUTE.update(mode=None, region=None, ts=time.time(), err="; ".join(errs)[:300])
@@ -11820,7 +11826,7 @@ def n3_route_text():
     if _N3_ROUTE["mode"] == "direct":
         return "Binance OK (direct)"
     if _N3_ROUTE["mode"] == "fn":
-        return f"Binance OK (via Supabase {_N3_ROUTE['region']})"
+        return f"Binance OK (via Supabase {_N3_ROUTE.get('fn')} {_N3_ROUTE['region']})"
     if not _N3_ROUTE["ts"]:
         return "Binance not checked yet"
     return "Binance NOT REACHABLE - N3 cannot check the thin-coin rule and will NOT trade (" + _N3_ROUTE["err"] + ")"
@@ -12172,6 +12178,11 @@ def n3_startup_verify():
 
 
 def n3_status_lines():
+    if _N3_ROUTE["mode"] is None:
+        try:
+            _n3_pick_route()                               # /n3 always shows a fresh check
+        except Exception as e:
+            print(f"[N3 ROUTE] {e}")
     on = "ON" if N3["on"] else "OFF - send /n3_start"
     opens = ", ".join(f"{s} (exit {datetime.fromtimestamp(t['exit_due'], timezone.utc).strftime('%m-%d %H:%M')})"
                       for s, t in N3["open"].items()) or "none"

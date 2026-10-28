@@ -9999,6 +9999,7 @@ def n2x_open(sym, day_ts):
     if sl_id is None:
         place_market_order(sym, "BUY", qty, "SHORT")
         send_tg(f"⚠️ N2 {sym}: stop could not be placed - short closed at market (no naked risk).")
+        send_journal(f"➖ N2 · {sym} · SHORT\nstop বসানো যায়নি, তাই সাথে সাথে market-এ বন্ধ (naked risk নেই)\nNiti Journal")
         return False
     hq, hfill, hid = 0.0, 0.0, None
     if N2X["hedge"]:
@@ -10544,6 +10545,7 @@ def n2z_open(sym, sig, bar_ts):
     if sl_id is None:
         place_market_order(sym, close_side, qty, side)
         send_tg(f"⚠️ N2 {sym}: stop could not be placed - position closed at market (no naked risk).")
+        send_journal(f"➖ N2 · {sym} · {side}\nstop বসানো যায়নি, তাই সাথে সাথে market-এ বন্ধ (naked risk নেই)\nNiti Journal")
         return "no stop"
     tp_id = place_tp_order(sym, close_side, side, px_round(sym, tp), qty)
     if not tp_id or tp_id == "N/A":
@@ -11581,6 +11583,663 @@ def slotmap_startup_report():
         print(f"[STARTUP REPORT] {e}")
 
 
+# ============================================================================
+# 2026-10-29 JOURNAL FIX
+# Problem: a closed trade's journal message could vanish while the short "closed" line
+# still reached the bot chat. send_journal() dropped the message silently when
+# TG_JOURNAL_CHAT_ID was empty, and a Telegram reject (wrong chat id / bot not admin)
+# was only printed to the console. The startup report never checked the journal channel.
+# Fix: every journal message is checked; if it cannot be delivered the bot chat gets a
+# warning + the full journal text (marked), so no closed trade is ever lost.
+# ============================================================================
+_JRNL_WARN = {"ts": 0.0}
+
+
+def send_journal(msg):
+    ok = False
+    if TG_JOURNAL_ID:
+        try:
+            ok = send_tg(msg, chat_id=TG_JOURNAL_ID)
+        except Exception as e:
+            print(f"[JOURNAL SEND] {e}")
+            ok = False
+    if ok:
+        return True
+    why = ("TG_JOURNAL_CHAT_ID is not set on Render" if not TG_JOURNAL_ID else
+           "the journal channel rejected the message (check TG_JOURNAL_CHAT_ID and that the bot is admin)")
+    now = time.time()
+    head = ""
+    if now - _JRNL_WARN["ts"] > 3600:
+        _JRNL_WARN["ts"] = now
+        head = f"⚠️ JOURNAL NOT DELIVERED: {why}.\n"
+    try:
+        send_tg(head + "📒 (journal copy)\n" + str(msg))
+    except Exception as e:
+        print(f"[JOURNAL FALLBACK] {e}")
+    print(f"[JOURNAL NOT DELIVERED] {why}: {str(msg)[:160]}")
+    return False
+
+
+_orig_startup_channels_report = startup_channels_report
+
+
+def startup_channels_report():
+    _orig_startup_channels_report()
+    try:
+        if TG_JOURNAL_ID:
+            ok = send_tg("📒 Niti Journal connected - every closed N1/N2/N3 trade will appear here.",
+                         chat_id=TG_JOURNAL_ID)
+            if not ok:
+                send_tg("⚠️ Niti Journal channel not reachable - check TG_JOURNAL_CHAT_ID and that the bot is admin.\n"
+                        "Until fixed, journal entries are copied to this chat.")
+        else:
+            send_tg("⚠️ TG_JOURNAL_CHAT_ID is not set - journal entries will be copied to this chat.")
+    except Exception as e:
+        print(f"[STARTUP JOURNAL CHECK] {e}")
+    try:
+        _n3_pick_route()
+        if _N3_ROUTE["mode"] is None:
+            send_tg("⚠️ N3: " + n3_route_text() +
+                    "\nDeploy the Supabase Edge Function 'binance-n3' (code is in the bot file, N3 section).")
+    except Exception as e:
+        print(f"[STARTUP N3 ROUTE] {e}")
+
+
+# ============================================================================
+# N3 = THIN-COIN FAKE-SPIKE SHORT (live, real orders)                2026-10-29
+# Spec = memory /areas/n3-thin-spike-short.md, exactly as backtested:
+#   universe : BingX USDT perps, no NC* tokenized, no BTC; BingX 24h quote volume >= $1M
+#   thin     : Binance futures 7-day avg daily quote volume <= $30M (measured on the 168
+#              hourly bars that end 4 bars before the signal bar; coin not on Binance = 0;
+#              listed on Binance with < 100 such bars -> skipped, as in the backtest)
+#   signal   : on each CLOSED 1h bar: 4h return >= +12% AND last 1h bar >= +12% AND the
+#              median 24h return of liquid alts >= -0.86%
+#   entry    : SHORT at market right after the bar closes (= next 1h open)
+#   exit     : stop +50% from entry, no TP, market close 48h after the entry open
+#   size     : $50 notional (N3_NOTIONAL), 1x leverage by default (a +50% stop needs
+#              <= 1x isolated or the position liquidates before the stop), cap 10
+#   rules    : one signal per coin per 24h; skip a coin N2 (or any engine) holds
+# Backtest cap10 $50: BingX Nov25-Jul26 3.8/wk 75% +$8.05/wk | BingX Jul29-Oct4 2026
+# 18.0/wk 71% +$41.98/wk | Binance bull 23H2-24 2.1/wk 71% | 2025 10.1/wk 71% | 2026 16.5/wk 68%
+# ============================================================================
+N3 = {
+    "tag": "n3", "name": "N3",
+    "on": AUTO_RESUME_ON_START,
+    "notional": float(os.environ.get("N3_NOTIONAL", 50)),
+    "lev": int(os.environ.get("N3_LEV", 1)),
+    "max_concurrent": int(os.environ.get("N3_MAX_OPEN", 10)),
+    "r4": 0.12, "r1": 0.12, "med24_min": -0.0086,
+    "min_q24": 1e6, "max_bn_q7": 3e7, "bn_min_bars": 100,
+    "stop_pct": 0.50, "hold_h": 48, "cool_s": 86400,
+    "late_s": int(os.environ.get("N3_LATE_SECONDS", 600)),
+    "open": {}, "cool": {}, "done_bars": [], "last_note": "",
+}
+N3_LOCK = _threading.RLock()
+N3_BAR = 3600000
+BINANCE_FAPI_N3 = "https://fapi.binance.com"
+
+# BingX name -> Binance futures name, for coins whose names differ (price-matched in the backtest)
+N3_BN_ALIAS = {
+    "1000000BABYDOGE-USDT": "1MBABYDOGEUSDT", "10000SATS-USDT": "1000SATSUSDT", "BEAM-USDT": "BEAMXUSDT",
+    "BITLIGHT-USDT": "LIGHTUSDT", "BROCCOLI-USDT": "BROCCOLI714USDT", "CITREA-USDT": "CTRUSDT",
+    "DATANETWORK-USDT": "DATAIPUSDT", "EDGEX-USDT": "EDGEUSDT", "FIGHTID-USDT": "FIGHTUSDT",
+    "FLOKI-USDT": "1000FLOKIUSDT", "GENSYN-USDT": "AIGENSYNUSDT", "GRAMTON-USDT": "GRAMUSDT",
+    "HYPERLANE-USDT": "HYPERUSDT", "LIGHTER-USDT": "LITUSDT", "LUNA-USDT": "LUNA2USDT",
+    "LUNC-USDT": "1000LUNCUSDT", "METEORA-USDT": "METUSDT", "MIRANETWORK-USDT": "MIRAUSDT",
+    "MONAD-USDT": "MONUSDT", "NEIROCTO-USDT": "NEIROUSDT", "NOMINA-USDT": "NOMUSDT",
+    "OPENEDEN-USDT": "EDENUSDT", "OPENLEDGER-USDT": "OPENUSDT", "PLAYSOUT-USDT": "PLAYUSDT",
+    "RATS-USDT": "1000RATSUSDT", "REDSTONE-USDT": "REDUSDT", "RON-USDT": "RONINUSDT",
+    "SPACECOIN-USDT": "SPACEUSDT", "TRUMPSOL-USDT": "TRUMPUSDT",
+}
+_N3_BN = {"ts": 0.0, "syms": set()}
+
+
+def n3_save():
+    with N3_LOCK:
+        st = {"open": N3["open"], "cool": N3["cool"], "done_bars": N3["done_bars"][-200:], "on": N3["on"]}
+    state_put("n3_books", st)
+
+
+def n3_load():
+    b = state_get("n3_books", {}) or {}
+    with N3_LOCK:
+        N3["open"] = dict(b.get("open") or {})
+        N3["cool"] = dict(b.get("cool") or {})
+        N3["done_bars"] = list(b.get("done_bars") or [])
+    print(f"[N3] state loaded: open {len(N3['open'])}")
+
+
+_prev3_all_open_symbols = all_open_symbols
+
+
+def all_open_symbols():
+    s = set(_prev3_all_open_symbols())
+    try:
+        s |= set(N3["open"].keys())
+    except Exception:
+        pass
+    return s
+
+
+# Binance blocks Render's IP (same reason T3 uses Supabase). N3 tries Binance directly
+# first; if that is blocked it goes through the Supabase Edge Function "binance-n3"
+# (code in the comment below, deploy once), trying the same regions as T3.
+#
+# ---- supabase/functions/binance-n3/index.ts ----
+# Deno.serve(async (req) => {
+#   const u = new URL(req.url); const op = u.searchParams.get("op");
+#   const B = "https://fapi.binance.com";
+#   try {
+#     if (op === "symbols") {
+#       const j = await (await fetch(B + "/fapi/v1/exchangeInfo")).json();
+#       const s = (j.symbols || []).filter((x: any) => x.quoteAsset === "USDT" &&
+#                  x.contractType === "PERPETUAL").map((x: any) => x.symbol);
+#       return Response.json({ symbols: s });
+#     }
+#     if (op === "klines") {
+#       const q = new URLSearchParams({ symbol: u.searchParams.get("symbol") || "", interval: "1h",
+#                  limit: u.searchParams.get("limit") || "200", endTime: u.searchParams.get("endTime") || "" });
+#       const r = await fetch(B + "/fapi/v1/klines?" + q);
+#       return new Response(await r.text(), { status: r.status, headers: { "content-type": "application/json" } });
+#     }
+#     return Response.json({ error: "bad op" }, { status: 400 });
+#   } catch (e) { return Response.json({ error: String(e) }, { status: 502 }); }
+# });
+# ------------------------------------------------
+N3_BN_FN = os.environ.get("N3_BINANCE_FN", "binance-n3")
+_N3_ROUTE = {"mode": None, "region": None, "ts": 0.0, "err": ""}
+
+
+def _n3_fn_call(params, region):
+    url = SUPABASE_URL + "/functions/v1/" + N3_BN_FN
+    hd = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": "Bearer " + SUPABASE_SERVICE_KEY, "x-region": region}
+    r = requests.get(url, params=params, headers=hd, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} {r.text[:60]}")
+    return r.json()
+
+
+def _n3_direct_call(params):
+    if params["op"] == "symbols":
+        r = requests.get(BINANCE_FAPI_N3 + "/fapi/v1/exchangeInfo", timeout=15)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        j = r.json()
+        return {"symbols": [x.get("symbol") for x in j.get("symbols", []) or []
+                            if x.get("quoteAsset") == "USDT" and x.get("contractType") == "PERPETUAL"]}
+    q = {k: params[k] for k in ("symbol", "limit", "endTime")}
+    q["interval"] = "1h"
+    r = requests.get(BINANCE_FAPI_N3 + "/fapi/v1/klines", params=q, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return r.json()
+
+
+def _n3_pick_route():
+    errs = []
+    try:
+        j = _n3_direct_call({"op": "symbols"})
+        if j.get("symbols"):
+            _N3_ROUTE.update(mode="direct", region=None, ts=time.time(), err="")
+            return
+    except Exception as e:
+        errs.append(f"direct: {str(e)[:50]}")
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        for reg in S1_REGIONS:
+            try:
+                j = _n3_fn_call({"op": "symbols"}, reg)
+                if j.get("symbols"):
+                    _N3_ROUTE.update(mode="fn", region=reg, ts=time.time(), err="")
+                    print(f"[N3 ROUTE] Binance via Supabase {reg}")
+                    return
+                errs.append(f"{reg}: {str(j)[:50]}")
+            except Exception as e:
+                errs.append(f"{reg}: {str(e)[:50]}")
+    else:
+        errs.append("SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
+    _N3_ROUTE.update(mode=None, region=None, ts=time.time(), err="; ".join(errs)[:300])
+    print(f"[N3 ROUTE] Binance NOT reachable: {_N3_ROUTE['err']}")
+
+
+def _n3_bn_get(params):
+    """Binance data for N3 (direct or via Supabase). Raises on failure."""
+    if _N3_ROUTE["mode"] is None and time.time() - _N3_ROUTE["ts"] > 600:
+        _n3_pick_route()
+    if _N3_ROUTE["mode"] == "direct":
+        return _n3_direct_call(params)
+    if _N3_ROUTE["mode"] == "fn":
+        try:
+            return _n3_fn_call(params, _N3_ROUTE["region"])
+        except Exception:
+            _N3_ROUTE.update(mode=None, ts=0.0)
+            raise
+    raise RuntimeError("Binance not reachable (" + (_N3_ROUTE["err"] or "no route") + ")")
+
+
+def n3_route_text():
+    if _N3_ROUTE["mode"] == "direct":
+        return "Binance OK (direct)"
+    if _N3_ROUTE["mode"] == "fn":
+        return f"Binance OK (via Supabase {_N3_ROUTE['region']})"
+    if not _N3_ROUTE["ts"]:
+        return "Binance not checked yet"
+    return "Binance NOT REACHABLE - N3 cannot check the thin-coin rule and will NOT trade (" + _N3_ROUTE["err"] + ")"
+
+
+def _n3_binance_symbols():
+    if time.time() - _N3_BN["ts"] < 12 * 3600 and _N3_BN["syms"]:
+        return _N3_BN["syms"]
+    try:
+        syms = set(_n3_bn_get({"op": "symbols"}).get("symbols") or [])
+        if syms:
+            _N3_BN.update({"ts": time.time(), "syms": syms})
+    except Exception as e:
+        print(f"[N3 BINANCE LIST] {e}")
+    return _N3_BN["syms"]
+
+
+def _n3_bn_symbol(sym):
+    """BingX symbol -> Binance futures symbol, or None if not listed on Binance."""
+    bn = _n3_binance_symbols()
+    if not bn:
+        return "ERR"
+    if sym in N3_BN_ALIAS:
+        a = N3_BN_ALIAS[sym]
+        return a if a in bn else None
+    b = str(sym).upper().split("-")[0]
+    core = b
+    for p in ("1000000", "10000", "1000", "1M"):
+        if core.startswith(p) and len(core) > len(p):
+            core = core[len(p):]
+            break
+    for p in ("", "1000", "1000000", "1M", "10000"):
+        if p + core + "USDT" in bn:
+            return p + core + "USDT"
+    return None
+
+
+def _n3_binance_q7(sym, signal_bar_ms):
+    """7-day average daily Binance quote volume measured exactly like the backtest:
+    mean of the 168 hourly bars ending 4 bars before the signal bar, x24.
+    Returns (value, note). value None = skip (unknown / too little history)."""
+    bsym = _n3_bn_symbol(sym)
+    if bsym == "ERR":
+        return None, "Binance symbol list unavailable"
+    if bsym is None:
+        return 0.0, "not on Binance"
+    try:
+        r = _n3_bn_get({"op": "klines", "symbol": bsym, "limit": 200,
+                        "endTime": int(signal_bar_ms) + N3_BAR - 1})
+        rows = [x for x in (r if isinstance(r, list) else []) if isinstance(x, list) and len(x) > 7]
+    except Exception as e:
+        return None, f"Binance klines failed ({e})"
+    rows = [x for x in rows if int(x[0]) <= int(signal_bar_ms)]
+    end = [x for x in rows if int(x[0]) <= int(signal_bar_ms) - 4 * N3_BAR]
+    win = end[-168:]
+    if len(win) < N3["bn_min_bars"]:
+        return None, f"on Binance ({bsym}) but only {len(win)} h of history"
+    q = sum(float(x[7]) for x in win) / len(win) * 24.0
+    return q, f"Binance {bsym} 7d avg ${q / 1e6:.1f}M"
+
+
+def _n3_med24(tick):
+    vals = []
+    for sym, t in tick.items():
+        try:
+            if not _clean_symbol(sym) or _coin_base(sym) == "BTC":
+                continue
+            if float(t.get("quoteVolume", 0) or 0) < N3["min_q24"]:
+                continue
+            op = float(t.get("openPrice", 0) or 0)
+            last = float(t.get("lastPrice", 0) or 0)
+            if op > 0 and last > 0:
+                vals.append(last / op - 1)
+        except Exception:
+            pass
+    if len(vals) < 20:
+        return None
+    vals.sort()
+    m = len(vals) // 2
+    return vals[m] if len(vals) % 2 else (vals[m - 1] + vals[m]) / 2
+
+
+def _n3_candidates(tick):
+    """Cheap ticker pre-filter. A 4h return >= +12% needs last >= 1.12 x the 24h low,
+    and the backtest's BingX 24h volume rule (>= $1M)."""
+    out = []
+    for sym, t in tick.items():
+        try:
+            if not _clean_symbol(sym) or _coin_base(sym) == "BTC":
+                continue
+            if float(t.get("quoteVolume", 0) or 0) < N3["min_q24"] * 0.8:
+                continue
+            last = float(t.get("lastPrice", 0) or 0)
+            lo = float(t.get("lowPrice", 0) or 0)
+            if last > 0 and (lo <= 0 or last >= lo * (1 + N3["r4"] * 0.9)):
+                out.append(sym)
+        except Exception:
+            pass
+    return sorted(out)
+
+
+def _n3_bars(sym, limit=40):
+    cs = get_candles(sym, limit=limit, interval="1h") or []
+    cs = [c for c in _closed_only(cs, N3_BAR) if _bar_ms(c) % N3_BAR == 0]
+    out = []
+    for c in sorted(cs, key=_bar_ms):
+        try:
+            out.append({"time": _bar_ms(c), "open": o(c), "high": h(c), "low": l(c), "close": cl(c),
+                        "qv": cl(c) * v(c)})
+        except Exception:
+            pass
+    return out
+
+
+def n3_signal(bars, bar_ts):
+    """bars = closed 1h bars, last one must be the signal bar. Returns (r4, r1, q24) or None."""
+    if len(bars) < 25 or bars[-1]["time"] != bar_ts:
+        return None
+    C = [b["close"] for b in bars]
+    if bars[-2]["time"] != bar_ts - N3_BAR or bars[-5]["time"] != bar_ts - 4 * N3_BAR:
+        return None                      # gap in the hourly series -> do not guess
+    r1 = C[-1] / C[-2] - 1
+    r4 = C[-1] / C[-5] - 1
+    q24 = sum(b["qv"] for b in bars[-24:])
+    if r4 >= N3["r4"] and r1 >= N3["r1"] and q24 >= N3["min_q24"]:
+        return r4, r1, q24
+    return None
+
+
+def _n3_msg_signal(sym, px, r4, r1, why):
+    send_tg(f"🔔 N3 SIGNAL (not opened: {why})\n{sym} SHORT ~{px_round(sym, px) if px else '?'}\n"
+            f"4h {r4 * 100:+.0f}% | 1h {r1 * 100:+.0f}% | stop +50% | 48h")
+
+
+def n3_open(sym, sig, bar_ts):
+    r4, r1, q24, bnote = sig
+    px = get_current_price(sym)
+    if not px:
+        return "no price"
+    prec = symbol_precision.get(sym, 4)
+    qty = round(N3["notional"] / px, prec)
+    if qty <= 0:
+        _n3_msg_signal(sym, px, r4, r1, "qty rounds to 0")
+        return "qty0"
+    lev = max(1, min(N3["lev"], int(symbol_max_lev.get(sym, N3["lev"]) or N3["lev"])))
+    need = qty * px / lev
+    avail = get_available_margin()
+    if avail is not None and avail < need * 1.1:
+        _n3_msg_signal(sym, px, r4, r1, f"margin: need ${need:.1f}, free ${avail:.1f}")
+        _st(N3, "skip_margin")
+        return "margin"
+    set_leverage_api(sym, lev)
+    oid = place_market_order(sym, "SELL", qty, "SHORT")
+    if not oid or oid == "N/A":
+        _n3_msg_signal(sym, px, r4, r1, "BingX rejected the market order")
+        return "rejected"
+    time.sleep(1)
+    fill = get_fill_price(oid, sym, 0.0) or px
+    sl = fill * (1 + N3["stop_pct"])
+    sl_id = place_sl_guarded(sym, "BUY", "SHORT", px_round(sym, sl), qty)
+    if sl_id is None:
+        place_market_order(sym, "BUY", qty, "SHORT")
+        send_tg(f"⚠️ N3 {sym}: stop could not be placed - short closed at market (no naked risk).")
+        send_journal(f"➖ N3 · {sym} · SHORT\nEntry {px_round(sym, fill)} → closed at market at once\n"
+                     f"stop বসানো যায়নি, তাই সাথে সাথে বন্ধ (naked risk নেই)\nNiti Journal")
+        return "no stop"
+    t = {"symbol": sym, "side": "SHORT", "qty": qty, "entry": fill, "sl": sl, "sl_id": sl_id,
+         "lev": lev, "open_ts": time.time(), "bar_ts": int(bar_ts),
+         "exit_due": (int(bar_ts) + (N3["hold_h"] + 1) * N3_BAR) / 1000.0,
+         "r4": r4, "r1": r1, "bnote": bnote, "gone": 0}
+    with N3_LOCK:
+        N3["open"][sym] = t
+    _st(N3, "fills")
+    n3_save()
+    print(f"[N3] OPEN {sym} SHORT {qty} @ {fill} SL {sl} lev {lev}")
+    send_tg(f"✅ N3 {sym} SHORT FILLED\n"
+            f"Entry {px_round(sym, fill)} | SL {px_round(sym, sl)} (+50%) | no TP | max 48h\n"
+            f"Notional ${qty * fill:.0f} | {lev}x | margin ${qty * fill / lev:.2f}\n"
+            f"4h {r4 * 100:+.0f}% | 1h {r1 * 100:+.0f}% | {bnote}")
+    return "opened"
+
+
+def n3_finalize(sym, t, reason, pos=None):
+    try:
+        if pos is None:
+            pos = _positions_map() or {}
+        left = pos.get((sym, "SHORT"), 0)
+        if left > 0:
+            place_market_order(sym, "BUY", min(t["qty"], left), "SHORT")
+            time.sleep(1)
+        if t.get("sl_id"):
+            try:
+                cancel_order(sym, t["sl_id"])
+            except Exception:
+                pass
+        exit_px = 0.0
+        if reason == "gone":
+            slf = get_fill_price(t["sl_id"], sym, 0.0) if t.get("sl_id") else 0.0
+            if slf:
+                reason, exit_px = "sl", slf
+        exit_px = exit_px or get_current_price(sym) or t["entry"]
+        pnl = get_income_pnl(sym, t["open_ts"] * 1000 - 120000)
+        est = pnl is None
+        if est:
+            pnl = -(exit_px - t["entry"]) * t["qty"] - 0.0011 * t["entry"] * t["qty"]
+        notional = t["entry"] * t["qty"]
+        emoji = "✅" if pnl > 0.1 else ("❌" if pnl < -0.1 else "➖")
+        how = {"sl": "SL (+50%) লেগেছে", "time": "সময় শেষ (৪৮ ঘণ্টা), market-এ বন্ধ",
+               "gone": "BingX-এ position বন্ধ পাওয়া গেছে"}.get(reason, reason)
+        hrs = (time.time() - t["open_ts"]) / 3600.0
+        send_journal(f"{emoji} N3 · {sym} · SHORT\n"
+                     f"Entry {px_round(sym, t['entry'])} → Exit {px_round(sym, exit_px)}\n{how}\n"
+                     f"PnL {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} on ${notional:.0f} · {hrs:.1f} ঘণ্টা"
+                     + (" (আনুমানিক)" if est else "") + "\nNiti Journal")
+        send_tg(f"{emoji} N3 {sym} SHORT closed {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} ({how})")
+        with N3_LOCK:
+            N3["open"].pop(sym, None)
+            N_CLOSED.append({"tag": "n3", "symbol": sym, "side": "SHORT", "pnl": round(pnl, 2),
+                             "r": round(pnl / max(notional, 1e-9), 4), "open_ts": t["open_ts"],
+                             "close_ts": time.time()})
+            closed = N_CLOSED[-2000:]
+        state_put("n_closed", closed)
+        _st(N3, "closed")
+        n3_save()
+        print(f"[N3] CLOSED {sym} {reason} pnl {pnl:.2f}")
+    except Exception as ex:
+        print(f"[N3 CLOSE {sym}] {ex}")
+
+
+def n3_manage():
+    if not N3["open"]:
+        return
+    pos = _positions_map()
+    if pos is None:
+        return
+    now = time.time()
+    for sym, t in list(N3["open"].items()):
+        if now >= t["exit_due"]:
+            n3_finalize(sym, t, "time", pos)
+            continue
+        if pos.get((sym, "SHORT"), 0) <= 0:
+            t["gone"] = t.get("gone", 0) + 1
+            if t["gone"] >= 2:
+                n3_finalize(sym, t, "gone", pos)
+            continue
+        t["gone"] = 0
+
+
+def n3_scan(bar_ts):
+    tick = _ticker_map()
+    if not tick:
+        return False
+    med = _n3_med24(tick)
+    cands = _n3_candidates(tick)
+    late = time.time() - (bar_ts + N3_BAR) / 1000.0
+    sigs = []
+    for sym in cands:
+        while api_backoff_active():
+            time.sleep(20)
+        try:
+            bars = _n3_bars(sym, 40)
+            s = n3_signal(bars, bar_ts)
+            if s:
+                sigs.append((sym, s, bars[-1]["close"]))
+        except Exception as e:
+            print(f"[N3 SCAN {sym}] {e}")
+        time.sleep(N_REQ_PAUSE)
+    opened = 0
+    for sym, (r4, r1, q24), last_c in sigs:
+        why = None
+        if sym in N3["cool"] and N3["cool"][sym] > bar_ts / 1000.0:
+            continue                                   # one signal per coin per 24h (silent, as backtested)
+        with N3_LOCK:
+            N3["cool"][sym] = bar_ts / 1000.0 + N3["cool_s"]
+        if med is None:
+            why = "market median unavailable"
+        elif med < N3["med24_min"]:
+            continue                                   # market filter fails -> not a signal (silent)
+        bq7, bnote = _n3_binance_q7(sym, bar_ts)
+        if bq7 is None:
+            print(f"[N3] {sym} skipped: {bnote}")
+            if "unavailable" in bnote or "failed" in bnote:
+                _n3_msg_signal(sym, get_current_price(sym) or last_c, r4, r1,
+                               "Binance data unreachable, thin-coin rule cannot be checked - " + n3_route_text())
+            continue
+        if bq7 > N3["max_bn_q7"]:
+            print(f"[N3] {sym} skipped: fat coin ({bnote})")
+            continue
+        if not why:
+            if not N3["on"]:
+                why = "N3 is OFF"
+            elif late > N3["late_s"]:
+                why = f"bot {late / 60:.0f} min late"
+            elif sym in N3["open"]:
+                why = "already in a N3 trade"
+            elif len(N3["open"]) >= N3["max_concurrent"]:
+                why = f"N3 cap full ({len(N3['open'])}/{N3['max_concurrent']})"
+            else:
+                pos = _positions_map() or {}
+                busy = (all_open_symbols() - set(N3["open"].keys())) | {sy for (sy, _p) in pos.keys()}
+                if sym in busy:
+                    why = "coin already used by another engine (N2 or other)"
+        if why:
+            _n3_msg_signal(sym, get_current_price(sym) or last_c, r4, r1, why)
+            continue
+        if n3_open(sym, (r4, r1, q24, bnote), bar_ts) == "opened":
+            opened += 1
+    meds = f"{med * 100:+.2f}%" if med is not None else "n/a"
+    N3["last_note"] = (f"{datetime.fromtimestamp(bar_ts / 1000 + 3600, timezone.utc).strftime('%m-%d %H:%M')} UTC: "
+                       f"{len(cands)} checked, {len(sigs)} spike(s), {opened} opened, alt median 24h {meds}")
+    if sigs:
+        print("[N3] " + N3["last_note"])
+    return True
+
+
+def n3_loop():
+    time.sleep(90)
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+            boundary = now_ms // N3_BAR * N3_BAR
+            bar_ts = boundary - N3_BAR
+            if bar_ts not in N3["done_bars"] and now_ms - boundary >= 20000:
+                if n3_scan(bar_ts):
+                    N3["done_bars"].append(bar_ts)
+                    N3["done_bars"] = N3["done_bars"][-200:]
+                    N3["cool"] = {s: v for s, v in N3["cool"].items() if v > time.time()}
+                    n3_save()
+            n3_manage()
+        except Exception as ex:
+            print(f"[N3 LOOP] {ex}")
+        time.sleep(30)
+
+
+def n3_startup_verify():
+    pos = _positions_map() or {}
+    for sym, t in list(N3["open"].items()):
+        try:
+            if pos.get((sym, "SHORT"), 0) <= 0:
+                continue                                   # manage loop finalizes it after two checks
+            sl_id, _sp, _tid, _tp = get_open_orders_for(sym)
+            if sl_id is None:
+                sl_id = place_sl_guarded(sym, "BUY", "SHORT", px_round(sym, t["sl"]), t["qty"])
+                print(f"[N3] {sym} stop re-placed after restart -> {sl_id}")
+            t["sl_id"] = sl_id
+        except Exception as ex:
+            print(f"[N3 VERIFY {sym}] {ex}")
+    n3_save()
+
+
+def n3_status_lines():
+    on = "ON" if N3["on"] else "OFF - send /n3_start"
+    opens = ", ".join(f"{s} (exit {datetime.fromtimestamp(t['exit_due'], timezone.utc).strftime('%m-%d %H:%M')})"
+                      for s, t in N3["open"].items()) or "none"
+    return (f"N3 (thin-coin fake-spike SHORT, 1h, stop +50%, 48h): {on} | ${N3['notional']:.0f} notional "
+            f"{N3['lev']}x | open {len(N3['open'])}/{N3['max_concurrent']}\n"
+            f"  open: {opens}\n  last scan: {N3.get('last_note') or 'not yet'}\n  data: {n3_route_text()}")
+
+
+_orig_n_report_lines = n_report_lines
+
+
+def n_report_lines(since_ts):
+    out = _orig_n_report_lines(since_ts)
+    try:
+        n, wr, p = _agg_closed(_n_rows(since_ts, "n3"))
+        out.append(f"N3: {n} trades | win {wr:.0f}% | {'+' if p >= 0 else '-'}${abs(p):.2f} | open {len(N3['open'])}")
+    except Exception as e:
+        print(f"[N3 REPORT] {e}")
+    return out
+
+
+_orig_n_status_text = n_status_text
+
+
+def n_status_text():
+    base = _orig_n_status_text()
+    try:
+        return base + "\n" + n3_status_lines()
+    except Exception as e:
+        return base + f"\nN3: status unavailable ({e})"
+
+
+_orig_n_cmd_start = _n_cmd_start
+
+
+def _n_cmd_start(_on):
+    _orig_n_cmd_start(_on)
+    N3["on"] = True
+    n3_save()
+    _on.append("N3 LIVE (thin-coin spike short, 1h)")
+
+
+_orig_n_cmd_stop = _n_cmd_stop
+
+
+def _n_cmd_stop():
+    _orig_n_cmd_stop()
+    N3["on"] = False
+    n3_save()
+
+
+_orig_n_handle_cmd = _n_handle_cmd
+
+
+def _n_handle_cmd(text):
+    t = text.strip().lower()
+    if t in ("/n3_start", "/n3_stop"):
+        N3["on"] = t.endswith("start")
+        n3_save()
+        send_tg("N3 " + ("ON (live orders, $%.0f notional, %dx, cap %d)" % (N3["notional"], N3["lev"], N3["max_concurrent"])
+                         if N3["on"] else "OFF (open trades keep their +50% stop and 48h exit)"))
+        return True
+    if t in ("/n3", "/n3_status"):
+        send_tg(n3_status_lines())
+        return True
+    return _orig_n_handle_cmd(text)
+
+
 if __name__ == "__main__":
     # 2026-10-11: restore N1/N2 + paper state BEFORE anything adopts or cancels orders
     try:
@@ -11595,6 +12254,10 @@ if __name__ == "__main__":
         n2z_load()
     except Exception as e:
         print(f"[STARTUP N2Z LOAD] {e}")
+    try:
+        n3_load()
+    except Exception as e:
+        print(f"[STARTUP N3 LOAD] {e}")
     try:
         paper_load()
     except Exception as e:
@@ -11620,6 +12283,10 @@ if __name__ == "__main__":
         n2z_startup_verify()
     except Exception as e:
         print(f"[STARTUP N VERIFY] {e}")
+    try:
+        n3_startup_verify()
+    except Exception as e:
+        print(f"[STARTUP N3 VERIFY] {e}")
 
     Thread(target=rev2_loop,                daemon=True).start()
     Thread(target=trailing_loop,            daemon=True).start()   # also runs the daily/weekly reports
@@ -11646,6 +12313,7 @@ if __name__ == "__main__":
     Thread(target=n_manage_loop,            daemon=True).start()   # N1/N2 fills, 50% at 1R, trailing, time stop
     Thread(target=n2x_loop,                 daemon=True).start()   # old N2: closes out existing shorts only
     Thread(target=n2z_loop,                 daemon=True).start()   # N2 = Zone Sweep (Pine 1 logic), 15m
+    Thread(target=n3_loop,                  daemon=True).start()   # N3 = thin-coin fake-spike short, 1h
     Thread(target=paper_loop,               daemon=True).start()   # T-series paper fills / exits
     Thread(target=fu_loop,                  daemon=True).start()   # Follow Up break alerts
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

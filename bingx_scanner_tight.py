@@ -12251,6 +12251,426 @@ def _n_handle_cmd(text):
     return _orig_n_handle_cmd(text)
 
 
+# ============================================================================
+# N4 = FUNDING-FARMER SHORT (live, real orders)                          2026-10-30
+# Spec = memory /areas/n4-funding-short.md, exactly as backtested:
+#   idea     : when funding is deeply negative, retail longs buy before the settlement to
+#              collect it and sell right after it -> price drops in the first hour
+#   universe : BingX USDT perps, no NC* tokenized, no BTC
+#   signal   : the SETTLED funding print of a coin is <= -0.30%
+#   entry    : SHORT at market right after that settlement (bot checks every few seconds)
+#   exit     : stop +8% from entry, no TP; market close 60 min after entry OR 15 min before
+#              the coin's next settlement, whichever comes first (never pays funding)
+#   size     : $50 notional (N4_NOTIONAL), 5x leverage (margin ~$10), cap 10
+#   rules    : skip a coin any other engine (N2/N3/...) holds; one trade per settlement
+# Backtest BingX, 0.1%/side, $50: bear Nov25-Jul26 41/wk win 61% +$11.57/wk |
+# recent Jul29-Oct4 2026 75/wk win 59% +$24.35/wk | OKX Jul27-Oct27 2026 33/wk 61% +$10.60/wk
+# ============================================================================
+N4 = {
+    "tag": "n4", "name": "N4",
+    "on": AUTO_RESUME_ON_START,
+    "notional": float(os.environ.get("N4_NOTIONAL", 50)),
+    "lev": int(os.environ.get("N4_LEV", 5)),
+    "max_concurrent": int(os.environ.get("N4_MAX_OPEN", 10)),
+    "fr_max": -0.003, "pre_fr": -0.002, "sl_pct": 0.08,
+    "max_hold": 3600, "exit_before": 900,
+    "late_s": int(os.environ.get("N4_LATE_SECONDS", 300)),
+    "open": {}, "done": {}, "last_note": "", "last_sig": "",
+}
+N4_LOCK = _threading.RLock()
+_N4_PREM = {"ts": 0.0, "map": {}, "err": ""}     # sym -> (lastFundingRate, nextFundingTime ms)
+_N4_WATCH = {}                                    # sym -> (rate seen before settlement, settlement ms, prev settlement ms)
+
+
+def n4_save():
+    with N4_LOCK:
+        st = {"open": N4["open"], "done": dict(list(N4["done"].items())[-500:])}
+    state_put("n4_books", st)
+
+
+def n4_load():
+    b = state_get("n4_books", {}) or {}
+    with N4_LOCK:
+        N4["open"] = dict(b.get("open") or {})
+        N4["done"] = dict(b.get("done") or {})
+    print(f"[N4] state loaded: open {len(N4['open'])}")
+
+
+_prev4_all_open_symbols = all_open_symbols
+
+
+def all_open_symbols():
+    s = set(_prev4_all_open_symbols())
+    try:
+        s |= set(N4["open"].keys())
+    except Exception:
+        pass
+    return s
+
+
+def _n4_premium_all():
+    """All symbols' predicted funding + next settlement time in one call."""
+    try:
+        r = requests.get(BASE_URL + "/openApi/swap/v2/quote/premiumIndex", timeout=10).json()
+        d = r.get("data")
+        if isinstance(d, dict):
+            d = [d]
+        out = {}
+        for x in d or []:
+            try:
+                sym = x.get("symbol", "")
+                fr = x.get("lastFundingRate")
+                nft = int(x.get("nextFundingTime") or 0)
+                if sym and fr is not None and nft > 0:
+                    out[sym] = (float(fr), nft)
+            except Exception:
+                pass
+        if out:
+            _N4_PREM.update({"ts": time.time(), "map": out, "err": ""})
+        else:
+            _N4_PREM["err"] = f"premiumIndex returned no rows ({str(r)[:80]})"
+    except Exception as e:
+        _N4_PREM["err"] = f"premiumIndex failed ({str(e)[:80]})"
+    return _N4_PREM["map"]
+
+
+def _n4_next_settlement(sym):
+    try:
+        r = requests.get(BASE_URL + "/openApi/swap/v2/quote/premiumIndex", params={"symbol": sym}, timeout=8).json()
+        d = r.get("data")
+        if isinstance(d, list):
+            d = d[0] if d else None
+        return int(d.get("nextFundingTime") or 0) if d else 0
+    except Exception:
+        return 0
+
+
+def _n4_settled(sym, expect_ms):
+    """The settled funding print at expect_ms (no cache). Returns rate or None."""
+    try:
+        r = requests.get(BASE_URL + "/openApi/swap/v2/quote/fundingRate",
+                         params={"symbol": sym, "limit": 3}, timeout=8).json()
+        d = r.get("data") or []
+        if isinstance(d, dict):
+            d = [d]
+        for x in d:
+            ft = int(x.get("fundingTime") or 0)
+            if abs(ft - expect_ms) <= 60000:
+                return float(x.get("fundingRate"))
+    except Exception as e:
+        print(f"[N4 FUNDING {sym}] {e}")
+    return None
+
+
+def _n4_msg_signal(sym, fr, why):
+    N4["last_sig"] = f"{sym} {fr * 100:.2f}% - not opened: {why}"
+    send_tg(f"🔔 N4 SIGNAL (not opened: {why})\n{sym} SHORT after funding {fr * 100:.2f}%\n"
+            f"stop +8% | exit <=60 min")
+
+
+def n4_open(sym, fr, settle_ms, prev_ms):
+    px = get_current_price(sym)
+    if not px:
+        _n4_msg_signal(sym, fr, "no price")
+        return "no price"
+    prec = symbol_precision.get(sym, 4)
+    qty = round(N4["notional"] / px, prec)
+    if qty <= 0:
+        _n4_msg_signal(sym, fr, "qty rounds to 0")
+        return "qty0"
+    lev = max(1, min(N4["lev"], int(symbol_max_lev.get(sym, N4["lev"]) or N4["lev"])))
+    need = qty * px / lev
+    avail = get_available_margin()
+    if avail is not None and avail < need * 1.2:
+        _n4_msg_signal(sym, fr, f"margin: need ${need:.1f}, free ${avail:.1f}")
+        _st(N4, "skip_margin")
+        return "margin"
+    set_leverage_api(sym, lev)
+    oid = place_market_order(sym, "SELL", qty, "SHORT")
+    if not oid or oid == "N/A":
+        _n4_msg_signal(sym, fr, "BingX rejected the market order")
+        return "rejected"
+    time.sleep(1)
+    fill = get_fill_price(oid, sym, 0.0) or px
+    sl = fill * (1 + N4["sl_pct"])
+    sl_id = place_sl_guarded(sym, "BUY", "SHORT", px_round(sym, sl), qty)
+    if sl_id is None:
+        place_market_order(sym, "BUY", qty, "SHORT")
+        send_tg(f"⚠️ N4 {sym}: stop could not be placed - short closed at market (no naked risk).")
+        send_journal(f"➖ N4 · {sym} · SHORT\nEntry {px_round(sym, fill)} → closed at market at once\n"
+                     f"stop বসানো যায়নি, তাই সাথে সাথে বন্ধ (naked risk নেই)\nNiti Journal")
+        return "no stop"
+    now = time.time()
+    nxt = _n4_next_settlement(sym)
+    if not nxt or nxt <= settle_ms:
+        nxt = settle_ms + max(3600000, settle_ms - prev_ms if prev_ms else 3600000)
+    exit_due = min(now + N4["max_hold"], nxt / 1000.0 - N4["exit_before"])
+    if exit_due <= now + 60:
+        exit_due = now + 60
+    t = {"symbol": sym, "side": "SHORT", "qty": qty, "entry": fill, "sl": sl, "sl_id": sl_id,
+         "lev": lev, "open_ts": now, "settle_ms": int(settle_ms), "next_ms": int(nxt),
+         "exit_due": exit_due, "fr": fr, "gone": 0}
+    with N4_LOCK:
+        N4["open"][sym] = t
+    _st(N4, "fills")
+    n4_save()
+    print(f"[N4] OPEN {sym} SHORT {qty} @ {fill} SL {sl} lev {lev} fr {fr}")
+    send_tg(f"✅ N4 {sym} SHORT FILLED\n"
+            f"Entry {px_round(sym, fill)} | SL {px_round(sym, sl)} (+8%) | no TP | exit "
+            f"{datetime.fromtimestamp(exit_due, timezone.utc).strftime('%H:%M')} UTC\n"
+            f"Notional ${qty * fill:.0f} | {lev}x | margin ${qty * fill / lev:.2f}\n"
+            f"settled funding {fr * 100:.2f}%")
+    return "opened"
+
+
+def n4_finalize(sym, t, reason, pos=None):
+    try:
+        if pos is None:
+            pos = _positions_map() or {}
+        left = pos.get((sym, "SHORT"), 0)
+        if left > 0:
+            place_market_order(sym, "BUY", min(t["qty"], left), "SHORT")
+            time.sleep(1)
+        if t.get("sl_id"):
+            try:
+                cancel_order(sym, t["sl_id"])
+            except Exception:
+                pass
+        exit_px = 0.0
+        if reason == "gone":
+            slf = get_fill_price(t["sl_id"], sym, 0.0) if t.get("sl_id") else 0.0
+            if slf:
+                reason, exit_px = "sl", slf
+        exit_px = exit_px or get_current_price(sym) or t["entry"]
+        pnl = get_income_pnl(sym, t["open_ts"] * 1000 - 120000)
+        est = pnl is None
+        if est:
+            pnl = -(exit_px - t["entry"]) * t["qty"] - 0.0011 * t["entry"] * t["qty"]
+        notional = t["entry"] * t["qty"]
+        emoji = "✅" if pnl > 0.1 else ("❌" if pnl < -0.1 else "➖")
+        how = {"sl": "SL (+8%) লেগেছে", "time": "সময় শেষ, market-এ বন্ধ",
+               "gone": "BingX-এ position বন্ধ পাওয়া গেছে"}.get(reason, reason)
+        mins = (time.time() - t["open_ts"]) / 60.0
+        send_journal(f"{emoji} N4 · {sym} · SHORT\n"
+                     f"Entry {px_round(sym, t['entry'])} → Exit {px_round(sym, exit_px)}\n{how}\n"
+                     f"PnL {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} on ${notional:.0f} · {mins:.0f} মিনিট"
+                     + (" (আনুমানিক)" if est else "") + f" · funding {t.get('fr', 0) * 100:.2f}%\nNiti Journal")
+        send_tg(f"{emoji} N4 {sym} SHORT closed {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} ({how})")
+        with N4_LOCK:
+            N4["open"].pop(sym, None)
+            N_CLOSED.append({"tag": "n4", "symbol": sym, "side": "SHORT", "pnl": round(pnl, 2),
+                             "r": round(pnl / max(notional, 1e-9), 4), "open_ts": t["open_ts"],
+                             "close_ts": time.time()})
+            closed = N_CLOSED[-2000:]
+        state_put("n_closed", closed)
+        _st(N4, "closed")
+        n4_save()
+        print(f"[N4] CLOSED {sym} {reason} pnl {pnl:.2f}")
+    except Exception as ex:
+        print(f"[N4 CLOSE {sym}] {ex}")
+
+
+def n4_manage():
+    if not N4["open"]:
+        return
+    now = time.time()
+    due = [s for s, t in N4["open"].items() if now >= t["exit_due"]]
+    pos = _positions_map()
+    if pos is None:
+        return
+    for sym, t in list(N4["open"].items()):
+        if sym in due:
+            n4_finalize(sym, t, "time", pos)
+            continue
+        if pos.get((sym, "SHORT"), 0) <= 0:
+            t["gone"] = t.get("gone", 0) + 1
+            if t["gone"] >= 2:
+                n4_finalize(sym, t, "gone", pos)
+            continue
+        t["gone"] = 0
+
+
+def n4_check_settlements():
+    """Called every few seconds. Finds coins whose settlement just passed with a deeply
+    negative print and opens the short."""
+    now_ms = int(time.time() * 1000)
+    hits = []
+    for sym, (fr, sms, pms) in list(_N4_WATCH.items()):
+        if now_ms < sms + 2000:
+            continue
+        _N4_WATCH.pop(sym, None)
+        key = f"{sym}:{sms}"
+        if key in N4["done"]:
+            continue
+        N4["done"][key] = 1
+        hits.append((sym, fr, sms, pms))
+    opened = 0
+    for sym, fr_pre, sms, pms in hits:
+        settled = None
+        for _ in range(3):
+            settled = _n4_settled(sym, sms)
+            if settled is not None:
+                break
+            time.sleep(2)
+        if settled is None:
+            print(f"[N4] {sym} settled print not found (pre {fr_pre * 100:.2f}%) - skipped")
+            continue
+        if settled > N4["fr_max"]:
+            continue                                    # settled above -0.30% -> not a signal (silent)
+        late = time.time() - sms / 1000.0
+        why = None
+        if not N4["on"]:
+            why = "N4 is OFF"
+        elif late > N4["late_s"]:
+            why = f"bot {late / 60:.0f} min late"
+        elif sym in N4["open"]:
+            why = "already in a N4 trade"
+        elif len(N4["open"]) >= N4["max_concurrent"]:
+            why = f"N4 cap full ({len(N4['open'])}/{N4['max_concurrent']})"
+        else:
+            pos = _positions_map() or {}
+            busy = (all_open_symbols() - set(N4["open"].keys())) | {sy for (sy, _p) in pos.keys()}
+            if sym in busy:
+                why = "coin already used by another engine (N2/N3 or other)"
+        if why:
+            _n4_msg_signal(sym, settled, why)
+            continue
+        if n4_open(sym, settled, sms, pms) == "opened":
+            opened += 1
+    if hits:
+        N4["last_note"] = (f"{datetime.now(timezone.utc).strftime('%m-%d %H:%M')} UTC: "
+                           f"{len(hits)} coin(s) settled near/below {N4['pre_fr'] * 100:.2f}%, {opened} opened")
+        if len(N4["done"]) > 800:
+            N4["done"] = dict(list(N4["done"].items())[-500:])
+        n4_save()
+
+
+def n4_refresh_watch():
+    m = _n4_premium_all()
+    for sym, (fr, nft) in m.items():
+        try:
+            if not _clean_symbol(sym) or _coin_base(sym) == "BTC":
+                continue
+        except Exception:
+            continue
+        old = _N4_WATCH.get(sym)
+        if fr <= N4["pre_fr"]:
+            prev = old[2] if old else 0
+            if old and old[1] != nft:
+                prev = old[1]
+            _N4_WATCH[sym] = (fr, nft, prev)
+        elif old and old[1] == nft:
+            _N4_WATCH.pop(sym, None)                   # rate recovered before its settlement
+
+
+def n4_loop():
+    time.sleep(100)
+    last_ref = 0.0
+    last_man = 0.0
+    while True:
+        try:
+            now = time.time()
+            # refresh the funding snapshot every 30 s (every 10 s in the 3 minutes before an hour mark)
+            near = (now % 3600) > 3420
+            if now - last_ref >= (10 if near else 30):
+                n4_refresh_watch()
+                last_ref = now
+            if _N4_WATCH:
+                n4_check_settlements()
+            if now - last_man >= 10:
+                n4_manage()
+                last_man = now
+        except Exception as ex:
+            print(f"[N4 LOOP] {ex}")
+        time.sleep(2)
+
+
+def n4_startup_verify():
+    pos = _positions_map() or {}
+    for sym, t in list(N4["open"].items()):
+        try:
+            if pos.get((sym, "SHORT"), 0) <= 0:
+                continue                                   # manage loop finalizes it after two checks
+            sl_id, _sp, _tid, _tp = get_open_orders_for(sym)
+            if sl_id is None:
+                sl_id = place_sl_guarded(sym, "BUY", "SHORT", px_round(sym, t["sl"]), t["qty"])
+                print(f"[N4] {sym} stop re-placed after restart -> {sl_id}")
+            t["sl_id"] = sl_id
+        except Exception as ex:
+            print(f"[N4 VERIFY {sym}] {ex}")
+    n4_save()
+
+
+def n4_status_lines():
+    on = "ON" if N4["on"] else "OFF - send /n4_start"
+    opens = ", ".join(f"{s} (exit {datetime.fromtimestamp(t['exit_due'], timezone.utc).strftime('%H:%M')})"
+                      for s, t in N4["open"].items()) or "none"
+    data = ("OK" if _N4_PREM["map"] and time.time() - _N4_PREM["ts"] < 120 else
+            ("NOT OK - " + (_N4_PREM["err"] or "no funding snapshot yet")))
+    watch = ", ".join(f"{s} {v[0] * 100:.2f}%" for s, v in sorted(_N4_WATCH.items(), key=lambda kv: kv[1][0])[:6]) or "none"
+    return (f"N4 (funding-farmer SHORT, funding <= -0.30%, stop +8%, <=60 min): {on} | ${N4['notional']:.0f} "
+            f"notional {N4['lev']}x | open {len(N4['open'])}/{N4['max_concurrent']}\n"
+            f"  open: {opens}\n  watching (next settlement <= -0.20%): {watch}\n"
+            f"  last: {N4.get('last_note') or 'no settlement signal yet'}\n  funding data: {data}")
+
+
+_orig4_n_report_lines = n_report_lines
+
+
+def n_report_lines(since_ts):
+    out = _orig4_n_report_lines(since_ts)
+    try:
+        n, wr, p = _agg_closed(_n_rows(since_ts, "n4"))
+        out.append(f"N4: {n} trades | win {wr:.0f}% | {'+' if p >= 0 else '-'}${abs(p):.2f} | open {len(N4['open'])}")
+    except Exception as e:
+        print(f"[N4 REPORT] {e}")
+    return out
+
+
+_orig4_n_status_text = n_status_text
+
+
+def n_status_text():
+    base = _orig4_n_status_text()
+    try:
+        return base + "\n" + n4_status_lines()
+    except Exception as e:
+        return base + f"\nN4: status unavailable ({e})"
+
+
+_orig4_n_cmd_start = _n_cmd_start
+
+
+def _n_cmd_start(_on):
+    _orig4_n_cmd_start(_on)
+    N4["on"] = True
+    _on.append("N4 LIVE (funding-farmer short)")
+
+
+_orig4_n_cmd_stop = _n_cmd_stop
+
+
+def _n_cmd_stop():
+    _orig4_n_cmd_stop()
+    N4["on"] = False
+
+
+_orig4_n_handle_cmd = _n_handle_cmd
+
+
+def _n_handle_cmd(text):
+    t = text.strip().lower()
+    if t in ("/n4_start", "/n4_stop"):
+        N4["on"] = t.endswith("start")
+        send_tg("N4 " + ("ON (live orders, $%.0f notional, %dx, cap %d)" % (N4["notional"], N4["lev"], N4["max_concurrent"])
+                         if N4["on"] else "OFF (open trades keep their +8% stop and time exit)"))
+        return True
+    if t in ("/n4", "/n4_status"):
+        send_tg(n4_status_lines())
+        return True
+    return _orig4_n_handle_cmd(text)
+
+
 if __name__ == "__main__":
     # 2026-10-11: restore N1/N2 + paper state BEFORE anything adopts or cancels orders
     try:
@@ -12269,6 +12689,10 @@ if __name__ == "__main__":
         n3_load()
     except Exception as e:
         print(f"[STARTUP N3 LOAD] {e}")
+    try:
+        n4_load()
+    except Exception as e:
+        print(f"[STARTUP N4 LOAD] {e}")
     try:
         paper_load()
     except Exception as e:
@@ -12298,6 +12722,10 @@ if __name__ == "__main__":
         n3_startup_verify()
     except Exception as e:
         print(f"[STARTUP N3 VERIFY] {e}")
+    try:
+        n4_startup_verify()
+    except Exception as e:
+        print(f"[STARTUP N4 VERIFY] {e}")
 
     Thread(target=rev2_loop,                daemon=True).start()
     Thread(target=trailing_loop,            daemon=True).start()   # also runs the daily/weekly reports
@@ -12325,6 +12753,7 @@ if __name__ == "__main__":
     Thread(target=n2x_loop,                 daemon=True).start()   # old N2: closes out existing shorts only
     Thread(target=n2z_loop,                 daemon=True).start()   # N2 = Zone Sweep (Pine 1 logic), 15m
     Thread(target=n3_loop,                  daemon=True).start()   # N3 = thin-coin fake-spike short, 1h
+    Thread(target=n4_loop,                  daemon=True).start()   # N4 = funding-farmer short after settlement
     Thread(target=paper_loop,               daemon=True).start()   # T-series paper fills / exits
     Thread(target=fu_loop,                  daemon=True).start()   # Follow Up break alerts
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
